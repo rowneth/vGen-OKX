@@ -1,0 +1,12 @@
+aiohttp
+websockets
+pyyaml
+python-dotenv
+pandas
+numpy
+sqlalchemy
+pytest
+rich
+plotly
+pyarrow
+tabulate

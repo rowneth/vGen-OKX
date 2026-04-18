@@ -1,0 +1,25 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS metadata
+.DS_Store
+
+# Local data outputs
+mexc-bot/data/historical/*.parquet
+mexc-bot/data/reports/
+mexc-bot/data/*.db
+mexc-bot/data/logs/

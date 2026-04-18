@@ -1,0 +1,102 @@
+app:
+  name: mexc-bollinger-bot
+  environment: development
+  timezone: UTC
+  log_level: INFO
+
+exchange:
+  name: mexc_futures
+  base_url_rest: https://contract.mexc.com
+  base_url_ws: wss://contract.mexc.com/edge
+  symbol: BTC_USDT
+  timeframe: 15m
+  tick_size: 0.1
+  recv_window_ms: 5000
+  request_timeout_seconds: 15
+  heartbeat_timeout_seconds: 30
+  rate_limits:
+    requests_per_second: 10
+    burst_capacity: 20
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+
+strategy:
+  name: bollinger_mean_reversion
+  bollinger:
+    period: 20
+    std_dev: 2.0
+  rsi:
+    period: 14
+    oversold: 30
+    overbought: 70
+  ema:
+    period: 200
+    slope_lookback_candles: 20
+    slope_min: 0.0
+  atr:
+    period: 14
+    stop_multiple: 1.5
+  volatility_filter:
+    min_bandwidth_pct: 0.003
+  confirmation:
+    require_next_candle_close_confirmation: true
+  exits:
+    take_profit_at_middle_band: true
+    time_stop_candles: 16
+
+risk:
+  risk_per_trade_pct: 0.02
+  max_open_positions: 1
+  daily_drawdown_limit_pct: 0.03
+  consecutive_losses_limit: 3
+  consecutive_losses_pause_hours: 4
+  max_leverage: 5
+  max_spread_pct: 0.0005
+  emergency_market_exit_enabled: true
+  startup_checks:
+    require_futures_trade_permission: true
+    require_withdrawal_disabled: true
+
+execution:
+  entry_order_type: limit
+  entry_time_in_force: post_only
+  cancel_on_miss: true
+  allow_market_orders_for_emergency_exit_only: true
+  slippage:
+    base_ticks_per_fill: 1
+    extra_ticks_if_low_volume: 1
+    low_volume_threshold_ratio: 0.5
+  maker_fill_model:
+    enabled: true
+    base_fill_probability: 0.65
+    max_fill_probability: 0.98
+    min_fill_probability: 0.10
+
+backtest:
+  start_lookback_months: 12
+  initial_equity: 10000.0
+  average_volume_lookback: 50
+  enforce_single_position: true
+  use_realistic_fills: true
+  include_fees: true
+  include_slippage: true
+  stress_test:
+    enabled: true
+    win_rate_drop_percentage_points: 5
+
+storage:
+  historical_data_dir: data/historical
+  sqlite_path: data/bot_audit.db
+  parquet_compression: snappy
+
+reporting:
+  output_dir: data/reports
+  create_html: true
+  create_markdown: true
+  include_monthly_returns: true
+  include_trades_per_day_distribution: true
+  include_win_rate_by_month: true
+  include_equity_vs_btc_overlay: true
+  include_winner_loser_distribution: true
