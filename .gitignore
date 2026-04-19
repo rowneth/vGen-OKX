@@ -23,3 +23,6 @@ mexc-bot/data/historical/*.parquet
 mexc-bot/data/reports/
 mexc-bot/data/*.db
 mexc-bot/data/logs/
+
+# Claude Code settings
+.claude/
