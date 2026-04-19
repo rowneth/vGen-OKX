@@ -40,14 +40,28 @@ POLL_SECONDS = 30
 SEED_CANDLES = 300
 STATE_FILENAME = "paper_session_state.json"
 
+_TIMEFRAME_TO_MEXC = {
+	"1m": "Min1",
+	"5m": "Min5",
+	"15m": "Min15",
+	"30m": "Min30",
+	"1h": "Min60",
+	"4h": "Hour4",
+	"1d": "Day1",
+}
 
-def _load_config() -> Dict[str, Any]:
-	with (PROJECT_ROOT / "config" / "config.yaml").open("r", encoding="utf-8") as handle:
+
+def _load_config(path: pathlib.Path) -> Dict[str, Any]:
+	with path.open("r", encoding="utf-8") as handle:
 		return yaml.safe_load(handle)
 
 
 def _parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Paper trade against MEXC live data.")
+	parser.add_argument("--config", type=str, default="config/config.yaml", help="Config file path (relative to project root or absolute).")
+	parser.add_argument("--state-file", type=str, default=None, help="State JSON filename under data/ (default derived from config).")
+	parser.add_argument("--log-file", type=str, default=None, help="Log file path (default data/logs/paper.log).")
+	parser.add_argument("--label", type=str, default=None, help="Short label prefixed to every Telegram message (e.g. '5m-BTC').")
 	parser.add_argument("--duration-days", type=float, default=7.0, help="Stop after N days.")
 	parser.add_argument("--poll-seconds", type=int, default=POLL_SECONDS, help="Kline poll interval.")
 	parser.add_argument("--daily-report-hour", type=int, default=None, help="Override daily digest hour (local time).")
@@ -176,11 +190,22 @@ async def _daily_report_loop(
 # ---------------------------------------------------------------------------
 
 async def _run(args: argparse.Namespace) -> None:
-	config = _load_config()
-	log_file = PROJECT_ROOT / "data" / "logs" / "paper.log"
+	config_path = pathlib.Path(args.config)
+	if not config_path.is_absolute():
+		config_path = PROJECT_ROOT / config_path
+	config = _load_config(config_path)
+
+	if args.log_file:
+		log_file = pathlib.Path(args.log_file)
+		if not log_file.is_absolute():
+			log_file = PROJECT_ROOT / log_file
+	else:
+		log_file = PROJECT_ROOT / "data" / "logs" / "paper.log"
 	configure_logging(log_level=str(config["app"].get("log_level", "INFO")), log_file_path=log_file)
 
 	load_dotenv(PROJECT_ROOT / ".env", override=False)
+	if args.label:
+		os.environ["BOT_LABEL"] = args.label
 
 	notif_cfg = config.get("notifications", {}).get("telegram", {}) or {}
 	send = {
@@ -202,12 +227,16 @@ async def _run(args: argparse.Namespace) -> None:
 		local_tz = ZoneInfo("UTC")
 
 	symbol = str(config["exchange"]["symbol"])
-	interval = "Min15"
+	timeframe = str(config["exchange"].get("timeframe", "15m")).lower()
+	interval = _TIMEFRAME_TO_MEXC.get(timeframe, "Min15")
+	if timeframe not in _TIMEFRAME_TO_MEXC:
+		LOGGER.warning("Unknown timeframe %r in config, defaulting to Min15", timeframe)
 
 	strategy = BollingerMeanReversionStrategy(config)
 	session = PaperSession(config=config, strategy=strategy)
 
-	state_path = PROJECT_ROOT / "data" / STATE_FILENAME
+	state_filename = args.state_file or STATE_FILENAME
+	state_path = PROJECT_ROOT / "data" / state_filename
 	if args.resume:
 		session.load_state(state_path)
 		LOGGER.info("Resumed: equity=%.2f trades=%d", session.equity, len(session.ledger))

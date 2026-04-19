@@ -103,6 +103,8 @@ class TelegramNotifier:
 			self._tz = ZoneInfo(tz_name)
 		except Exception:
 			self._tz = _UTC
+		label = os.getenv("BOT_LABEL", "").strip()
+		self._label = label or None
 		self._session = session
 		self._owns_session = session is None
 		self._timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
@@ -153,6 +155,8 @@ class TelegramNotifier:
 	async def send_raw(self, markdown_v2_text: str) -> None:
 		"""Queue a pre-formatted MarkdownV2 message."""
 
+		if self._label:
+			markdown_v2_text = f"*\\[{_md(self._label)}\\]*  " + markdown_v2_text
 		if not self._enabled or self._stopped:
 			LOGGER.info("[telegram-disabled]\n%s", markdown_v2_text)
 			return
