@@ -23,28 +23,62 @@ fees:
   taker: 0.0005
 
 strategy:
-  name: bollinger_mean_reversion
+  name: cipher_confluence
+  require_extreme_zone: true
   bollinger:
     period: 20
     std_dev: 2.0
+  fib:
+    mult: 2.618
+  wavetrend:
+    channel_len: 9
+    average_len: 12
+    signal_len: 3
+    oversold: -50.0
+    oversold_deep: -75.0
+    overbought: 50.0
+    overbought_deep: 75.0
+  mfi:
+    period: 14
+    bull_threshold: 42.0
+    bear_threshold: 58.0
   rsi:
     period: 14
-    oversold: 30
-    overbought: 70
+    oversold: 36
+    overbought: 64
+    require_crossback: true
+    crossback_min_delta: 0.0
   ema:
     period: 200
     slope_lookback_candles: 20
     slope_min: 0.0
+    side_bias_max_atr_distance: 4.0
   atr:
     period: 14
-    stop_multiple: 1.5
+    stop_multiple: 0.9
   volatility_filter:
-    min_bandwidth_pct: 0.003
+    min_bandwidth_pct: 0.002
+    max_bandwidth_pct: 0.05
+  volume_filter:
+    enabled: true
+    sma_period: 20
+    min_ratio: 0.7
   confirmation:
     require_next_candle_close_confirmation: true
+    min_body_fraction: 0.0
   exits:
     take_profit_at_middle_band: true
-    time_stop_candles: 16
+    time_stop_candles: 10
+    partial_tp:
+      enabled: true
+      tp1_fraction_to_mid: 0.35
+      tp1_size_fraction: 0.4
+      tp2_fraction_to_mid: 0.70
+      tp2_size_fraction: 0.3
+      move_stop_to_breakeven: true
+  signal_quality:
+    min_rr_ratio: 1.1
+    min_fee_cover_multiple: 4.0
 
 risk:
   risk_per_trade_pct: 0.02
@@ -54,6 +88,7 @@ risk:
   consecutive_losses_pause_hours: 4
   max_leverage: 5
   max_spread_pct: 0.0005
+  cooldown_bars_after_stop: 4
   emergency_market_exit_enabled: true
   startup_checks:
     require_futures_trade_permission: true

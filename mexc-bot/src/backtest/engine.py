@@ -1,10 +1,10 @@
-"""Event-driven backtesting engine for strategy validation."""
+"""Event-driven backtesting engine for strategy validation (v2)."""
 
 from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -19,7 +19,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class Position:
-	"""Represents an open backtest position."""
+	"""Represents an open backtest position, possibly with partial scale-out."""
 
 	side: str
 	qty: float
@@ -29,6 +29,19 @@ class Position:
 	stop_price: float
 	take_profit_price: float
 	entry_fee: float
+	initial_qty: float
+	tp1_price: Optional[float] = None
+	tp1_qty: float = 0.0
+	tp1_hit: bool = False
+	tp1_hit_index: int = -1
+	tp2_price: Optional[float] = None
+	tp2_qty: float = 0.0
+	tp2_hit: bool = False
+	tp2_hit_index: int = -1
+	move_stop_to_breakeven: bool = False
+	realized_partial_pnl: float = 0.0
+	realized_partial_fee: float = 0.0
+	partial_events: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -42,7 +55,16 @@ class BacktestResult:
 
 
 class BacktestEngine:
-	"""Runs a deterministic bar-by-bar backtest simulation."""
+	"""Runs a deterministic bar-by-bar backtest simulation.
+
+	Supports:
+	- Post-only maker entry with probabilistic fills.
+	- Stop-loss, take-profit, time-stop exits.
+	- Partial take-profit (TP1) with breakeven runner.
+	- Cooldown bars after stop-outs.
+	- Daily drawdown and consecutive-loss circuit breakers.
+	- Realistic tick slippage with low-volume inflation.
+	"""
 
 	def __init__(self, config: Dict[str, object], seed: int = 42) -> None:
 		"""Initialize backtest engine.
@@ -76,6 +98,8 @@ class BacktestEngine:
 			consecutive_losses_limit=int(risk_cfg["consecutive_losses_limit"]),
 			consecutive_losses_pause_hours=int(risk_cfg["consecutive_losses_pause_hours"]),
 		)
+		cooldown_bars = int(risk_cfg.get("cooldown_bars_after_stop", 0))
+		cooldown_until_index = -1
 
 		first_time = _row_time(frame.iloc[0])
 		risk_state = limits.reset_for_day(now=first_time, equity=equity)
@@ -87,6 +111,8 @@ class BacktestEngine:
 
 		avg_vol_lookback = int(self.config["backtest"]["average_volume_lookback"])
 		max_spread_pct = float(risk_cfg["max_spread_pct"])
+		maker_fee = float(self.config["fees"]["maker"])
+		taker_fee = float(self.config["fees"]["taker"])
 
 		for i in range(len(frame)):
 			row = frame.iloc[i]
@@ -106,22 +132,34 @@ class BacktestEngine:
 				if close_record is not None:
 					gross_pnl = float(close_record["gross_pnl"])
 					exit_fee = float(close_record["exit_fee"])
-					net_pnl = gross_pnl - open_position.entry_fee - exit_fee
-					fees_paid += open_position.entry_fee + exit_fee
+					partial_pnl = open_position.realized_partial_pnl
+					partial_fee = open_position.realized_partial_fee
+					total_gross = gross_pnl + partial_pnl
+					total_exit_fee = exit_fee + partial_fee
+					net_pnl = total_gross - open_position.entry_fee - total_exit_fee
+					fees_paid += open_position.entry_fee + total_exit_fee
 					equity += net_pnl
 
+					close_record["gross_pnl"] = total_gross
+					close_record["partial_pnl"] = partial_pnl
+					close_record["partial_fee"] = partial_fee
 					close_record["entry_fee"] = open_position.entry_fee
+					close_record["exit_fee"] = total_exit_fee
 					close_record["net_pnl"] = net_pnl
 					close_record["equity_after"] = equity
+					close_record["tp1_hit"] = open_position.tp1_hit
+					close_record["initial_qty"] = open_position.initial_qty
 					trades.append(close_record)
 					limits.register_trade_result(risk_state, now=now, pnl=net_pnl)
 					decisions.append(
 						{
 							"time": now,
 							"type": "exit",
-							"message": f"Closed {open_position.side} on {close_record['reason']}",
+							"message": f"Closed {open_position.side} on {close_record['reason']} net={net_pnl:.2f}",
 						}
 					)
+					if str(close_record["reason"]) == "stop_loss" and cooldown_bars > 0:
+						cooldown_until_index = i + cooldown_bars
 					open_position = None
 
 			equity_points.append(
@@ -141,6 +179,10 @@ class BacktestEngine:
 
 			if limits.is_paused(risk_state, now):
 				decisions.append({"time": now, "type": "risk_block", "message": "Consecutive loss pause active"})
+				continue
+
+			if i < cooldown_until_index:
+				decisions.append({"time": now, "type": "risk_block", "message": "Cooldown after stop"})
 				continue
 
 			if i >= len(frame) - 1:
@@ -190,9 +232,13 @@ class BacktestEngine:
 			entry_index = int(entry_fill["entry_index"])
 			entry_row = frame.iloc[entry_index]
 			entry_price = float(entry_fill["entry_price"])
-
-			maker_fee_rate = float(self.config["fees"]["maker"])
-			entry_fee = abs(entry_price * qty) * maker_fee_rate
+			entry_fee = abs(entry_price * qty) * maker_fee
+			tp1_qty = 0.0
+			if signal.tp1_price is not None and signal.tp1_size_fraction > 0.0:
+				tp1_qty = qty * signal.tp1_size_fraction
+			tp2_qty = 0.0
+			if signal.tp2_price is not None and signal.tp2_size_fraction > 0.0:
+				tp2_qty = qty * signal.tp2_size_fraction
 
 			open_position = Position(
 				side=signal.side,
@@ -203,12 +249,18 @@ class BacktestEngine:
 				stop_price=signal.stop_price,
 				take_profit_price=signal.take_profit_price,
 				entry_fee=entry_fee,
+				initial_qty=qty,
+				tp1_price=signal.tp1_price,
+				tp1_qty=tp1_qty,
+				tp2_price=signal.tp2_price,
+				tp2_qty=tp2_qty,
+				move_stop_to_breakeven=signal.move_stop_to_breakeven_after_tp1,
 			)
 			decisions.append(
 				{
 					"time": _row_time(entry_row),
 					"type": "entry",
-					"message": f"Entered {signal.side} qty={qty:.6f} price={entry_price:.2f}",
+					"message": f"Entered {signal.side} qty={qty:.6f} price={entry_price:.2f} stop={signal.stop_price:.2f} tp={signal.take_profit_price:.2f}",
 				}
 			)
 
@@ -227,26 +279,31 @@ class BacktestEngine:
 				entry_price=open_position.entry_price,
 				exit_price=close_price,
 			)
-			taker_fee = float(self.config["fees"]["taker"])
 			exit_fee = abs(close_price * open_position.qty) * taker_fee
-			net = gross - open_position.entry_fee - exit_fee
+			total_gross = gross + open_position.realized_partial_pnl
+			total_exit_fee = exit_fee + open_position.realized_partial_fee
+			net = total_gross - open_position.entry_fee - total_exit_fee
 			equity += net
-			fees_paid += open_position.entry_fee + exit_fee
+			fees_paid += open_position.entry_fee + total_exit_fee
 			trades.append(
 				{
 					"entry_time": open_position.entry_time,
 					"exit_time": _row_time(last),
 					"side": side,
 					"qty": open_position.qty,
+					"initial_qty": open_position.initial_qty,
 					"entry_price": open_position.entry_price,
 					"exit_price": close_price,
 					"reason": "end_of_data",
-					"gross_pnl": gross,
+					"gross_pnl": total_gross,
+					"partial_pnl": open_position.realized_partial_pnl,
+					"partial_fee": open_position.realized_partial_fee,
 					"entry_fee": open_position.entry_fee,
-					"exit_fee": exit_fee,
+					"exit_fee": total_exit_fee,
 					"net_pnl": net,
 					"bars_held": len(frame) - 1 - open_position.entry_index,
 					"equity_after": equity,
+					"tp1_hit": open_position.tp1_hit,
 				}
 			)
 
@@ -325,59 +382,165 @@ class BacktestEngine:
 		position: Position,
 		avg_vol_lookback: int,
 	) -> Optional[Dict[str, object]]:
-		"""Close position if any exit rule is hit.
+		"""Process exits for current bar: partial TP, stop, TP2/final, time-stop.
+
+		Partial TP is simulated first (if not yet hit and candle reached TP1).
+		Then stop / final TP / time-stop exit the remaining qty.
 
 		Args:
 			frame: Backtest frame.
 			index: Current bar index.
-			position: Open position.
-			avg_vol_lookback: Lookback for low volume slippage flag.
+			position: Open position (mutated on partial TP).
+			avg_vol_lookback: Low-volume lookback.
 
 		Returns:
-			Close record if position exits on this bar.
+			Close record if full position exits on this bar.
 		"""
 		row = frame.iloc[index]
 		low = float(row["low"])
 		high = float(row["high"])
 		close = float(row["close"])
+		maker_fee = float(self.config["fees"]["maker"])
+		taker_fee = float(self.config["fees"]["taker"])
 
+		# --- Partial TP1 handling ---
+		if (
+			not position.tp1_hit
+			and position.tp1_price is not None
+			and position.tp1_qty > 0.0
+		):
+			tp1 = float(position.tp1_price)
+			hit_tp1 = (
+				(position.side == "long" and high >= tp1)
+				or (position.side == "short" and low <= tp1)
+			)
+			if hit_tp1:
+				partial_qty = min(position.tp1_qty, position.qty)
+				gross = self._compute_gross_pnl(
+					side=position.side,
+					qty=partial_qty,
+					entry_price=position.entry_price,
+					exit_price=tp1,
+				)
+				fee = abs(tp1 * partial_qty) * maker_fee
+				position.realized_partial_pnl += gross
+				position.realized_partial_fee += fee
+				position.qty = max(0.0, position.qty - partial_qty)
+				position.tp1_hit = True
+				position.tp1_hit_index = index
+				# Defer breakeven shift until NEXT bar so we don't stop-out
+				# on the same candle's natural noise.
+				position.partial_events.append(
+					{"time": _row_time(row), "price": tp1, "qty": partial_qty}
+				)
+				# If full qty consumed at TP1 (rare: size_fraction == 1), close now.
+				if position.qty <= 1e-12:
+					return {
+						"entry_time": position.entry_time,
+						"exit_time": _row_time(row),
+						"side": position.side,
+						"qty": position.initial_qty,
+						"entry_price": position.entry_price,
+						"exit_price": tp1,
+						"reason": "take_profit_partial_only",
+						"gross_pnl": 0.0,
+						"exit_fee": 0.0,
+						"bars_held": index - position.entry_index,
+					}
+				# Skip final-exit checks on the same bar as TP1 to avoid
+				# instant-BE whipsaw. Stop will move to BE next bar.
+				return None
+
+		# --- Partial TP2 handling (second scale-out) ---
+		if (
+			position.tp1_hit
+			and not position.tp2_hit
+			and position.tp2_price is not None
+			and position.tp2_qty > 0.0
+			and position.qty > 1e-12
+		):
+			tp2 = float(position.tp2_price)
+			hit_tp2 = (
+				(position.side == "long" and high >= tp2)
+				or (position.side == "short" and low <= tp2)
+			)
+			if hit_tp2:
+				partial_qty = min(position.tp2_qty, position.qty)
+				gross = self._compute_gross_pnl(
+					side=position.side,
+					qty=partial_qty,
+					entry_price=position.entry_price,
+					exit_price=tp2,
+				)
+				fee = abs(tp2 * partial_qty) * maker_fee
+				position.realized_partial_pnl += gross
+				position.realized_partial_fee += fee
+				position.qty = max(0.0, position.qty - partial_qty)
+				position.tp2_hit = True
+				position.tp2_hit_index = index
+				position.partial_events.append(
+					{"time": _row_time(row), "price": tp2, "qty": partial_qty}
+				)
+				if position.qty <= 1e-12:
+					return {
+						"entry_time": position.entry_time,
+						"exit_time": _row_time(row),
+						"side": position.side,
+						"qty": position.initial_qty,
+						"entry_price": position.entry_price,
+						"exit_price": tp2,
+						"reason": "take_profit_partial_only",
+						"gross_pnl": 0.0,
+						"exit_fee": 0.0,
+						"bars_held": index - position.entry_index,
+					}
+				return None
+
+		# Lazily apply breakeven shift starting the bar AFTER TP1 fired.
+		if (
+			position.tp1_hit
+			and position.move_stop_to_breakeven
+			and index > position.tp1_hit_index
+		):
+			if position.side == "long" and position.stop_price < position.entry_price:
+				position.stop_price = position.entry_price
+			elif position.side == "short" and position.stop_price > position.entry_price:
+				position.stop_price = position.entry_price
+
+		# --- Final exits on remaining qty ---
 		time_stop_bars = int(self.config["strategy"]["exits"]["time_stop_candles"])
 		bars_held = index - position.entry_index
 
 		reason = ""
 		exit_price = close
-		fee_rate = float(self.config["fees"]["taker"])
-
+		fee_rate = taker_fee
+		# priority: stop > final TP > time stop
 		if position.side == "long":
-			stop_hit = low <= position.stop_price
-			tp_hit = high >= position.take_profit_price
-			if stop_hit:
+			if low <= position.stop_price:
 				reason = "stop_loss"
 				exit_price = position.stop_price
-				fee_rate = float(self.config["fees"]["taker"])
-			elif tp_hit:
+				fee_rate = taker_fee
+			elif high >= position.take_profit_price:
 				reason = "take_profit"
 				exit_price = position.take_profit_price
-				fee_rate = float(self.config["fees"]["maker"])
+				fee_rate = maker_fee
 			elif bars_held >= time_stop_bars:
 				reason = "time_stop"
 				exit_price = close
-				fee_rate = float(self.config["fees"]["taker"])
+				fee_rate = taker_fee
 		else:
-			stop_hit = high >= position.stop_price
-			tp_hit = low <= position.take_profit_price
-			if stop_hit:
+			if high >= position.stop_price:
 				reason = "stop_loss"
 				exit_price = position.stop_price
-				fee_rate = float(self.config["fees"]["taker"])
-			elif tp_hit:
+				fee_rate = taker_fee
+			elif low <= position.take_profit_price:
 				reason = "take_profit"
 				exit_price = position.take_profit_price
-				fee_rate = float(self.config["fees"]["maker"])
+				fee_rate = maker_fee
 			elif bars_held >= time_stop_bars:
 				reason = "time_stop"
 				exit_price = close
-				fee_rate = float(self.config["fees"]["taker"])
+				fee_rate = taker_fee
 
 		if not reason:
 			return None
@@ -396,7 +559,7 @@ class BacktestEngine:
 			"entry_time": position.entry_time,
 			"exit_time": _row_time(row),
 			"side": position.side,
-			"qty": position.qty,
+			"qty": position.initial_qty,
 			"entry_price": position.entry_price,
 			"exit_price": slipped_exit,
 			"reason": reason,
@@ -406,16 +569,7 @@ class BacktestEngine:
 		}
 
 	def _is_low_volume(self, frame: pd.DataFrame, index: int, lookback: int) -> bool:
-		"""Detect low-volume condition for extra slippage tick.
-
-		Args:
-			frame: Backtest frame.
-			index: Current bar index.
-			lookback: Number of bars for average volume.
-
-		Returns:
-			True if current bar volume is below threshold.
-		"""
+		"""Detect low-volume condition for extra slippage tick."""
 		if index <= 0:
 			return False
 		start = max(0, index - lookback)
@@ -428,16 +582,7 @@ class BacktestEngine:
 		return current_volume < avg_volume * ratio
 
 	def _apply_slippage(self, price: float, side: str, low_volume: bool) -> float:
-		"""Apply directional slippage in ticks.
-
-		Args:
-			price: Raw price.
-			side: ``buy`` or ``sell``.
-			low_volume: Whether to add one extra slippage tick.
-
-		Returns:
-			Slippage-adjusted price.
-		"""
+		"""Apply directional slippage in ticks."""
 		slip_cfg = self.config["execution"]["slippage"]
 		ticks = int(slip_cfg["base_ticks_per_fill"])
 		if low_volume:
@@ -452,14 +597,7 @@ class BacktestEngine:
 		raise ValueError("side must be buy or sell")
 
 	def _estimate_spread_pct(self, row: pd.Series) -> float:
-		"""Estimate spread percentage from candle range proxy.
-
-		Args:
-			row: Candle row.
-
-		Returns:
-			Estimated spread percentage.
-		"""
+		"""Estimate spread percentage from candle range proxy."""
 		high = float(row["high"])
 		low = float(row["low"])
 		close = float(row["close"])
@@ -470,17 +608,7 @@ class BacktestEngine:
 
 	@staticmethod
 	def _compute_gross_pnl(side: str, qty: float, entry_price: float, exit_price: float) -> float:
-		"""Compute gross PnL before fees.
-
-		Args:
-			side: ``long`` or ``short``.
-			qty: Position quantity.
-			entry_price: Entry price.
-			exit_price: Exit price.
-
-		Returns:
-			Gross PnL.
-		"""
+		"""Compute gross PnL before fees."""
 		if side == "long":
 			return (exit_price - entry_price) * qty
 		if side == "short":
