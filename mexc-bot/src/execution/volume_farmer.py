@@ -14,7 +14,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
+
+from strategy.indicators import (
+	bollinger_bands as bb_indicator,
+	ema as ema_indicator,
+	rsi as rsi_indicator,
+	wavetrend as wt_indicator,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -76,8 +84,14 @@ class VolumeFarmerSession:
 		self.equity = float(f["capital_usd"])
 		self.peak_equity = self.equity
 		self.start_equity = self.equity
-		self._leverage = float(f["leverage"])
-		self._margin_frac = float(f["margin_fraction_per_trade"])
+		self._leverage = float(f.get("leverage", 0))  # 0 = auto
+		self._margin_frac = float(f.get("margin_fraction_per_trade", 0.05))
+		# Dynamic sizing (ebirth.net formula): lev = risk$ / (margin$ * SL%)
+		sizing_cfg = f.get("sizing", {})
+		self._dynamic_leverage = bool(sizing_cfg.get("dynamic_leverage", False))
+		self._risk_pct = float(sizing_cfg.get("risk_per_trade_pct", 0.025))
+		self._max_leverage = float(sizing_cfg.get("max_leverage", 125))
+		self._min_leverage = float(sizing_cfg.get("min_leverage", 5))
 		self._tp_bps = float(f["tp_bps"])
 		self._sl_bps = float(f["sl_bps"])
 		self._max_hold = int(f["max_hold_bars"])
@@ -85,6 +99,29 @@ class VolumeFarmerSession:
 		self._entry_mode = str(entry_cfg.get("mode", "micro_momentum"))
 		self._min_range_bps = float(entry_cfg.get("min_bar_range_bps", 0.0))
 		self._max_range_bps = float(entry_cfg.get("max_bar_range_bps", 1_000.0))
+		# RSI / WaveTrend params (used when entry_mode == 'rsi_wt')
+		rsi_cfg = entry_cfg.get("rsi", {})
+		self._rsi_period = int(rsi_cfg.get("period", 14))
+		self._rsi_upper = float(rsi_cfg.get("upper", 70.0))
+		self._rsi_lower = float(rsi_cfg.get("lower", 30.0))
+		wt_cfg = entry_cfg.get("wavetrend", {})
+		self._wt_channel = int(wt_cfg.get("channel_len", 9))
+		self._wt_avg = int(wt_cfg.get("average_len", 12))
+		self._wt_signal = int(wt_cfg.get("signal_len", 3))
+		self._wt_oversold = float(wt_cfg.get("oversold", -53.0))
+		self._wt_overbought = float(wt_cfg.get("overbought", 53.0))
+		self._require_wt_confirm = bool(entry_cfg.get("require_wt_confirmation", False))
+		self._wt_lookback = int(entry_cfg.get("wt_confluence_lookback", 3))
+		# Bollinger-fade params (used when entry_mode == 'bollinger_fade')
+		bb_cfg = entry_cfg.get("bollinger", {})
+		self._bb_period = int(bb_cfg.get("period", 20))
+		self._bb_std = float(bb_cfg.get("std_dev", 2.0))
+		self._bb_rsi_long_max = float(bb_cfg.get("rsi_long_max", 35.0))
+		self._bb_rsi_short_min = float(bb_cfg.get("rsi_short_min", 65.0))
+		self._bb_width_min_bps = float(bb_cfg.get("width_min_bps", 20.0))   # skip squeezed
+		self._bb_width_max_bps = float(bb_cfg.get("width_max_bps", 200.0))  # skip exploded
+		self._bb_ema_len = int(bb_cfg.get("ema_trend_len", 200))
+		self._bb_ema_filter = bool(bb_cfg.get("ema_trend_filter", False))
 		self._alternate = bool(f.get("alternate_direction", True))
 		fees_cfg = self.config.get("fees", {})
 		self._maker_rate = float(fees_cfg.get("maker", 0.0001))
@@ -147,6 +184,15 @@ class VolumeFarmerSession:
 
 		if history.empty:
 			return None
+
+		# RSI + WaveTrend entry (based on WTF Pine Scripts)
+		if self._entry_mode == "rsi_wt":
+			return self._rsi_wt_signal(history)
+
+		# Bollinger-band fade with RSI + optional EMA trend filter
+		if self._entry_mode == "bollinger_fade":
+			return self._bollinger_fade_signal(history)
+
 		last = history.iloc[-1]
 		open_p = float(last["open"])
 		close_p = float(last["close"])
@@ -171,9 +217,123 @@ class VolumeFarmerSession:
 		return bias
 
 	# ------------------------------------------------------------------
+	def _rsi_wt_signal(self, history: pd.DataFrame) -> Optional[str]:
+		"""RSI crossback signal (WTF Pine Script).
+
+		Long  when RSI[-2] < lower and RSI[-1] >= lower (crossback up).
+		Short when RSI[-2] > upper and RSI[-1] <= upper (crossback down).
+		Optionally require a WT green/red dot within the last N bars.
+		"""
+		min_bars = max(self._rsi_period, self._wt_channel) + 5
+		if len(history) < min_bars:
+			return None
+		close = history["close"].astype(float).values
+		rsi_series = rsi_indicator(close, self._rsi_period)
+		if len(rsi_series) < 2:
+			return None
+		r_prev = rsi_series[-2]
+		r_now = rsi_series[-1]
+		if np.isnan(r_prev) or np.isnan(r_now):
+			return None
+
+		rsi_buy = (r_prev < self._rsi_lower) and (r_now >= self._rsi_lower)
+		rsi_sell = (r_prev > self._rsi_upper) and (r_now <= self._rsi_upper)
+		if not (rsi_buy or rsi_sell):
+			return None
+
+		if self._require_wt_confirm:
+			wt1, wt2 = wt_indicator(
+				high=history["high"].astype(float).values,
+				low=history["low"].astype(float).values,
+				close=close,
+				channel_len=self._wt_channel,
+				average_len=self._wt_avg,
+				signal_len=self._wt_signal,
+			)
+			lb = min(self._wt_lookback + 1, len(wt1))
+			wt1_tail = wt1[-lb:]
+			wt2_tail = wt2[-lb:]
+			green = red = False
+			for i in range(1, len(wt1_tail)):
+				if np.isnan(wt1_tail[i]) or np.isnan(wt1_tail[i-1]):
+					continue
+				cross_up = wt1_tail[i-1] <= wt2_tail[i-1] and wt1_tail[i] > wt2_tail[i]
+				cross_dn = wt1_tail[i-1] >= wt2_tail[i-1] and wt1_tail[i] < wt2_tail[i]
+				if cross_up and wt2_tail[i] <= self._wt_oversold:
+					green = True
+				if cross_dn and wt2_tail[i] >= self._wt_overbought:
+					red = True
+			if rsi_buy and not green:
+				return None
+			if rsi_sell and not red:
+				return None
+
+		return "long" if rsi_buy else "short"
+
+	# ------------------------------------------------------------------
+	def _bollinger_fade_signal(self, history: pd.DataFrame) -> Optional[str]:
+		"""Mean-reversion fade at BB extremes with RSI + BB-width gate.
+
+		Long  : close <= lower BB AND RSI < rsi_long_max AND width in band
+				[AND close > EMA200 if ema_trend_filter]
+		Short : close >= upper BB AND RSI > rsi_short_min AND width in band
+				[AND close < EMA200 if ema_trend_filter]
+		"""
+		need = max(self._bb_period, self._rsi_period, self._bb_ema_len if self._bb_ema_filter else 0) + 5
+		if len(history) < need:
+			return None
+		close = history["close"].astype(float).values
+		mid, upper, lower = bb_indicator(close, self._bb_period, self._bb_std)
+		c = close[-1]
+		m = mid[-1]; up = upper[-1]; lo = lower[-1]
+		if np.isnan(m) or np.isnan(up) or np.isnan(lo) or m <= 0:
+			return None
+		width_bps = (up - lo) / m * 10_000
+		if width_bps < self._bb_width_min_bps or width_bps > self._bb_width_max_bps:
+			return None
+		rsi_series = rsi_indicator(close, self._rsi_period)
+		r_now = rsi_series[-1]
+		if np.isnan(r_now):
+			return None
+
+		long_ok = (c <= lo) and (r_now < self._bb_rsi_long_max)
+		short_ok = (c >= up) and (r_now > self._bb_rsi_short_min)
+		if not (long_ok or short_ok):
+			return None
+
+		if self._bb_ema_filter:
+			ema_series = ema_indicator(close, self._bb_ema_len)
+			e_now = ema_series[-1]
+			if np.isnan(e_now):
+				return None
+			if long_ok and c <= e_now:
+				return None
+			if short_ok and c >= e_now:
+				return None
+
+		return "long" if long_ok else "short"
+
+	# ------------------------------------------------------------------
+	def _calc_leverage(self, margin: float) -> float:
+		"""Dynamic leverage: lev = risk$ / (margin$ * SL_fraction).
+
+		Mirrors the ebirth.net leverage calculator.
+		Caps at exchange max; floors at min_leverage.
+		"""
+		if not self._dynamic_leverage or margin <= 0:
+			return self._leverage if self._leverage > 0 else 20.0
+		risk_usd = self.equity * self._risk_pct
+		sl_frac = self._sl_bps / 10_000.0
+		if sl_frac <= 0:
+			return self._max_leverage
+		lev = risk_usd / (margin * sl_frac)
+		return max(self._min_leverage, min(lev, self._max_leverage))
+
+	# ------------------------------------------------------------------
 	def _open_position(self, side: str, price: float, bar_time: pd.Timestamp) -> None:
 		margin = self.equity * self._margin_frac
-		notional = margin * self._leverage
+		leverage = self._calc_leverage(margin)
+		notional = margin * leverage
 		open_fee = notional * self._maker_rate  # limit order = maker
 		self.total_fees_gross += open_fee
 		self.total_volume_usd += notional
@@ -188,6 +348,7 @@ class VolumeFarmerSession:
 			kind="entry", time=bar_time,
 			payload={
 				"side": side, "price": price, "notional": notional,
+				"leverage": round(leverage, 1),
 				"fee": open_fee, "tp": tp, "sl": sl,
 				"equity": self.equity,
 				"volume": self.total_volume_usd,
@@ -207,7 +368,11 @@ class VolumeFarmerSession:
 		else:
 			pnl_pct = (p.entry_price - exit_price) / p.entry_price
 		gross_pnl = pnl_pct * p.notional
-		close_fee = p.notional * self._taker_rate  # market order = taker
+		# TP exits are limit orders (maker fee); SL/time_stop are market (taker fee)
+		if reason == "tp":
+			close_fee = p.notional * self._maker_rate
+		else:
+			close_fee = p.notional * self._taker_rate
 		net_pnl = gross_pnl - close_fee
 		self.total_fees_gross += close_fee
 		self.total_volume_usd += p.notional

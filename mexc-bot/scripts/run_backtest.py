@@ -26,6 +26,7 @@ from data.storage import initialize_audit_db, load_parquet, persist_backtest_aud
 from strategy.base import Strategy
 from strategy.bollinger import BollingerMeanReversionStrategy
 from strategy.cipher_confluence import CipherConfluenceStrategy
+from strategy.rsi_wt import RsiWtStrategy
 
 
 def build_strategy(config: dict) -> Strategy:
@@ -45,6 +46,8 @@ def build_strategy(config: dict) -> Strategy:
 		return CipherConfluenceStrategy(config)
 	if name in {"bollinger_mean_reversion", "bollinger"}:
 		return BollingerMeanReversionStrategy(config)
+	if name in {"rsi_wt", "rsi_wavetrend", "wtf"}:
+		return RsiWtStrategy(config)
 	raise ValueError(f"Unknown strategy: {name}")
 
 console = Console()
