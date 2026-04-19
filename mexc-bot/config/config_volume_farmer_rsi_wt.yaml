@@ -1,0 +1,72 @@
+app:
+  name: volume-farmer-rsi-wt
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# VOLUME FARMER — RSI+WT signal variant.
+# Uses WTF Indicator (RSI crossback) on 5m BTC to pick direction, then runs the
+# same tight 10 bps TP/SL scalp as the base farmer. Goal: $100 -> $1M notional
+# with positive fee-cover after the 70% monthly rebate.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0001                    # 1 bps — limit open
+  taker: 0.0005                    # 5 bps — market close
+  rebate_pct: 0.70                 # 70% monthly rebate
+
+farmer:
+  capital_usd: 100.0
+  leverage: 20                     # $60 margin × 20x = $1,200 notional
+  margin_fraction_per_trade: 0.6
+
+  # Tight scalp bracket — same as base farmer (NOT the 2:1 RR from backtest)
+  tp_bps: 10.0                     # 0.10% TP
+  sl_bps: 10.0                     # 0.10% SL
+  max_hold_bars: 2                 # force exit after 10 min
+
+  # Entry signal: RSI crossback (WTF Pine) — optional WT confluence
+  entry:
+    mode: rsi_wt
+    # Range guards apply only to non rsi_wt modes — RSI handles filtering
+    min_bar_range_bps: 0.0
+    max_bar_range_bps: 10000.0
+    rsi:
+      period: 14
+      upper: 70.0                  # short on crossback down through 70
+      lower: 30.0                  # long on crossback up through 30
+    wavetrend:
+      channel_len: 9
+      average_len: 12
+      signal_len: 3
+      oversold: -53.0
+      overbought: 53.0
+    require_wt_confirmation: false # Phase 1: RSI only (higher frequency)
+    wt_confluence_lookback: 3
+
+  alternate_direction: false       # respect the indicator direction
+
+risk:
+  daily_loss_limit_pct: 0.20
+  max_drawdown_pct: 0.60
+  consecutive_losses_limit: 6
+  consecutive_losses_cooldown_bars: 24
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 1000000.0
+  min_fee_cover_pct: 0.30
+
+notifications:
+  telegram:
+    enabled: true
+    send_daily: true
+    send_errors: true
+    send_milestones: true
+    daily_report_hour: 0
+
+reporting:
+  output_dir: data/reports
