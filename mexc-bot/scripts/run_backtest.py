@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
 	"""
 	parser = argparse.ArgumentParser(description="Run Bollinger strategy backtest.")
 	parser.add_argument(
+		"--config",
+		type=str,
+		default="config/config.yaml",
+		help="Path to config YAML (relative to project root or absolute).",
+	)
+	parser.add_argument(
 		"--data",
 		type=str,
 		default=None,
@@ -73,20 +79,28 @@ def parse_args() -> argparse.Namespace:
 	return parser.parse_args()
 
 
-def load_config() -> dict:
-	"""Load root config.yaml.
+def load_config(path: pathlib.Path | None = None) -> dict:
+	"""Load config YAML.
+
+	Args:
+		path: Optional absolute or project-relative path. Defaults to config/config.yaml.
 
 	Returns:
 		Parsed config dict.
 	"""
-	with (PROJECT_ROOT / "config" / "config.yaml").open("r", encoding="utf-8") as handle:
+	if path is None:
+		path = PROJECT_ROOT / "config" / "config.yaml"
+	with path.open("r", encoding="utf-8") as handle:
 		return yaml.safe_load(handle)
 
 
 def main() -> None:
 	"""Execute backtest and report generation."""
 	args = parse_args()
-	config = load_config()
+	cfg_path = pathlib.Path(args.config)
+	if not cfg_path.is_absolute():
+		cfg_path = PROJECT_ROOT / cfg_path
+	config = load_config(cfg_path)
 
 	symbol = config["exchange"]["symbol"]
 	timeframe = config["exchange"]["timeframe"]

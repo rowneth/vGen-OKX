@@ -1,0 +1,59 @@
+app:
+  name: volume-farmer
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# VOLUME FARMER BOT — completely separate from 15m/5m strategies.
+# Goal: hit $1M traded notional on $100 paper capital while covering >=30% of fees via PnL.
+# Behaviour: acts like a normal scalp trader (micro-momentum, small TP/SL, real holds),
+# NOT instant wash trading. Alternating directional bias keeps net exposure near zero.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+  effective_rate: 0.0001   # assume post-only maker fills (paper sim)
+
+farmer:
+  capital_usd: 100.0
+  leverage: 10                     # 10x keeps bust-risk manageable
+  margin_fraction_per_trade: 0.6   # 60% margin -> ~$600 notional
+
+  # Entry bracket
+  tp_bps: 10.0                     # 0.10% TP
+  sl_bps: 10.0                     # 0.10% SL
+  max_hold_bars: 2                 # exit at market after 2 bars (10 min)
+
+  # Entry signal: micro-momentum (follow prior bar direction)
+  entry:
+    mode: micro_momentum           # 'micro_momentum' | 'alternate' | 'mean_revert'
+    min_bar_range_bps: 4.0         # skip dead bars
+    max_bar_range_bps: 40.0        # skip violent bars
+  alternate_direction: true        # flip bias after each round-trip to stay flat on net
+
+# Capital-preservation rails (tuned for volume-farming bleed tolerance)
+risk:
+  daily_loss_limit_pct: 0.20       # allow 20%/day bleed before halting
+  max_drawdown_pct: 0.60           # HARD KILL at -60% absolute
+  consecutive_losses_limit: 6      # 6 losers in a row -> cooldown
+  consecutive_losses_cooldown_bars: 24   # 2 hour cooldown, then resume
+  stop_on_volume_target: true      # halt when $1M volume hit
+
+target:
+  volume_usd: 1000000.0
+  min_fee_cover_pct: 0.30          # reporting threshold
+
+notifications:
+  telegram:
+    enabled: true
+    send_daily: true
+    send_errors: true
+    send_milestones: true          # 100k, 250k, 500k, 750k, 1M volume pings
+    daily_report_hour: 0
+
+reporting:
+  output_dir: data/reports

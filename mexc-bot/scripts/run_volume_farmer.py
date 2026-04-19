@@ -1,0 +1,332 @@
+"""Live paper runner for the volume-farmer bot.
+
+Polls BTC_USDT 5m klines from MEXC (same feed as run_paper.py but fully isolated
+state / log / config) and drives :class:`VolumeFarmerSession`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import pathlib
+import signal
+import sys
+from datetime import datetime, time as dt_time, timedelta
+from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import yaml
+from dotenv import load_dotenv
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+	sys.path.insert(0, str(SRC_DIR))
+
+from data.historical import _normalize_kline_payload  # noqa: E402
+from exchange.mexc_client import MEXCClient  # noqa: E402
+from execution.volume_farmer import FarmerEvent, VolumeFarmerSession  # noqa: E402
+from monitoring.logger import configure_logging  # noqa: E402
+from monitoring.telegram_notifier import TelegramNotifier  # noqa: E402
+
+LOGGER = logging.getLogger("volume_farmer_runner")
+
+POLL_SECONDS = 30
+SEED_CANDLES = 50
+STATE_FILENAME = "volume_farmer_state.json"
+
+
+_TIMEFRAME_TO_MEXC = {
+	"1m": "Min1", "5m": "Min5", "15m": "Min15",
+	"30m": "Min30", "1h": "Min60", "4h": "Hour4", "1d": "Day1",
+}
+
+
+def _load_config(path: pathlib.Path) -> Dict[str, Any]:
+	with path.open("r", encoding="utf-8") as handle:
+		return yaml.safe_load(handle)
+
+
+def _parse_args() -> argparse.Namespace:
+	p = argparse.ArgumentParser(description="Run the volume farmer paper bot.")
+	p.add_argument("--config", type=str, default="config/config_volume_farmer.yaml")
+	p.add_argument("--state-file", type=str, default=None)
+	p.add_argument("--log-file", type=str, default="data/logs/volume_farmer.log")
+	p.add_argument("--label", type=str, default="VOL-FARM")
+	p.add_argument("--duration-days", type=float, default=7.0)
+	p.add_argument("--poll-seconds", type=int, default=POLL_SECONDS)
+	p.add_argument("--resume", action="store_true")
+	return p.parse_args()
+
+
+async def _fetch_candles(
+	client: MEXCClient, symbol: str, interval: str,
+	*, start: Optional[int] = None, end: Optional[int] = None,
+) -> pd.DataFrame:
+	payload = await client.get_klines(symbol=symbol, interval=interval, start=start, end=end)
+	rows = _normalize_kline_payload(payload)
+	if not rows:
+		return pd.DataFrame()
+	df = pd.DataFrame(rows)
+	return df.sort_values("open_time").drop_duplicates(subset=["open_time"]).reset_index(drop=True)
+
+
+async def _seed_history(
+	client: MEXCClient, symbol: str, interval: str, n: int
+) -> pd.DataFrame:
+	df = await _fetch_candles(client, symbol, interval)
+	if len(df) < n:
+		return df
+	return df.tail(n).reset_index(drop=True)
+
+
+def _fmt(v: float, digits: int = 2) -> str:
+	return f"{v:,.{digits}f}"
+
+
+def _build_event_handler(notifier: TelegramNotifier, symbol: str, send_milestones: bool):
+	loop = asyncio.get_event_loop()
+
+	def _escape(text: str) -> str:
+		for ch in "_*[]()~`>#+-=|{}.!":
+			text = text.replace(ch, f"\\{ch}")
+		return text
+
+	def handler(evt: FarmerEvent) -> None:
+		LOGGER.info("farmer evt %s %s", evt.kind, evt.payload)
+		if evt.kind == "milestone" and send_milestones:
+			pct = int(evt.payload["pct"] * 100)
+			msg = (
+				f"🎯 *Volume milestone: {pct}%*\n"
+				f"Volume: `{_escape(_fmt(evt.payload['volume']))}` USD\n"
+				f"Equity: `{_escape(_fmt(evt.payload['equity'], 4))}`\n"
+				f"Fees: `{_escape(_fmt(evt.payload['fees'], 2))}`  "
+				f"PnL: `{_escape(_fmt(evt.payload['pnl'], 2))}`"
+			)
+			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+		elif evt.kind == "halt":
+			msg = (
+				f"🛑 *Volume farmer HALTED*\n"
+				f"Reason: `{_escape(evt.payload['reason'])}`\n"
+				f"Equity: `{_escape(_fmt(evt.payload['equity'], 4))}`\n"
+				f"Volume: `{_escape(_fmt(evt.payload['volume']))}` USD"
+			)
+			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+
+	return handler
+
+
+async def _daily_report_loop(
+	session: VolumeFarmerSession,
+	notifier: TelegramNotifier,
+	hour_local: int,
+	stop_event: asyncio.Event,
+	local_tz: ZoneInfo,
+) -> None:
+	while not stop_event.is_set():
+		now = datetime.now(tz=local_tz)
+		next_run = datetime.combine(now.date(), dt_time(hour=hour_local, tzinfo=local_tz))
+		if next_run <= now:
+			next_run += timedelta(days=1)
+		try:
+			await asyncio.wait_for(stop_event.wait(), timeout=(next_run - now).total_seconds())
+			return
+		except asyncio.TimeoutError:
+			pass
+
+		s = session.summary()
+		def esc(t: str) -> str:
+			for ch in "_*[]()~`>#+-=|{}.!":
+				t = t.replace(ch, f"\\{ch}")
+			return t
+		msg = (
+			f"📊 *Daily digest — volume farmer*\n"
+			f"Volume: `{esc(_fmt(s['volume_usd']))}` USD  "
+			f"\\({esc(str(s['volume_target_pct']))}% of target\\)\n"
+			f"Round\\-trips: `{s['round_trips']}`  "
+			f"Win rate: `{esc(str(s['win_rate_pct']))}`%\n"
+			f"Equity: `{esc(_fmt(s['equity'], 4))}`  "
+			f"Δ: `{esc(_fmt(s['equity_delta'], 4))}`\n"
+			f"Fees: `{esc(_fmt(s['fees_paid'], 2))}`  "
+			f"PnL: `{esc(_fmt(s['total_pnl'], 2))}`  "
+			f"Fee cover: `{esc(str(s['fee_cover_pct']))}`%"
+		)
+		try:
+			await notifier.send_raw(msg)
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.exception("daily digest send failed: %s", exc)
+
+
+async def _run(args: argparse.Namespace) -> None:
+	config_path = pathlib.Path(args.config)
+	if not config_path.is_absolute():
+		config_path = PROJECT_ROOT / config_path
+	config = _load_config(config_path)
+
+	log_file = pathlib.Path(args.log_file)
+	if not log_file.is_absolute():
+		log_file = PROJECT_ROOT / log_file
+	configure_logging(log_level=str(config["app"].get("log_level", "INFO")), log_file_path=log_file)
+
+	load_dotenv(PROJECT_ROOT / ".env", override=False)
+	if args.label:
+		os.environ["BOT_LABEL"] = args.label
+
+	tz_name = str(config["app"].get("timezone", "Asia/Colombo"))
+	try:
+		local_tz = ZoneInfo(tz_name)
+	except Exception:
+		local_tz = ZoneInfo("UTC")
+
+	symbol = str(config["exchange"]["symbol"])
+	timeframe = str(config["exchange"].get("timeframe", "5m")).lower()
+	interval = _TIMEFRAME_TO_MEXC.get(timeframe, "Min5")
+
+	session = VolumeFarmerSession(config=config)
+
+	state_filename = args.state_file or STATE_FILENAME
+	state_path = PROJECT_ROOT / "data" / state_filename
+	if args.resume:
+		session.load_state(state_path)
+		LOGGER.info(
+			"Resumed: equity=%.2f vol=%.2f trips=%d",
+			session.equity, session.total_volume_usd, session.round_trips,
+		)
+
+	notif_cfg = config.get("notifications", {}).get("telegram", {}) or {}
+	notifier = TelegramNotifier()
+	await notifier.start()
+	session.event_callback = _build_event_handler(
+		notifier, symbol, bool(notif_cfg.get("send_milestones", True)),
+	)
+
+	stop_event = asyncio.Event()
+
+	def _handle_stop(*_a: Any) -> None:
+		LOGGER.info("Stop signal received.")
+		stop_event.set()
+
+	loop = asyncio.get_running_loop()
+	for sig in (signal.SIGINT, signal.SIGTERM):
+		try:
+			loop.add_signal_handler(sig, _handle_stop)
+		except NotImplementedError:
+			signal.signal(sig, _handle_stop)
+
+	report_hour = int(notif_cfg.get("daily_report_hour", 0))
+	report_task = asyncio.create_task(
+		_daily_report_loop(session, notifier, report_hour, stop_event, local_tz),
+		name="farmer-daily-report",
+	)
+
+	api_key = os.getenv("MEXC_API_KEY", "").strip()
+	api_secret = os.getenv("MEXC_API_SECRET", "").strip()
+	client = MEXCClient(
+		api_key=api_key or "paper",
+		api_secret=api_secret or "paper",
+		base_url="https://contract.mexc.com",
+	)
+	try:
+		async with client:
+			LOGGER.info("Seeding %d candles for %s %s ...", SEED_CANDLES, symbol, interval)
+			history = await _seed_history(client, symbol, interval, SEED_CANDLES)
+			if history.empty:
+				LOGGER.error("No candles returned; aborting.")
+				return
+			LOGGER.info("Seeded %d candles; last=%s", len(history), history.iloc[-1]["open_time"])
+
+			# Drop forming bar if any — keep only closed
+			now_ms = int(datetime.now(tz=timezone_utc()).timestamp() * 1000)
+			history = _drop_forming(history, interval, now_ms)
+
+			deadline = datetime.now() + timedelta(days=args.duration_days)
+			last_ts = history.iloc[-1]["open_time"] if not history.empty else None
+
+			await notifier.send_raw(
+				"🚜 *Volume farmer started*\n"
+				f"Symbol: `BTC\\_USDT`  TF: `{timeframe}`\n"
+				f"Capital: `{_fmt(session.equity, 2)}` USD  "
+				f"Target: `{_fmt(session._volume_target, 0)}` USD"
+			)
+
+			while not stop_event.is_set():
+				if datetime.now() >= deadline:
+					LOGGER.info("Duration elapsed; stopping.")
+					break
+				if session.halted:
+					LOGGER.info("Session halted (%s); stopping poll loop.", session.halt_reason)
+					break
+				try:
+					fresh = await _fetch_candles(client, symbol, interval)
+					fresh = _drop_forming(fresh, interval, int(datetime.now(tz=timezone_utc()).timestamp() * 1000))
+					if not fresh.empty and last_ts is not None:
+						new_rows = fresh[fresh["open_time"] > last_ts]
+						if not new_rows.empty:
+							for _, row in new_rows.iterrows():
+								history = pd.concat([history, row.to_frame().T], ignore_index=True)
+								history = history.tail(200).reset_index(drop=True)
+								session.on_new_candle(history)
+								last_ts = row["open_time"]
+								session.save_state(state_path)
+				except Exception as exc:  # noqa: BLE001
+					LOGGER.exception("poll iteration failed: %s", exc)
+				try:
+					await asyncio.wait_for(stop_event.wait(), timeout=args.poll_seconds)
+					break
+				except asyncio.TimeoutError:
+					continue
+	finally:
+		s = session.summary()
+		def esc(t: str) -> str:
+			for ch in "_*[]()~`>#+-=|{}.!":
+				t = t.replace(ch, f"\\{ch}")
+			return t
+		try:
+			await notifier.send_raw(
+				"🛑 *Volume farmer stopped*\n"
+				f"Volume: `{esc(_fmt(s['volume_usd']))}` USD  "
+				f"\\({esc(str(s['volume_target_pct']))}%\\)\n"
+				f"Round\\-trips: `{s['round_trips']}`  WR: `{esc(str(s['win_rate_pct']))}`%\n"
+				f"Equity: `{esc(_fmt(s['equity'], 4))}`  "
+				f"Fees: `{esc(_fmt(s['fees_paid'], 2))}`  "
+				f"PnL: `{esc(_fmt(s['total_pnl'], 2))}`  "
+				f"Fee cover: `{esc(str(s['fee_cover_pct']))}`%"
+			)
+		except Exception:  # noqa: BLE001
+			LOGGER.exception("final notify failed")
+		stop_event.set()
+		report_task.cancel()
+		try:
+			await report_task
+		except (asyncio.CancelledError, Exception):
+			pass
+		await notifier.stop()
+		session.save_state(state_path)
+		LOGGER.info("Final summary: %s", s)
+
+
+def timezone_utc():
+	from datetime import timezone as _tz
+	return _tz.utc
+
+
+def _drop_forming(df: pd.DataFrame, interval: str, now_ms: int) -> pd.DataFrame:
+	if df.empty:
+		return df
+	bar_minutes = {
+		"Min1": 1, "Min5": 5, "Min15": 15, "Min30": 30,
+		"Min60": 60, "Hour4": 240, "Day1": 1440,
+	}.get(interval, 5)
+	last = df.iloc[-1]
+	last_open = pd.Timestamp(last["open_time"]).value // 1_000_000
+	close_ms = last_open + bar_minutes * 60 * 1000
+	if close_ms > now_ms:
+		return df.iloc[:-1].reset_index(drop=True)
+	return df
+
+
+if __name__ == "__main__":
+	asyncio.run(_run(_parse_args()))
