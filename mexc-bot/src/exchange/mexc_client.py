@@ -113,6 +113,209 @@ class MEXCClient:
 		path = "/api/v1/private/account/assets"
 		return await self._request("GET", path, auth=True)
 
+	# ------------------------------------------------------------------
+	# Order + trigger-order wrappers
+	# ------------------------------------------------------------------
+
+	async def submit_order(
+		self,
+		symbol: str,
+		side: int,
+		order_type: int,
+		vol: float,
+		price: Optional[float] = None,
+		leverage: Optional[int] = None,
+		open_type: int = 1,
+		position_id: Optional[int] = None,
+		external_oid: Optional[str] = None,
+		stop_loss_price: Optional[float] = None,
+		take_profit_price: Optional[float] = None,
+		reduce_only: bool = False,
+	) -> Any:
+		"""Submit a contract order, optionally with attached SL/TP.
+
+		Args:
+			symbol: Contract symbol (e.g. ``BTC_USDT``).
+			side: MEXC side code (1=open long, 2=close short, 3=open short, 4=close long).
+			order_type: 1=limit, 5=market, 6=post-only (per MEXC contract API).
+			vol: Order size in contracts.
+			price: Limit price (required for non-market types).
+			leverage: Optional leverage override.
+			open_type: 1=isolated, 2=cross.
+			position_id: Existing position id for close-side operations.
+			external_oid: Client-supplied external order id (idempotency).
+			stop_loss_price: Optional server-side SL attached on fill.
+			take_profit_price: Optional server-side TP attached on fill.
+			reduce_only: Reduce-only flag.
+
+		Returns:
+			Decoded exchange response (typically an order id).
+		"""
+		body: Dict[str, Any] = {
+			"symbol": symbol,
+			"side": int(side),
+			"type": int(order_type),
+			"vol": float(vol),
+			"openType": int(open_type),
+			"reduceOnly": bool(reduce_only),
+		}
+		if price is not None:
+			body["price"] = float(price)
+		if leverage is not None:
+			body["leverage"] = int(leverage)
+		if position_id is not None:
+			body["positionId"] = int(position_id)
+		if external_oid is not None:
+			body["externalOid"] = str(external_oid)
+		if stop_loss_price is not None:
+			body["stopLossPrice"] = float(stop_loss_price)
+		if take_profit_price is not None:
+			body["takeProfitPrice"] = float(take_profit_price)
+
+		return await self._request(
+			"POST", "/api/v1/private/order/submit", body=body, auth=True
+		)
+
+	async def place_trigger_order(
+		self,
+		symbol: str,
+		side: int,
+		vol: float,
+		trigger_price: float,
+		trigger_type: int,
+		execute_cycle: int = 1,
+		order_type: int = 5,
+		price: Optional[float] = None,
+		leverage: Optional[int] = None,
+		open_type: int = 1,
+		trend: int = 1,
+	) -> Any:
+		"""Place a standalone plan/trigger order (stop-loss or take-profit).
+
+		Args:
+			symbol: Contract symbol.
+			side: MEXC side code (same scheme as ``submit_order``).
+			vol: Size in contracts.
+			trigger_price: Price that fires the order.
+			trigger_type: 1=price <= trigger (stop for long / TP for short),
+				2=price >= trigger (TP for long / stop for short).
+			execute_cycle: 1=24h, 2=7d validity.
+			order_type: Resulting order type after trigger (5=market, 1=limit).
+			price: Limit price (only when order_type=1).
+			leverage: Optional leverage.
+			open_type: 1=isolated, 2=cross.
+			trend: 1=latest price, 2=fair price, 3=index price.
+
+		Returns:
+			Decoded plan-order id payload.
+		"""
+		body: Dict[str, Any] = {
+			"symbol": symbol,
+			"side": int(side),
+			"vol": float(vol),
+			"triggerPrice": float(trigger_price),
+			"triggerType": int(trigger_type),
+			"executeCycle": int(execute_cycle),
+			"orderType": int(order_type),
+			"openType": int(open_type),
+			"trend": int(trend),
+		}
+		if price is not None:
+			body["price"] = float(price)
+		if leverage is not None:
+			body["leverage"] = int(leverage)
+
+		return await self._request(
+			"POST", "/api/v1/private/planorder/place", body=body, auth=True
+		)
+
+	async def change_stop_price(
+		self,
+		stop_order_id: int,
+		*,
+		stop_loss_price: Optional[float] = None,
+		take_profit_price: Optional[float] = None,
+	) -> Any:
+		"""Modify the SL/TP price of an existing position-bound stop order.
+
+		Use this to trail a stop after TP1/TP2 without cancelling + re-placing.
+
+		Args:
+			stop_order_id: The stop order id returned by MEXC when the SL/TP
+				was first attached (or ``positionId`` for position-level SL/TP
+				depending on MEXC account mode).
+			stop_loss_price: New SL price, or None to leave unchanged.
+			take_profit_price: New TP price, or None to leave unchanged.
+
+		Returns:
+			Decoded exchange response.
+
+		Raises:
+			ValueError: If neither price is provided.
+		"""
+		if stop_loss_price is None and take_profit_price is None:
+			raise ValueError("Provide stop_loss_price and/or take_profit_price")
+
+		body: Dict[str, Any] = {"orderId": int(stop_order_id)}
+		if stop_loss_price is not None:
+			body["stopLossPrice"] = float(stop_loss_price)
+		if take_profit_price is not None:
+			body["takeProfitPrice"] = float(take_profit_price)
+
+		return await self._request(
+			"POST",
+			"/api/v1/private/stoporder/change_price",
+			body=body,
+			auth=True,
+		)
+
+	async def cancel_trigger_order(self, order_ids: list) -> Any:
+		"""Cancel one or more pending plan/trigger orders.
+
+		Args:
+			order_ids: List of plan-order ids to cancel.
+
+		Returns:
+			Decoded exchange response.
+		"""
+		body = [{"orderId": int(oid)} for oid in order_ids]
+		return await self._request(
+			"POST",
+			"/api/v1/private/planorder/cancel",
+			body=body,
+			auth=True,
+		)
+
+	async def cancel_stop_order(self, stop_plan_order_ids: list) -> Any:
+		"""Cancel position-bound stop orders (SL/TP attached to open positions).
+
+		Args:
+			stop_plan_order_ids: List of stop-plan order ids to cancel.
+
+		Returns:
+			Decoded exchange response.
+		"""
+		body = [{"stopPlanOrderId": int(oid)} for oid in stop_plan_order_ids]
+		return await self._request(
+			"POST", "/api/v1/private/stoporder/cancel", body=body, auth=True
+		)
+
+	async def get_open_positions(self, symbol: Optional[str] = None) -> Any:
+		"""Fetch currently open futures positions.
+
+		Args:
+			symbol: Optional contract symbol filter.
+
+		Returns:
+			Decoded positions payload.
+		"""
+		params: Dict[str, Any] = {}
+		if symbol is not None:
+			params["symbol"] = symbol
+		return await self._request(
+			"GET", "/api/v1/private/position/open_positions", params=params, auth=True
+		)
+
 	async def get_api_permission_snapshot(self) -> Dict[str, Any]:
 		"""Fetch API-key permission payload from private account endpoints.
 
@@ -154,7 +357,7 @@ class MEXCClient:
 		method: str,
 		path: str,
 		params: Optional[Dict[str, Any]] = None,
-		body: Optional[Dict[str, Any]] = None,
+		body: Optional[Any] = None,
 		auth: bool = False,
 	) -> Any:
 		"""Perform a rate-limited HTTP request.
@@ -180,7 +383,7 @@ class MEXCClient:
 
 		url = f"{self._base_url}{path}"
 		headers: Dict[str, str] = {"Content-Type": "application/json"}
-		json_body: Optional[Dict[str, Any]] = body
+		json_body: Optional[Any] = body
 		request_param_string = self._build_request_param_string(params=params, body=body)
 
 		if auth:
@@ -248,19 +451,21 @@ class MEXCClient:
 	@staticmethod
 	def _build_request_param_string(
 		params: Optional[Dict[str, Any]] = None,
-		body: Optional[Dict[str, Any]] = None,
+		body: Optional[Any] = None,
 	) -> str:
 		"""Create canonical request parameter string for signing.
 
 		Args:
 			params: Query parameters.
-			body: JSON body.
+			body: JSON body (dict or list).
 
 		Returns:
 			Canonical string used by MEXC signing algorithm.
 		"""
-		if body:
-			return json.dumps(body, separators=(",", ":"), sort_keys=True)
+		if body is not None:
+			if isinstance(body, dict):
+				return json.dumps(body, separators=(",", ":"), sort_keys=True)
+			return json.dumps(body, separators=(",", ":"))
 		if not params:
 			return ""
 		normalized = {key: params[key] for key in sorted(params.keys())}
