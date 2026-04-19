@@ -23,7 +23,29 @@ from backtest.engine import BacktestEngine
 from backtest.metrics import calculate_metrics
 from backtest.report import generate_html_report, generate_markdown_report
 from data.storage import initialize_audit_db, load_parquet, persist_backtest_audit
+from strategy.base import Strategy
 from strategy.bollinger import BollingerMeanReversionStrategy
+from strategy.cipher_confluence import CipherConfluenceStrategy
+
+
+def build_strategy(config: dict) -> Strategy:
+	"""Instantiate the strategy selected in config.
+
+	Args:
+		config: Parsed config dict.
+
+	Returns:
+		Strategy implementation.
+
+	Raises:
+		ValueError: If strategy name is unknown.
+	"""
+	name = str(config["strategy"].get("name", "cipher_confluence")).lower()
+	if name == "cipher_confluence":
+		return CipherConfluenceStrategy(config)
+	if name in {"bollinger_mean_reversion", "bollinger"}:
+		return BollingerMeanReversionStrategy(config)
+	raise ValueError(f"Unknown strategy: {name}")
 
 console = Console()
 
@@ -84,7 +106,7 @@ def main() -> None:
 	if args.rows is not None:
 		candles = candles.tail(args.rows).reset_index(drop=True)
 
-	strategy = BollingerMeanReversionStrategy(config)
+	strategy = build_strategy(config)
 	engine = BacktestEngine(config)
 	result = engine.run(candles, strategy)
 	metrics = calculate_metrics(

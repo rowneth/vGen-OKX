@@ -14,7 +14,18 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
 	sys.path.insert(0, str(SRC))
 
-from strategy.indicators import atr, bollinger_bands, ema, rolling_std, rsi, sma
+from strategy.indicators import (
+	atr,
+	bollinger_bands,
+	ema,
+	fib_bands,
+	money_flow_index,
+	rolling_std,
+	rsi,
+	sma,
+	smoothed_sma,
+	wavetrend,
+)
 
 
 def test_sma_computes_expected_values() -> None:
@@ -87,3 +98,47 @@ def test_indicator_period_validation() -> None:
 		rsi([1, 2, 3], period=0)
 	with pytest.raises(ValueError):
 		rolling_std([1, 2, 3], period=0)
+
+
+def test_smoothed_sma_matches_double_sma() -> None:
+	values = np.linspace(1.0, 10.0, 50)
+	direct = sma(sma(values, 5), 5)
+	ssma = smoothed_sma(values, 5)
+	mask = ~np.isnan(direct)
+	assert np.allclose(ssma[mask], direct[mask])
+
+
+def test_fib_bands_order_and_mult_scales() -> None:
+	values = np.concatenate([np.linspace(100, 110, 30), np.linspace(110, 95, 30)])
+	mid, up, lo = fib_bands(values, period=20, mult=2.618)
+	mask = ~np.isnan(up)
+	assert (up[mask] >= mid[mask]).all()
+	assert (lo[mask] <= mid[mask]).all()
+	# Wider than Bollinger at same period with 2 std-dev multiplier.
+	_, bbu, _ = bollinger_bands(values, period=20, std_dev=2.0)
+	assert np.nanmean(up - mid) > np.nanmean(bbu - mid)
+
+
+def test_wavetrend_emits_bounded_oscillator() -> None:
+	rng = np.random.default_rng(7)
+	close = 100 + np.cumsum(rng.normal(0, 0.5, 300))
+	high = close + rng.uniform(0.1, 1.0, 300)
+	low = close - rng.uniform(0.1, 1.0, 300)
+	wt1, wt2 = wavetrend(high, low, close)
+	mask = ~np.isnan(wt2)
+	assert mask.sum() > 100
+	# WT typically oscillates within ~[-120, 120]; assert finite / bounded.
+	assert np.all(np.abs(wt2[mask]) < 500.0)
+
+
+def test_money_flow_index_bounds() -> None:
+	rng = np.random.default_rng(3)
+	close = 100 + np.cumsum(rng.normal(0, 0.4, 200))
+	high = close + 0.5
+	low = close - 0.5
+	volume = rng.uniform(500, 2000, 200)
+	out = money_flow_index(high, low, close, volume, period=14)
+	mask = ~np.isnan(out)
+	assert mask.sum() > 100
+	assert np.all(out[mask] >= 0.0)
+	assert np.all(out[mask] <= 100.0)
