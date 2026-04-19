@@ -20,8 +20,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
 import aiohttp
+from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger(__name__)
+
+_UTC = ZoneInfo("UTC")
 
 
 _MD_V2_ESCAPE = re.compile(r"([_\*\[\]\(\)~`>#\+\-=\|{}\.!\\])")
@@ -95,6 +98,11 @@ class TelegramNotifier:
 			self._enabled = bool(self._bot_token and self._chat_id)
 		else:
 			self._enabled = bool(enabled)
+		tz_name = os.getenv("BOT_TIMEZONE", "Asia/Colombo")
+		try:
+			self._tz = ZoneInfo(tz_name)
+		except Exception:
+			self._tz = _UTC
 		self._session = session
 		self._owns_session = session is None
 		self._timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
@@ -201,7 +209,7 @@ class TelegramNotifier:
 			f"Symbol: `{_md(symbol)}`  Timeframe: `{_md(timeframe)}`",
 			f"Strategy: `{_md(strategy)}`",
 			f"Equity: `{_md(_fmt_usd(equity))}`",
-			f"Time: `{_md(_now_iso())}`",
+			f"Time: `{_md(_now_iso(self._tz))}`",
 		]
 		await self.send_raw("\n".join(lines))
 
@@ -211,7 +219,7 @@ class TelegramNotifier:
 		await self.send_raw(
 			"🛑 *Bot stopping*\n"
 			f"Reason: `{_md(reason)}`\n"
-			f"Time: `{_md(_now_iso())}`"
+			f"Time: `{_md(_now_iso(self._tz))}`"
 		)
 
 	async def notify_signal(self, trade: TradeSnapshot) -> None:
@@ -369,8 +377,9 @@ class TelegramNotifier:
 		return "\n".join(lines)
 
 
-def _now_iso() -> str:
-	return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def _now_iso(tz: Optional[Any] = None) -> str:
+	use_tz = tz or ZoneInfo("Asia/Colombo")
+	return datetime.now(tz=use_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def build_notifier_from_env() -> TelegramNotifier:

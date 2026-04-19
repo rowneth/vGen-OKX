@@ -1,6 +1,7 @@
 aiohttp
 websockets
 pyyaml
+tzdata
 python-dotenv
 pandas
 numpy

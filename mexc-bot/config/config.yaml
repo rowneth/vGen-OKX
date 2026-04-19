@@ -1,7 +1,7 @@
 app:
   name: mexc-bollinger-bot
   environment: development
-  timezone: UTC
+  timezone: Asia/Colombo
   log_level: INFO
 
 exchange:
@@ -136,7 +136,7 @@ notifications:
     send_partials: true
     send_exits: true
     send_errors: true
-    daily_report_utc_hour: 0
+    daily_report_hour: 0
 
 reporting:
   output_dir: data/reports

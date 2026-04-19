@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
+
+_LOCAL_TZ = ZoneInfo("Asia/Colombo")
 
 SENSITIVE_PATTERNS = [
 	re.compile(r"(MEXC_API_KEY\s*=\s*)([^\s]+)", re.IGNORECASE),
@@ -30,7 +33,7 @@ class JsonFormatter(logging.Formatter):
 
 	def format(self, record: logging.LogRecord) -> str:
 		payload: Dict[str, Any] = {
-			"timestamp": datetime.now(tz=timezone.utc).isoformat(),
+			"timestamp": datetime.now(tz=_LOCAL_TZ).isoformat(),
 			"level": record.levelname,
 			"logger": record.name,
 			"message": redact_sensitive_text(record.getMessage()),
