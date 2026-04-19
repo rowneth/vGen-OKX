@@ -126,6 +126,18 @@ storage:
   sqlite_path: data/bot_audit.db
   parquet_compression: snappy
 
+notifications:
+  telegram:
+    enabled: true
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+    send_signals: true
+    send_entries: true
+    send_partials: true
+    send_exits: true
+    send_errors: true
+    daily_report_utc_hour: 0
+
 reporting:
   output_dir: data/reports
   create_html: true
