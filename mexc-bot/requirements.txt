@@ -10,3 +10,4 @@ rich
 plotly
 pyarrow
 tabulate
+streamlit
