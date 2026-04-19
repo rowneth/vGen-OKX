@@ -14,14 +14,17 @@ exchange:
   timeframe: 5m
 
 fees:
-  maker: 0.0001
-  taker: 0.0005
-  effective_rate: 0.0001   # assume post-only maker fills (paper sim)
+  maker: 0.0001                    # 1 bps — limit order open
+  taker: 0.0005                    # 5 bps — market order close
+  rebate_pct: 0.70                 # 70% of gross fees returned monthly
+  # Per round-trip: open maker 0.01% + close taker 0.05% on notional
+  # With $60 margin × 20x = $1,200 notional → $0.12 + $0.60 = $0.72 gross
+  # After 70% rebate: net $0.216 per round-trip
 
 farmer:
   capital_usd: 100.0
-  leverage: 10                     # 10x keeps bust-risk manageable
-  margin_fraction_per_trade: 0.6   # 60% margin -> ~$600 notional
+  leverage: 20                     # 20x — $60 margin → $1,200 notional
+  margin_fraction_per_trade: 0.6   # 60% of equity as margin per trade
 
   # Entry bracket
   tp_bps: 10.0                     # 0.10% TP

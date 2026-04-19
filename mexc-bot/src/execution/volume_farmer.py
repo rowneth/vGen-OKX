@@ -56,7 +56,7 @@ class VolumeFarmerSession:
 	start_equity: float = field(init=False)
 	position: Optional[_Position] = field(default=None, init=False)
 	total_volume_usd: float = field(default=0.0, init=False)
-	total_fees: float = field(default=0.0, init=False)
+	total_fees_gross: float = field(default=0.0, init=False)
 	total_pnl: float = field(default=0.0, init=False)
 	wins: int = field(default=0, init=False)
 	losses: int = field(default=0, init=False)
@@ -87,7 +87,9 @@ class VolumeFarmerSession:
 		self._max_range_bps = float(entry_cfg.get("max_bar_range_bps", 1_000.0))
 		self._alternate = bool(f.get("alternate_direction", True))
 		fees_cfg = self.config.get("fees", {})
-		self._fee_rate = float(fees_cfg.get("effective_rate", fees_cfg.get("taker", 0.0005)))
+		self._maker_rate = float(fees_cfg.get("maker", 0.0001))
+		self._taker_rate = float(fees_cfg.get("taker", 0.0005))
+		self._rebate_pct = float(fees_cfg.get("rebate_pct", 0.0))
 		risk_cfg = self.config.get("risk", {})
 		self._daily_loss_limit = float(risk_cfg.get("daily_loss_limit_pct", 0.05))
 		self._max_dd = float(risk_cfg.get("max_drawdown_pct", 0.25))
@@ -172,10 +174,10 @@ class VolumeFarmerSession:
 	def _open_position(self, side: str, price: float, bar_time: pd.Timestamp) -> None:
 		margin = self.equity * self._margin_frac
 		notional = margin * self._leverage
-		fee = notional * self._fee_rate
-		self.total_fees += fee
+		open_fee = notional * self._maker_rate  # limit order = maker
+		self.total_fees_gross += open_fee
 		self.total_volume_usd += notional
-		self.equity -= fee  # fee paid on open
+		self.equity -= open_fee  # fee paid on open
 		tp = price * (1 + self._tp_bps / 10_000) if side == "long" else price * (1 - self._tp_bps / 10_000)
 		sl = price * (1 - self._sl_bps / 10_000) if side == "long" else price * (1 + self._sl_bps / 10_000)
 		self.position = _Position(
@@ -185,9 +187,12 @@ class VolumeFarmerSession:
 		self._emit(FarmerEvent(
 			kind="entry", time=bar_time,
 			payload={
-				"side": side, "price": price, "notional": notional, "fee": fee,
-				"tp": tp, "sl": sl, "equity": self.equity,
+				"side": side, "price": price, "notional": notional,
+				"fee": open_fee, "tp": tp, "sl": sl,
+				"equity": self.equity,
 				"volume": self.total_volume_usd,
+				"round_trips": self.round_trips,
+				"capital": self.equity,
 			},
 		))
 
@@ -202,12 +207,12 @@ class VolumeFarmerSession:
 		else:
 			pnl_pct = (p.entry_price - exit_price) / p.entry_price
 		gross_pnl = pnl_pct * p.notional
-		exit_fee = p.notional * self._fee_rate
-		net_pnl = gross_pnl - exit_fee
-		self.total_fees += exit_fee
+		close_fee = p.notional * self._taker_rate  # market order = taker
+		net_pnl = gross_pnl - close_fee
+		self.total_fees_gross += close_fee
 		self.total_volume_usd += p.notional
 		self.total_pnl += net_pnl
-		self.equity += gross_pnl - exit_fee
+		self.equity += gross_pnl - close_fee
 		self.peak_equity = max(self.peak_equity, self.equity)
 		self._maybe_reset_daily(bar_time)
 		self.daily_pnl += net_pnl
@@ -222,6 +227,7 @@ class VolumeFarmerSession:
 			if self.consec_losses >= self._consec_loss_limit:
 				self.cooldown_bars_left = self._consec_loss_cooldown_bars
 				self.consec_losses = 0  # reset streak so next losses start fresh
+		open_fee = p.notional * self._maker_rate
 		self.ledger.append({
 			"entry_time": p.entry_time.isoformat(),
 			"exit_time": bar_time.isoformat(),
@@ -230,7 +236,9 @@ class VolumeFarmerSession:
 			"exit_price": exit_price,
 			"notional": p.notional,
 			"gross_pnl": gross_pnl,
-			"fees": exit_fee + p.notional * self._fee_rate,  # symmetric for record
+			"open_fee": open_fee,
+			"close_fee": close_fee,
+			"total_fee": open_fee + close_fee,
 			"net_pnl": net_pnl,
 			"reason": reason,
 		})
@@ -239,10 +247,12 @@ class VolumeFarmerSession:
 			payload={
 				"side": p.side, "entry_price": p.entry_price,
 				"exit_price": exit_price, "reason": reason,
-				"gross_pnl": gross_pnl, "fee": exit_fee, "net_pnl": net_pnl,
+				"gross_pnl": gross_pnl, "fee": open_fee + close_fee,
+				"net_pnl": net_pnl,
 				"equity": self.equity, "round_trips": self.round_trips,
 				"volume": self.total_volume_usd,
 				"wins": self.wins, "losses": self.losses,
+				"capital": self.equity,
 			},
 		))
 		self.position = None
@@ -259,7 +269,7 @@ class VolumeFarmerSession:
 					payload={
 						"pct": m, "volume": self.total_volume_usd,
 						"equity": self.equity,
-						"fees": self.total_fees, "pnl": self.total_pnl,
+						"fees_gross": self.total_fees_gross, "pnl": self.total_pnl,
 					},
 				))
 
@@ -313,16 +323,20 @@ class VolumeFarmerSession:
 	# ------------------------------------------------------------------
 	def summary(self) -> Dict[str, Any]:
 		wr = (self.wins / self.round_trips * 100.0) if self.round_trips else 0.0
-		fee_cover = (self.total_pnl / self.total_fees + 1.0) if self.total_fees > 0 else 0.0
+		net_fees = self.total_fees_gross * (1.0 - self._rebate_pct)
+		# fee_cover_pct: how much of gross fees the trade PnL covers
+		fee_cover = (self.total_pnl / self.total_fees_gross * 100) if self.total_fees_gross > 0 else 0.0
 		return {
 			"equity": round(self.equity, 4),
 			"start_equity": self.start_equity,
 			"equity_delta": round(self.equity - self.start_equity, 4),
 			"volume_usd": round(self.total_volume_usd, 2),
 			"volume_target_pct": round(self.total_volume_usd / max(self._volume_target, 1e-9) * 100, 2),
-			"fees_paid": round(self.total_fees, 4),
+			"fees_gross": round(self.total_fees_gross, 4),
+			"fees_net": round(net_fees, 4),
+			"rebate_estimate": round(self.total_fees_gross * self._rebate_pct, 4),
 			"total_pnl": round(self.total_pnl, 4),
-			"fee_cover_pct": round((self.total_pnl / self.total_fees * 100) if self.total_fees else 0.0, 2),
+			"fee_cover_pct": round(fee_cover, 2),
 			"round_trips": self.round_trips,
 			"wins": self.wins,
 			"losses": self.losses,
@@ -338,7 +352,7 @@ class VolumeFarmerSession:
 			"peak_equity": self.peak_equity,
 			"start_equity": self.start_equity,
 			"total_volume_usd": self.total_volume_usd,
-			"total_fees": self.total_fees,
+			"total_fees_gross": self.total_fees_gross,
 			"total_pnl": self.total_pnl,
 			"wins": self.wins,
 			"losses": self.losses,

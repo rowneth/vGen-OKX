@@ -97,22 +97,55 @@ def _build_event_handler(notifier: TelegramNotifier, symbol: str, send_milestone
 
 	def handler(evt: FarmerEvent) -> None:
 		LOGGER.info("farmer evt %s %s", evt.kind, evt.payload)
-		if evt.kind == "milestone" and send_milestones:
-			pct = int(evt.payload["pct"] * 100)
+		p = evt.payload
+
+		if evt.kind == "entry":
+			side_emoji = "🟢" if p["side"] == "long" else "🔴"
 			msg = (
-				f"🎯 *Volume milestone: {pct}%*\n"
-				f"Volume: `{_escape(_fmt(evt.payload['volume']))}` USD\n"
-				f"Equity: `{_escape(_fmt(evt.payload['equity'], 4))}`\n"
-				f"Fees: `{_escape(_fmt(evt.payload['fees'], 2))}`  "
-				f"PnL: `{_escape(_fmt(evt.payload['pnl'], 2))}`"
+				f"{side_emoji} *VOL\\-FARM ENTRY*\n"
+				f"Side: `{p['side'].upper()}`  Price: `{_escape(_fmt(p['price'], 1))}`\n"
+				f"Notional: `{_escape(_fmt(p['notional']))}`  Fee: `{_escape(_fmt(p['fee'], 4))}`\n"
+				f"TP: `{_escape(_fmt(p['tp'], 1))}`  SL: `{_escape(_fmt(p['sl'], 1))}`\n"
+				f"━━━━━━━━━━━━━━━━━━\n"
+				f"Capital: `{_escape(_fmt(p['capital'], 2))}` USD\n"
+				f"Volume: `{_escape(_fmt(p['volume']))}`  "
+				f"Trades: `{p['round_trips']}`"
 			)
 			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+
+		elif evt.kind == "exit":
+			result_emoji = "✅" if p["net_pnl"] >= 0 else "❌"
+			msg = (
+				f"{result_emoji} *VOL\\-FARM EXIT \\({_escape(p['reason'])}\\)*\n"
+				f"Side: `{p['side'].upper()}`  "
+				f"Entry: `{_escape(_fmt(p['entry_price'], 1))}`  "
+				f"Exit: `{_escape(_fmt(p['exit_price'], 1))}`\n"
+				f"PnL: `{_escape(_fmt(p['net_pnl'], 4))}`  Fee: `{_escape(_fmt(p['fee'], 4))}`\n"
+				f"━━━━━━━━━━━━━━━━━━\n"
+				f"Capital: `{_escape(_fmt(p['capital'], 2))}` USD\n"
+				f"Volume: `{_escape(_fmt(p['volume']))}`  "
+				f"W/L: `{p['wins']}/{p['losses']}`  "
+				f"Trades: `{p['round_trips']}`"
+			)
+			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+
+		elif evt.kind == "milestone" and send_milestones:
+			pct = int(p["pct"] * 100)
+			msg = (
+				f"🎯 *Volume milestone: {pct}%*\n"
+				f"Volume: `{_escape(_fmt(p['volume']))}` USD\n"
+				f"Equity: `{_escape(_fmt(p['equity'], 4))}`\n"
+				f"Fees: `{_escape(_fmt(p['fees_gross'], 2))}`  "
+				f"PnL: `{_escape(_fmt(p['pnl'], 2))}`"
+			)
+			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+
 		elif evt.kind == "halt":
 			msg = (
 				f"🛑 *Volume farmer HALTED*\n"
-				f"Reason: `{_escape(evt.payload['reason'])}`\n"
-				f"Equity: `{_escape(_fmt(evt.payload['equity'], 4))}`\n"
-				f"Volume: `{_escape(_fmt(evt.payload['volume']))}` USD"
+				f"Reason: `{_escape(p['reason'])}`\n"
+				f"Equity: `{_escape(_fmt(p['equity'], 4))}`\n"
+				f"Volume: `{_escape(_fmt(p['volume']))}` USD"
 			)
 			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
 
@@ -150,7 +183,9 @@ async def _daily_report_loop(
 			f"Win rate: `{esc(str(s['win_rate_pct']))}`%\n"
 			f"Equity: `{esc(_fmt(s['equity'], 4))}`  "
 			f"Δ: `{esc(_fmt(s['equity_delta'], 4))}`\n"
-			f"Fees: `{esc(_fmt(s['fees_paid'], 2))}`  "
+			f"Fees gross: `{esc(_fmt(s['fees_gross'], 2))}`  "
+			f"Rebate est: `{esc(_fmt(s['rebate_estimate'], 2))}`  "
+			f"Net: `{esc(_fmt(s['fees_net'], 2))}`\n"
 			f"PnL: `{esc(_fmt(s['total_pnl'], 2))}`  "
 			f"Fee cover: `{esc(str(s['fee_cover_pct']))}`%"
 		)
@@ -291,7 +326,8 @@ async def _run(args: argparse.Namespace) -> None:
 				f"\\({esc(str(s['volume_target_pct']))}%\\)\n"
 				f"Round\\-trips: `{s['round_trips']}`  WR: `{esc(str(s['win_rate_pct']))}`%\n"
 				f"Equity: `{esc(_fmt(s['equity'], 4))}`  "
-				f"Fees: `{esc(_fmt(s['fees_paid'], 2))}`  "
+				f"Fees gross: `{esc(_fmt(s['fees_gross'], 2))}`  "
+				f"Net: `{esc(_fmt(s['fees_net'], 2))}`\n"
 				f"PnL: `{esc(_fmt(s['total_pnl'], 2))}`  "
 				f"Fee cover: `{esc(str(s['fee_cover_pct']))}`%"
 			)

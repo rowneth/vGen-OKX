@@ -11,7 +11,7 @@ from execution.volume_farmer import VolumeFarmerSession
 def _make_config(**overrides):
 	cfg = {
 		"exchange": {"symbol": "BTC_USDT", "timeframe": "5m"},
-		"fees": {"maker": 0.0001, "taker": 0.0005, "effective_rate": 0.0005},
+		"fees": {"maker": 0.0001, "taker": 0.0005, "rebate_pct": 0.70},
 		"farmer": {
 			"capital_usd": 100.0,
 			"leverage": 20,
