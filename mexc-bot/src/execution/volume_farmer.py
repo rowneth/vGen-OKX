@@ -376,11 +376,10 @@ class VolumeFarmerSession:
 		else:
 			pnl_pct = (p.entry_price - exit_price) / p.entry_price
 		gross_pnl = pnl_pct * p.notional
-		# TP exits are limit orders (maker fee); SL/time_stop are market (taker fee)
-		if reason == "tp":
-			close_fee = p.notional * self._maker_rate
-		else:
-			close_fee = p.notional * self._taker_rate
+		# All exits (TP / SL / time_stop) on MEXC futures fire the exchange-
+		# attached trigger order which executes as a MARKET fill → taker fee.
+		# (Attached TP/SL cannot be limit orders on MEXC futures.)
+		close_fee = p.notional * self._taker_rate
 		net_pnl = gross_pnl - close_fee
 		self.total_fees_gross += close_fee
 		self.total_volume_usd += p.notional
@@ -401,8 +400,8 @@ class VolumeFarmerSession:
 				self.cooldown_bars_left = self._consec_loss_cooldown_bars
 				self.consec_losses = 0  # reset streak so next losses start fresh
 		open_fee = p.notional * self._maker_rate
-		close_fee_type = "maker" if reason == "tp" else "taker"
-		fee_overage = (close_fee - p.notional * self._maker_rate) if reason != "tp" else 0.0
+		close_fee_type = "taker"
+		fee_overage = close_fee - p.notional * self._maker_rate
 		wr_running = round(self.wins / self.round_trips * 100.0, 1) if self.round_trips else 0.0
 		self.ledger.append({
 			"entry_time": p.entry_time.isoformat(),

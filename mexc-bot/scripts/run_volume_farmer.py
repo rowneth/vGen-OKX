@@ -120,7 +120,7 @@ def _build_event_handler(
 ):
 	loop = asyncio.get_event_loop()
 	# Mutable container so the inner handler can update it across calls
-	_state: dict = {"entry_msg_id": None}
+	_state: dict = {"entry_msg_id": None, "real_exit_sent": False}
 
 	def _escape(text: str) -> str:
 		for ch in "_*[]()~`>#+-=|{}.!":
@@ -187,6 +187,7 @@ def _build_event_handler(
 			)
 			async def _send_entry(m: str) -> None:
 				_state["entry_msg_id"] = await notifier.send_and_get_id(m)
+				_state["real_exit_sent"] = False
 			asyncio.run_coroutine_threadsafe(_send_entry(msg), loop)
 
 		elif evt.kind == "exit":
@@ -220,6 +221,11 @@ def _build_event_handler(
 			)
 			reply_id = _state.get("entry_msg_id")
 			_state["entry_msg_id"] = None
+			# If the real-time position watcher already sent an exit message,
+			# skip the bar-driven one to avoid duplicates.
+			if _state.get("real_exit_sent"):
+				_state["real_exit_sent"] = False
+				return
 			async def _send_exit(m: str, rid: Optional[int]) -> None:
 				await notifier.send_and_get_id(m, reply_to_message_id=rid)
 			asyncio.run_coroutine_threadsafe(_send_exit(msg, reply_id), loop)
@@ -245,7 +251,51 @@ def _build_event_handler(
 			)
 			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
 
-	return handler
+	async def real_close_callback(info: dict) -> None:
+		"""Called by LiveVolumeExecutor the moment MEXC closes our position.
+
+		Sends an immediate exit Telegram as a reply to the entry message
+		and marks ``real_exit_sent`` so the later bar-driven exit event is
+		suppressed (no duplicate message).
+		"""
+		reason = info.get("reason", "unknown")
+		if reason == "tp":
+			result_emoji, result_label = "✅", "TP"
+		elif reason == "sl":
+			result_emoji, result_label = "❌", "SL"
+		else:
+			result_emoji, result_label = "⏹", reason.upper()
+		side = str(info.get("side", "")).upper()
+		entry = _as_float_safe(info.get("entry_price"))
+		exit_ = _as_float_safe(info.get("exit_price"))
+		gross = _as_float_safe(info.get("gross_pnl"))
+		open_fee = _as_float_safe(info.get("open_fee"))
+		close_fee = _as_float_safe(info.get("close_fee"))
+		net = _as_float_safe(info.get("net_pnl"))
+		msg = (
+			f"{result_emoji} *LIVE {side} {result_label}* · `{symbol}`\n"
+			f"`{_n(entry, 1)}` → `{_n(exit_, 1)}`\n"
+			f"{DIV}\n"
+			f"Gross PnL    {_signed_money(gross)}\n"
+			f"Open fee     {_signed_money(-open_fee)}   {_fee_label('maker')}\n"
+			f"Close fee    {_signed_money(-close_fee)}   {_fee_label('taker')}\n"
+			f"Net PnL      {_signed_money(net)}"
+		)
+		reply_id = _state.get("entry_msg_id")
+		_state["real_exit_sent"] = True
+		try:
+			await notifier.send_and_get_id(msg, reply_to_message_id=reply_id)
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.exception("real exit send failed: %s", exc)
+
+	return handler, real_close_callback
+
+
+def _as_float_safe(x: Any, default: float = 0.0) -> float:
+	try:
+		return float(x)
+	except (TypeError, ValueError):
+		return default
 
 
 async def _daily_report_loop(
@@ -358,7 +408,7 @@ async def _run(args: argparse.Namespace) -> None:
 		symbol,
 		bool(notif_cfg.get("send_milestones", True)),
 		live_executor=None,  # will be rebound after client opens if --live
-	)
+	)[0]
 
 	stop_event = asyncio.Event()
 
@@ -408,13 +458,16 @@ async def _run(args: argparse.Namespace) -> None:
 					notify_callback=notifier.send_raw,
 				)
 				await live_executor.startup()
-				# Re-bind handler now that executor exists.
-				session.event_callback = _build_event_handler(
+				# Re-bind handler now that executor exists, and wire the
+				# real-time close callback so MEXC TP/SL fills notify instantly.
+				handler, real_close_cb = _build_event_handler(
 					notifier,
 					symbol,
 					bool(notif_cfg.get("send_milestones", True)),
 					live_executor=live_executor,
 				)
+				session.event_callback = handler
+				live_executor.real_close_callback = real_close_cb
 				LOGGER.info("Live executor ready.")
 
 			# Drop forming bar if any — keep only closed

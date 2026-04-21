@@ -356,6 +356,41 @@ class MEXCClient:
 			"GET", "/api/v1/private/position/open_positions", params=params, auth=True
 		)
 
+	async def get_history_orders(
+		self,
+		symbol: Optional[str] = None,
+		states: Optional[str] = None,
+		start_time: Optional[int] = None,
+		end_time: Optional[int] = None,
+		page_num: int = 1,
+		page_size: int = 20,
+	) -> Any:
+		"""Fetch historical (filled/cancelled) futures orders.
+
+		Args:
+			symbol: Optional contract symbol filter.
+			states: Optional comma-separated state filter (e.g. ``"3"`` for filled).
+			start_time: Optional start time filter in milliseconds since epoch.
+			end_time: Optional end time filter in milliseconds since epoch.
+			page_num: Page number (1-indexed).
+			page_size: Results per page.
+
+		Returns:
+			Decoded history-orders payload.
+		"""
+		params: Dict[str, Any] = {"page_num": page_num, "page_size": page_size}
+		if symbol is not None:
+			params["symbol"] = symbol
+		if states is not None:
+			params["states"] = states
+		if start_time is not None:
+			params["start_time"] = start_time
+		if end_time is not None:
+			params["end_time"] = end_time
+		return await self._request(
+			"GET", "/api/v1/private/order/list/history_orders", params=params, auth=True
+		)
+
 	async def get_api_permission_snapshot(self) -> Dict[str, Any]:
 		"""Fetch API-key permission payload from private account endpoints.
 
