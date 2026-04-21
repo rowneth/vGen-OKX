@@ -83,7 +83,7 @@ class LiveVolumeExecutor:
 	open_type: int = 1         # 1 = isolated
 	max_live_trades: int = 5
 	max_notional_usd: float = 5000.0  # high cap — session controls real sizing
-	post_only_fill_timeout: float = 15.0
+	post_only_fill_timeout: float = 60.0
 	poll_interval: float = 1.5
 	dry_run: bool = False
 	notify_callback: Optional[Callable[[str], Awaitable[None]]] = None
@@ -189,11 +189,32 @@ class LiveVolumeExecutor:
 			side_str = str(payload.get("side", "")).lower()
 			sess_price = _as_float(payload.get("price"))
 			sess_notional = _as_float(payload.get("notional"))
-			tp = _as_float(payload.get("tp"))
-			sl = _as_float(payload.get("sl"))
-			if not side_str or sess_price <= 0 or tp <= 0 or sl <= 0:
+			tp_bps = _as_float(payload.get("tp_bps"))
+			sl_bps = _as_float(payload.get("sl_bps"))
+			if not side_str or sess_price <= 0 or tp_bps <= 0 or sl_bps <= 0:
 				LOGGER.error("live entry payload invalid: %s", payload)
 				return
+
+			# Fetch live bid/ask so we place at the current market, not stale bar close.
+			try:
+				ticker = await self.client.get_ticker(self.symbol)
+				if isinstance(ticker, list) and ticker:
+					ticker = ticker[0]
+				live_bid = _as_float(ticker.get("bid1") or ticker.get("bidPrice") or ticker.get("bid"))
+				live_ask = _as_float(ticker.get("ask1") or ticker.get("askPrice") or ticker.get("ask"))
+				live_last = _as_float(ticker.get("lastPrice") or ticker.get("last"))
+			except Exception as exc:  # noqa: BLE001
+				LOGGER.warning("ticker fetch failed, falling back to bar close: %s", exc)
+				live_bid = live_ask = live_last = sess_price
+
+			# POST-ONLY: place at bid for long (join the bid), ask for short (join the ask)
+			raw_price = live_bid if side_str == "long" else live_ask
+			if raw_price <= 0:
+				raw_price = live_last if live_last > 0 else sess_price
+
+			# Recalculate TP/SL from the live entry price
+			tp = raw_price * (1 + tp_bps / 10_000) if side_str == "long" else raw_price * (1 - tp_bps / 10_000)
+			sl = raw_price * (1 - sl_bps / 10_000) if side_str == "long" else raw_price * (1 + sl_bps / 10_000)
 
 			# Safety clamp on notional
 			real_notional = min(sess_notional, self.max_notional_usd)
