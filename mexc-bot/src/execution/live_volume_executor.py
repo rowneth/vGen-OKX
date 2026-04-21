@@ -64,6 +64,11 @@ class LiveTradeRecord:
 	notional: float = 0.0
 	tp_price: float = 0.0
 	sl_price: float = 0.0
+	tp_bps: float = 0.0
+	sl_bps: float = 0.0
+	leverage: int = 0
+	mexc_side: int = 0
+	reprice_attempts: int = 0
 	submitted_at: float = 0.0
 	filled: bool = False
 	fill_price: float = 0.0
@@ -85,6 +90,8 @@ class LiveVolumeExecutor:
 	max_notional_usd: float = 5000.0  # high cap — session controls real sizing
 	post_only_fill_timeout: float = 60.0
 	poll_interval: float = 1.5
+	reprice_drift_ticks: int = 3   # cancel & repost if market drifts this many ticks from our price
+	max_reprice_attempts: int = 5
 	dry_run: bool = False
 	notify_callback: Optional[Callable[[str], Awaitable[None]]] = None
 
@@ -222,7 +229,8 @@ class LiveVolumeExecutor:
 				LOGGER.error("live entry notional <= 0; skipping")
 				return
 
-			entry_price = _round_price(sess_price, self.tick)
+			# Use LIVE bid/ask (raw_price) for the actual order — not stale bar close
+			entry_price = _round_price(raw_price, self.tick)
 			tp_price = _round_price(tp, self.tick)
 			sl_price = _round_price(sl, self.tick)
 			vol_contracts = self._compute_contracts(real_notional, entry_price)
@@ -247,6 +255,10 @@ class LiveVolumeExecutor:
 				notional=vol_contracts * entry_price * self.contract_size,
 				tp_price=tp_price,
 				sl_price=sl_price,
+				tp_bps=tp_bps,
+				sl_bps=sl_bps,
+				leverage=order_leverage,
+				mexc_side=mexc_side,
 				submitted_at=time.time(),
 			)
 
@@ -307,69 +319,168 @@ class LiveVolumeExecutor:
 			asyncio.create_task(self._poll_fill(record))
 
 	# ------------------------------------------------------------------
-	async def _poll_fill(self, record: LiveTradeRecord) -> None:
-		deadline = record.submitted_at + self.post_only_fill_timeout
-		while time.time() < deadline:
-			await asyncio.sleep(self.poll_interval)
-			try:
-				order = await self.client.get_order_by_external_oid(
-					self.symbol, record.external_oid,
-				)
-			except Exception as exc:  # noqa: BLE001
-				LOGGER.debug("poll fill error oid=%s: %s", record.external_oid, exc)
-				continue
-			if not isinstance(order, dict):
-				continue
-			state = int(order.get("state", -1))
-			# 3 = filled, 4 = cancelled, 5 = partial
-			if state == 3:
-				record.filled = True
-				record.fill_price = _as_float(order.get("dealAvgPrice"))
-				record.fill_fee_maker = _as_float(order.get("makerFee"))
-				record.fill_fee_taker = _as_float(order.get("takerFee"))
-				LOGGER.info(
-					"LIVE entry filled: oid=%s avg=%.2f makerFee=%.6f takerFee=%.6f",
-					record.external_oid, record.fill_price,
-					record.fill_fee_maker, record.fill_fee_taker,
-				)
-				await self._notify(
-					f"✅ *LIVE fill* oid `{record.external_oid}` @ "
-					f"`{record.fill_price:,.2f}` maker fee "
-					f"`${record.fill_fee_maker:.4f}`"
-				)
-				return
-			if state == 4:
-				LOGGER.info("LIVE entry cancelled before fill oid=%s", record.external_oid)
-				record.closed = True
-				record.close_reason = "cancelled_before_fill"
-				if self._current is record:
-					self._current = None
-				await self._notify(
-					f"🚫 *LIVE cancelled* oid `{record.external_oid}`"
-				)
-				return
-		# timeout — cancel the resting post-only
-		LOGGER.warning(
-			"LIVE entry not filled within %.1fs — cancelling oid=%s",
-			self.post_only_fill_timeout, record.external_oid,
-		)
+	async def _cancel_order(self, record: LiveTradeRecord) -> None:
+		"""Best-effort cancel of the resting order on MEXC."""
+		if not record.order_id:
+			return
 		try:
-			# Best-effort cancel via orderId if we have one
-			if record.order_id:
-				await self.client._request(  # noqa: SLF001 — reuse generic request
-					"POST",
-					"/api/v1/private/order/cancel",
-					body=[int(record.order_id)] if record.order_id.isdigit() else [record.order_id],
-					auth=True,
-				)
+			await self.client._request(  # noqa: SLF001
+				"POST",
+				"/api/v1/private/order/cancel",
+				body=[int(record.order_id)] if record.order_id.isdigit() else [record.order_id],
+				auth=True,
+			)
 		except Exception as exc:  # noqa: BLE001
 			LOGGER.exception("LIVE cancel failed oid=%s: %s", record.external_oid, exc)
+
+	# ------------------------------------------------------------------
+	async def _reprice(self, record: LiveTradeRecord, new_price: float) -> bool:
+		"""Cancel the current order and resubmit at ``new_price``.
+
+		Returns True if a new order was placed.
+		"""
+		await self._cancel_order(record)
+		# Recalculate TP/SL from new entry price
+		if record.side == "long":
+			tp = new_price * (1 + record.tp_bps / 10_000)
+			sl = new_price * (1 - record.sl_bps / 10_000)
+		else:
+			tp = new_price * (1 - record.tp_bps / 10_000)
+			sl = new_price * (1 + record.sl_bps / 10_000)
+
+		new_entry = _round_price(new_price, self.tick)
+		new_tp = _round_price(tp, self.tick)
+		new_sl = _round_price(sl, self.tick)
+		new_oid = f"vf-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+
+		try:
+			submit_result = await self.client.submit_order(
+				symbol=self.symbol,
+				side=record.mexc_side,
+				order_type=2,
+				vol=record.vol_contracts,
+				price=new_entry,
+				leverage=record.leverage,
+				open_type=self.open_type,
+				external_oid=new_oid,
+				stop_loss_price=new_sl,
+				take_profit_price=new_tp,
+			)
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.exception("LIVE reprice submit failed oid=%s: %s", record.external_oid, exc)
+			return False
+
+		order_id = submit_result if isinstance(submit_result, (str, int)) else None
+		if isinstance(submit_result, dict):
+			order_id = submit_result.get("orderId") or submit_result.get("order_id")
+
+		old_oid = record.external_oid
+		record.external_oid = new_oid
+		record.order_id = str(order_id) if order_id is not None else ""
+		record.entry_price_req = new_entry
+		record.tp_price = new_tp
+		record.sl_price = new_sl
+		record.submitted_at = time.time()
+		record.reprice_attempts += 1
+
+		LOGGER.info(
+			"LIVE reprice #%d: old_oid=%s new_oid=%s new_price=%.2f",
+			record.reprice_attempts, old_oid, new_oid, new_entry,
+		)
+		return True
+
+	# ------------------------------------------------------------------
+	async def _poll_fill(self, record: LiveTradeRecord) -> None:
+		while True:
+			deadline = record.submitted_at + self.post_only_fill_timeout
+			repriced = False
+			while time.time() < deadline:
+				await asyncio.sleep(self.poll_interval)
+				# Check fill state
+				try:
+					order = await self.client.get_order_by_external_oid(
+						self.symbol, record.external_oid,
+					)
+				except Exception as exc:  # noqa: BLE001
+					LOGGER.debug("poll fill error oid=%s: %s", record.external_oid, exc)
+					order = None
+				if isinstance(order, dict):
+					state = int(order.get("state", -1))
+					if state == 3:
+						record.filled = True
+						record.fill_price = _as_float(order.get("dealAvgPrice"))
+						record.fill_fee_maker = _as_float(order.get("makerFee"))
+						record.fill_fee_taker = _as_float(order.get("takerFee"))
+						LOGGER.info(
+							"LIVE entry filled: oid=%s avg=%.2f makerFee=%.6f takerFee=%.6f reprices=%d",
+							record.external_oid, record.fill_price,
+							record.fill_fee_maker, record.fill_fee_taker,
+							record.reprice_attempts,
+						)
+						await self._notify(
+							f"✅ *LIVE fill* oid `{record.external_oid}` @ "
+							f"`{record.fill_price:,.2f}` maker fee "
+							f"`${record.fill_fee_maker:.4f}`"
+						)
+						return
+					if state == 4:
+						LOGGER.info("LIVE entry cancelled before fill oid=%s", record.external_oid)
+						record.closed = True
+						record.close_reason = "cancelled_before_fill"
+						if self._current is record:
+							self._current = None
+						await self._notify(
+							f"🚫 *LIVE cancelled* oid `{record.external_oid}`"
+						)
+						return
+
+				# Check drift — if market moved past our price, reprice
+				if record.reprice_attempts >= self.max_reprice_attempts:
+					continue
+				try:
+					ticker = await self.client.get_ticker(self.symbol)
+					if isinstance(ticker, list) and ticker:
+						ticker = ticker[0]
+					best = _as_float(
+						(ticker.get("bid1") or ticker.get("bidPrice") or ticker.get("bid"))
+						if record.side == "long"
+						else (ticker.get("ask1") or ticker.get("askPrice") or ticker.get("ask"))
+					)
+				except Exception:  # noqa: BLE001
+					best = 0.0
+				if best <= 0 or self.tick <= 0:
+					continue
+				drift = abs(best - record.entry_price_req) / self.tick
+				behind = (
+					(record.side == "long" and best > record.entry_price_req)
+					or (record.side == "short" and best < record.entry_price_req)
+				)
+				if behind and drift >= self.reprice_drift_ticks:
+					LOGGER.info(
+						"LIVE drift %.1f ticks — repricing oid=%s from %.2f to %.2f",
+						drift, record.external_oid, record.entry_price_req, best,
+					)
+					if await self._reprice(record, best):
+						repriced = True
+						break  # restart outer with new deadline
+
+			if repriced:
+				continue  # retry with fresh deadline after reprice
+			break  # timed out — fall through to cancel path
+
+		# timeout — cancel the resting post-only
+		LOGGER.warning(
+			"LIVE entry not filled (reprices=%d) — cancelling oid=%s",
+			record.reprice_attempts, record.external_oid,
+		)
+		await self._cancel_order(record)
 		record.closed = True
 		record.close_reason = "timeout_unfilled"
 		if self._current is record:
 			self._current = None
 		await self._notify(
-			f"⏳ *LIVE post\\-only timeout* — cancelled oid `{record.external_oid}`"
+			f"⏳ *LIVE post\\-only timeout* — cancelled oid `{record.external_oid}` "
+			f"\\(after {record.reprice_attempts} reprice attempts\\)"
 		)
 
 	# ------------------------------------------------------------------
