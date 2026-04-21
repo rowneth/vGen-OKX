@@ -74,12 +74,15 @@ def _parse_args() -> argparse.Namespace:
 		help="Hard cap on number of real orders placed in --live mode.",
 	)
 	p.add_argument(
-		"--max-live-notional", type=float, default=200.0,
-		help="Per-trade notional cap (USD) in --live mode.",
+		"--max-live-notional", type=float, default=5000.0,
+		help="Per-trade notional cap (USD) in --live mode. "
+			 "The session's dynamic sizing is used; this is just a safety ceiling.",
 	)
 	p.add_argument(
-		"--live-leverage", type=int, default=20,
-		help="Leverage for real orders in --live mode.",
+		"--live-leverage", type=int, default=125,
+		help="Max leverage cap for real orders in --live mode. "
+			 "Actual leverage comes from the session's dynamic calculator "
+			 "(ebirth.net formula) and is capped at this value.",
 	)
 	return p.parse_args()
 

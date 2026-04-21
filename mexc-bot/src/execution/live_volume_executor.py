@@ -79,10 +79,10 @@ class LiveVolumeExecutor:
 
 	client: MEXCClient
 	symbol: str = "BTC_USDT"
-	leverage: int = 20
-	open_type: int = 1  # 1 = isolated
+	leverage: int = 125        # max cap — actual leverage comes from session payload
+	open_type: int = 1         # 1 = isolated
 	max_live_trades: int = 5
-	max_notional_usd: float = 200.0
+	max_notional_usd: float = 5000.0  # high cap — session controls real sizing
 	post_only_fill_timeout: float = 15.0
 	poll_interval: float = 1.5
 	dry_run: bool = False
@@ -211,6 +211,10 @@ class LiveVolumeExecutor:
 				)
 				return
 
+			# Use session-computed dynamic leverage; cap at exchange max (self.leverage)
+			sess_leverage = int(round(_as_float(payload.get("leverage", self.leverage))))
+			order_leverage = min(sess_leverage, self.leverage)
+
 			mexc_side = 1 if side_str == "long" else 3  # 1=open long, 3=open short
 			external_oid = f"vf-{int(time.time())}-{uuid.uuid4().hex[:6]}"
 
@@ -227,9 +231,9 @@ class LiveVolumeExecutor:
 
 			if self.dry_run:
 				LOGGER.info(
-					"DRY-RUN live entry: %s %s %d contracts @%.2f TP=%.2f SL=%.2f oid=%s",
+					"DRY-RUN live entry: %s %s %d contracts @%.2f TP=%.2f SL=%.2f lev=%dx oid=%s",
 					side_str.upper(), self.symbol, vol_contracts, entry_price,
-					tp_price, sl_price, external_oid,
+					tp_price, sl_price, order_leverage, external_oid,
 				)
 				record.filled = True
 				record.fill_price = entry_price
@@ -249,7 +253,7 @@ class LiveVolumeExecutor:
 					order_type=2,  # 2 = post-only limit (MEXC futures)
 					vol=vol_contracts,
 					price=entry_price,
-					leverage=self.leverage,
+					leverage=order_leverage,
 					open_type=self.open_type,
 					external_oid=external_oid,
 					stop_loss_price=sl_price,
@@ -270,8 +274,8 @@ class LiveVolumeExecutor:
 			self._current = record
 
 			LOGGER.info(
-				"LIVE entry submitted: oid=%s orderId=%s side=%s vol=%d entry=%.2f",
-				external_oid, record.order_id, side_str, vol_contracts, entry_price,
+				"LIVE entry submitted: oid=%s orderId=%s side=%s vol=%d entry=%.2f lev=%dx",
+				external_oid, record.order_id, side_str, vol_contracts, entry_price, order_leverage,
 			)
 			await self._notify(
 				f"📤 *LIVE order* `{side_str.upper()}` `{vol_contracts}` contracts "
