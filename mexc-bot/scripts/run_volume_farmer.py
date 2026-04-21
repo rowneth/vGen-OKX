@@ -298,6 +298,27 @@ def _as_float_safe(x: Any, default: float = 0.0) -> float:
 		return default
 
 
+def _extract_usdt_equity(payload: Any) -> Optional[float]:
+	"""Return USDT equity from MEXC /account/assets payload, or None."""
+
+	def _walk(node: Any):
+		if isinstance(node, dict):
+			cur = str(node.get("currency") or node.get("coin") or "").upper()
+			if cur == "USDT":
+				yield node
+			for v in node.values():
+				yield from _walk(v)
+		elif isinstance(node, list):
+			for v in node:
+				yield from _walk(v)
+
+	for row in _walk(payload):
+		eq = _as_float_safe(row.get("equity", row.get("balance", 0)))
+		if eq > 0:
+			return eq
+	return None
+
+
 async def _daily_report_loop(
 	session: VolumeFarmerSession,
 	notifier: TelegramNotifier,
@@ -444,6 +465,26 @@ async def _run(args: argparse.Namespace) -> None:
 				LOGGER.error("No candles returned; aborting.")
 				return
 			LOGGER.info("Seeded %d candles; last=%s", len(history), history.iloc[-1]["open_time"])
+
+			# Fetch real USDT equity from MEXC and override session capital
+			# so Telegram / sizing reflect the actual wallet (not the YAML default).
+			# Skip the override on --resume to preserve session P&L tracking.
+			if api_key and api_secret and not args.resume:
+				try:
+					assets_payload = await client.get_account_info()
+					real_equity = _extract_usdt_equity(assets_payload)
+					if real_equity is not None and real_equity > 0:
+						LOGGER.info(
+							"Overriding session capital from MEXC wallet: %.4f USDT (was %.4f)",
+							real_equity, session.equity,
+						)
+						session.equity = real_equity
+						session.start_equity = real_equity
+						session.peak_equity = real_equity
+					else:
+						LOGGER.warning("Could not parse USDT equity from /account/assets; using config capital=%.2f", session.equity)
+				except Exception as exc:  # noqa: BLE001
+					LOGGER.warning("Failed to fetch MEXC account balance (%s); using config capital=%.2f", exc, session.equity)
 
 			# Build LiveExecutor once the client is inside the async context so
 			# it can issue authenticated calls.
