@@ -117,6 +117,7 @@ def _build_event_handler(
 	symbol: str,
 	send_milestones: bool,
 	live_executor: Optional[LiveVolumeExecutor] = None,
+	live_mode: bool = False,
 ):
 	loop = asyncio.get_event_loop()
 	# Mutable container so the inner handler can update it across calls
@@ -220,6 +221,14 @@ def _build_event_handler(
 				f"Record    `{p['wins']}W` `{p['losses']}L`   `{_n(p.get('win_rate_pct', 0.0), 1)}%`"
 			)
 			reply_id = _state.get("entry_msg_id")
+			# In LIVE mode the bar-driven exit is unreliable — the paper session's
+			# synthetic entry price drifts from the real MEXC fill, so the 5m bar
+			# can "hit TP" while the exchange position is still open. Only the
+			# real-time position watcher (real_close_callback) may send exit
+			# Telegrams when live. Keep entry_msg_id so the real callback can
+			# still reply to the entry message when MEXC actually closes.
+			if live_mode:
+				return
 			_state["entry_msg_id"] = None
 			# If the real-time position watcher already sent an exit message,
 			# skip the bar-driven one to avoid duplicates.
@@ -283,6 +292,7 @@ def _build_event_handler(
 		)
 		reply_id = _state.get("entry_msg_id")
 		_state["real_exit_sent"] = True
+		_state["entry_msg_id"] = None
 		try:
 			await notifier.send_and_get_id(msg, reply_to_message_id=reply_id)
 		except Exception as exc:  # noqa: BLE001
@@ -506,6 +516,7 @@ async def _run(args: argparse.Namespace) -> None:
 					symbol,
 					bool(notif_cfg.get("send_milestones", True)),
 					live_executor=live_executor,
+					live_mode=True,
 				)
 				session.event_callback = handler
 				live_executor.real_close_callback = real_close_cb
