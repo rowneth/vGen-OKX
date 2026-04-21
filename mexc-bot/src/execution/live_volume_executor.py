@@ -92,7 +92,7 @@ class LiveVolumeExecutor:
 	post_only_fill_timeout: float = 60.0
 	poll_interval: float = 1.5
 	reprice_drift_ticks: int = 3   # cancel & repost if market drifts this many ticks from our price
-	max_reprice_attempts: int = 5
+	max_reprice_attempts: int = 10
 	position_watch_interval: float = 3.0   # how often to poll open_positions after fill
 	position_watch_timeout: float = 3600.0  # give up watching after this many seconds
 	dry_run: bool = False
@@ -218,8 +218,15 @@ class LiveVolumeExecutor:
 				LOGGER.warning("ticker fetch failed, falling back to bar close: %s", exc)
 				live_bid = live_ask = live_last = sess_price
 
-			# POST-ONLY: place at bid for long (join the bid), ask for short (join the ask)
-			raw_price = live_bid if side_str == "long" else live_ask
+			# POST-ONLY SAFE: place ONE TICK INSIDE the book on the passive side.
+			#   long  -> best_bid - 1 tick   (can never cross the ask -> MEXC accepts)
+			#   short -> best_ask + 1 tick   (can never cross the bid -> MEXC accepts)
+			# This eliminates the "submitted at bid but ask lifted in-flight -> rejected"
+			# race that causes immediate 'LIVE cancelled' on volatile BTC ticks.
+			if side_str == "long":
+				raw_price = (live_bid - self.tick) if live_bid > 0 else 0.0
+			else:
+				raw_price = (live_ask + self.tick) if live_ask > 0 else 0.0
 			if raw_price <= 0:
 				raw_price = live_last if live_last > 0 else sess_price
 
@@ -344,15 +351,18 @@ class LiveVolumeExecutor:
 		Returns True if a new order was placed.
 		"""
 		await self._cancel_order(record)
-		# Recalculate TP/SL from new entry price
+		# Re-enter one tick INSIDE the book on the passive side so post-only
+		# cannot be rejected by a cross on arrival.
 		if record.side == "long":
-			tp = new_price * (1 + record.tp_bps / 10_000)
-			sl = new_price * (1 - record.sl_bps / 10_000)
+			passive = new_price - self.tick
+			tp = passive * (1 + record.tp_bps / 10_000)
+			sl = passive * (1 - record.sl_bps / 10_000)
 		else:
-			tp = new_price * (1 - record.tp_bps / 10_000)
-			sl = new_price * (1 + record.sl_bps / 10_000)
+			passive = new_price + self.tick
+			tp = passive * (1 - record.tp_bps / 10_000)
+			sl = passive * (1 + record.sl_bps / 10_000)
 
-		new_entry = _round_price(new_price, self.tick)
+		new_entry = _round_price(passive, self.tick)
 		new_tp = _round_price(tp, self.tick)
 		new_sl = _round_price(sl, self.tick)
 		new_oid = f"vf-{int(time.time())}-{uuid.uuid4().hex[:6]}"
@@ -457,11 +467,15 @@ class LiveVolumeExecutor:
 					best = 0.0
 				if best <= 0 or self.tick <= 0:
 					continue
-				drift = abs(best - record.entry_price_req) / self.tick
-				behind = (
-					(record.side == "long" and best > record.entry_price_req)
-					or (record.side == "short" and best < record.entry_price_req)
-				)
+				# Compare against the PASSIVE target (one tick inside current book),
+				# not the raw best, since we always rest one tick inside.
+				if record.side == "long":
+					passive_target = best - self.tick
+					behind = passive_target > record.entry_price_req
+				else:
+					passive_target = best + self.tick
+					behind = passive_target < record.entry_price_req
+				drift = abs(passive_target - record.entry_price_req) / self.tick
 				if behind and drift >= self.reprice_drift_ticks:
 					LOGGER.info(
 						"LIVE drift %.1f ticks — repricing oid=%s from %.2f to %.2f",
