@@ -1,6 +1,28 @@
 {
-  "equity": 10000.0,
+  "equity": 10017.743799723083,
   "position": null,
-  "ledger": [],
-  "last_processed_time": "2026-04-19T21:15:00+00:00"
+  "ledger": [
+    {
+      "entry_time": "2026-04-20T07:30:00+00:00",
+      "exit_time": "2026-04-20T08:15:00+00:00",
+      "symbol": "BTC_USDT",
+      "side": "short",
+      "qty": 0.40053511491352445,
+      "initial_qty": 0.6675585248558741,
+      "entry_price": 74899.8,
+      "exit_price": 74899.8,
+      "reason": "stop_loss",
+      "gross_pnl": 39.739825740509524,
+      "partial_pnl": 39.739825740509524,
+      "entry_fee": 5.0,
+      "exit_fee": 16.996026017425947,
+      "net_pnl": 17.743799723083576,
+      "equity_after": 10017.743799723083,
+      "bars_held": 3,
+      "tp1_hit": true,
+      "tp2_hit": false,
+      "notional": 99960.26017425949
+    }
+  ],
+  "last_processed_time": "2026-04-20T15:00:00+00:00"
 }

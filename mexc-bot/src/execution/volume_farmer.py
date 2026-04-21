@@ -348,12 +348,20 @@ class VolumeFarmerSession:
 			kind="entry", time=bar_time,
 			payload={
 				"side": side, "price": price, "notional": notional,
+				"margin": round(margin, 4),
 				"leverage": round(leverage, 1),
-				"fee": open_fee, "tp": tp, "sl": sl,
+				"open_fee": open_fee,
+				"fee_type": "maker",
+				"tp": tp, "sl": sl,
+				"tp_bps": self._tp_bps,
+				"sl_bps": self._sl_bps,
 				"equity": self.equity,
 				"volume": self.total_volume_usd,
+				"volume_target": self._volume_target,
 				"round_trips": self.round_trips,
 				"capital": self.equity,
+				"wins": self.wins,
+				"losses": self.losses,
 			},
 		))
 
@@ -393,6 +401,9 @@ class VolumeFarmerSession:
 				self.cooldown_bars_left = self._consec_loss_cooldown_bars
 				self.consec_losses = 0  # reset streak so next losses start fresh
 		open_fee = p.notional * self._maker_rate
+		close_fee_type = "maker" if reason == "tp" else "taker"
+		fee_overage = (close_fee - p.notional * self._maker_rate) if reason != "tp" else 0.0
+		wr_running = round(self.wins / self.round_trips * 100.0, 1) if self.round_trips else 0.0
 		self.ledger.append({
 			"entry_time": p.entry_time.isoformat(),
 			"exit_time": bar_time.isoformat(),
@@ -403,7 +414,9 @@ class VolumeFarmerSession:
 			"gross_pnl": gross_pnl,
 			"open_fee": open_fee,
 			"close_fee": close_fee,
+			"close_fee_type": close_fee_type,
 			"total_fee": open_fee + close_fee,
+			"fee_overage": fee_overage,
 			"net_pnl": net_pnl,
 			"reason": reason,
 		})
@@ -412,11 +425,21 @@ class VolumeFarmerSession:
 			payload={
 				"side": p.side, "entry_price": p.entry_price,
 				"exit_price": exit_price, "reason": reason,
-				"gross_pnl": gross_pnl, "fee": open_fee + close_fee,
+				"gross_pnl": gross_pnl,
+				"open_fee": open_fee,
+				"close_fee": close_fee,
+				"close_fee_type": close_fee_type,
+				"fee_total": open_fee + close_fee,
+				"fee_overage": fee_overage,
 				"net_pnl": net_pnl,
+				"notional": p.notional,
+				"bars_held": p.bars_held,
 				"equity": self.equity, "round_trips": self.round_trips,
 				"volume": self.total_volume_usd,
+				"volume_target": self._volume_target,
 				"wins": self.wins, "losses": self.losses,
+				"win_rate_pct": wr_running,
+				"consec_losses": self.consec_losses,
 				"capital": self.equity,
 			},
 		))

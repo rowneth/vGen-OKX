@@ -1,7 +1,6 @@
 # Volume Farmer Bot — Guide for Hirusha
 
 > Written for someone from a software background who is new to crypto trading.  
-> No finance jargon without explanation. Read top to bottom once, then use as a reference.
 
 ---
 

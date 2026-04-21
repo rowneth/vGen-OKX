@@ -104,6 +104,46 @@ class MEXCClient:
 		path = f"/api/v1/contract/kline/{symbol}"
 		return await self._request("GET", path, params=params, auth=False)
 
+	async def get_contract_detail(self, symbol: Optional[str] = None) -> Any:
+		"""Fetch contract specification (contractSize, scales, min vol, fees).
+
+		Args:
+			symbol: Optional contract symbol filter.
+
+		Returns:
+			Decoded contract-detail payload (list of contracts when no symbol).
+		"""
+		params: Dict[str, Any] = {}
+		if symbol is not None:
+			params["symbol"] = symbol
+		return await self._request("GET", "/api/v1/contract/detail", params=params, auth=False)
+
+	async def get_ticker(self, symbol: str) -> Any:
+		"""Fetch latest ticker (last/bid/ask) for a contract.
+
+		Args:
+			symbol: Contract symbol.
+
+		Returns:
+			Decoded ticker payload.
+		"""
+		return await self._request(
+			"GET", "/api/v1/contract/ticker", params={"symbol": symbol}, auth=False
+		)
+
+	async def get_order_by_external_oid(self, symbol: str, external_oid: str) -> Any:
+		"""Fetch a specific order by its external (client) order id.
+
+		Args:
+			symbol: Contract symbol.
+			external_oid: External order id supplied at submit time.
+
+		Returns:
+			Decoded order payload.
+		"""
+		path = f"/api/v1/private/order/external/{symbol}/{external_oid}"
+		return await self._request("GET", path, auth=True)
+
 	async def get_account_info(self) -> Any:
 		"""Fetch private futures account assets/margin info.
 
@@ -406,7 +446,11 @@ class MEXCClient:
 			headers=headers,
 		) as response:
 			text = await response.text()
-			response.raise_for_status()
+			if response.status >= 400:
+				snippet = text[:1000] if text else "<empty body>"
+				raise RuntimeError(
+					f"MEXC HTTP {response.status} on {method} {path} — body: {snippet}"
+				)
 
 			payload: Any
 			try:
