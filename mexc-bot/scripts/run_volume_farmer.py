@@ -28,6 +28,7 @@ if str(SRC_DIR) not in sys.path:
 
 from data.historical import _normalize_kline_payload  # noqa: E402
 from exchange.mexc_client import MEXCClient  # noqa: E402
+from execution.live_volume_executor import LiveVolumeExecutor  # noqa: E402
 from execution.volume_farmer import FarmerEvent, VolumeFarmerSession  # noqa: E402
 from monitoring.logger import configure_logging  # noqa: E402
 from monitoring.telegram_notifier import TelegramNotifier  # noqa: E402
@@ -59,6 +60,27 @@ def _parse_args() -> argparse.Namespace:
 	p.add_argument("--duration-days", type=float, default=7.0)
 	p.add_argument("--poll-seconds", type=int, default=POLL_SECONDS)
 	p.add_argument("--resume", action="store_true")
+	p.add_argument(
+		"--live", action="store_true",
+		help="Place REAL orders on MEXC in addition to paper simulation. "
+			 "Requires LIVE_FARMER_ACK=I_UNDERSTAND in env.",
+	)
+	p.add_argument(
+		"--live-dry-run", action="store_true",
+		help="With --live: log order intents but do not submit to MEXC.",
+	)
+	p.add_argument(
+		"--max-live-trades", type=int, default=5,
+		help="Hard cap on number of real orders placed in --live mode.",
+	)
+	p.add_argument(
+		"--max-live-notional", type=float, default=200.0,
+		help="Per-trade notional cap (USD) in --live mode.",
+	)
+	p.add_argument(
+		"--live-leverage", type=int, default=20,
+		help="Leverage for real orders in --live mode.",
+	)
 	return p.parse_args()
 
 
@@ -87,7 +109,12 @@ def _fmt(v: float, digits: int = 2) -> str:
 	return f"{v:,.{digits}f}"
 
 
-def _build_event_handler(notifier: TelegramNotifier, symbol: str, send_milestones: bool):
+def _build_event_handler(
+	notifier: TelegramNotifier,
+	symbol: str,
+	send_milestones: bool,
+	live_executor: Optional[LiveVolumeExecutor] = None,
+):
 	loop = asyncio.get_event_loop()
 
 	def _escape(text: str) -> str:
@@ -119,6 +146,18 @@ def _build_event_handler(notifier: TelegramNotifier, symbol: str, send_milestone
 	def handler(evt: FarmerEvent) -> None:
 		LOGGER.info("farmer evt %s %s", evt.kind, evt.payload)
 		p = evt.payload
+
+		# Dispatch to live executor FIRST so real order is in-flight while the
+		# Telegram message is formatted/sent.
+		if live_executor is not None:
+			if evt.kind == "entry":
+				asyncio.run_coroutine_threadsafe(
+					live_executor.handle_entry(p), loop,
+				)
+			elif evt.kind == "exit":
+				asyncio.run_coroutine_threadsafe(
+					live_executor.handle_exit(p), loop,
+				)
 
 		if evt.kind == "entry":
 			side = p["side"]
@@ -280,8 +319,34 @@ async def _run(args: argparse.Namespace) -> None:
 	notif_cfg = config.get("notifications", {}).get("telegram", {}) or {}
 	notifier = TelegramNotifier()
 	await notifier.start()
+
+	# --- LIVE MODE GUARD ------------------------------------------------
+	live_executor: Optional[LiveVolumeExecutor] = None
+	if args.live:
+		ack = os.getenv("LIVE_FARMER_ACK", "").strip()
+		if ack != "I_UNDERSTAND":
+			raise RuntimeError(
+				"--live requires env LIVE_FARMER_ACK=I_UNDERSTAND to be set."
+			)
+		LOGGER.warning(
+			"LIVE MODE ENABLED — real orders will be placed on MEXC "
+			"(max_trades=%d, max_notional=$%.2f, leverage=%dx, dry_run=%s)",
+			args.max_live_trades, args.max_live_notional,
+			args.live_leverage, args.live_dry_run,
+		)
+		await notifier.send_raw(
+			f"⚠️ *LIVE MODE* engaged\n"
+			f"Max trades: `{args.max_live_trades}`\n"
+			f"Max notional: `\\${args.max_live_notional:.2f}`\n"
+			f"Leverage: `{args.live_leverage}x`\n"
+			f"Dry\\-run: `{str(args.live_dry_run).lower()}`"
+		)
+
 	session.event_callback = _build_event_handler(
-		notifier, symbol, bool(notif_cfg.get("send_milestones", True)),
+		notifier,
+		symbol,
+		bool(notif_cfg.get("send_milestones", True)),
+		live_executor=None,  # will be rebound after client opens if --live
 	)
 
 	stop_event = asyncio.Event()
@@ -318,6 +383,28 @@ async def _run(args: argparse.Namespace) -> None:
 				LOGGER.error("No candles returned; aborting.")
 				return
 			LOGGER.info("Seeded %d candles; last=%s", len(history), history.iloc[-1]["open_time"])
+
+			# Build LiveExecutor once the client is inside the async context so
+			# it can issue authenticated calls.
+			if args.live:
+				live_executor = LiveVolumeExecutor(
+					client=client,
+					symbol=symbol,
+					leverage=args.live_leverage,
+					max_live_trades=args.max_live_trades,
+					max_notional_usd=args.max_live_notional,
+					dry_run=args.live_dry_run,
+					notify_callback=notifier.send_raw,
+				)
+				await live_executor.startup()
+				# Re-bind handler now that executor exists.
+				session.event_callback = _build_event_handler(
+					notifier,
+					symbol,
+					bool(notif_cfg.get("send_milestones", True)),
+					live_executor=live_executor,
+				)
+				LOGGER.info("Live executor ready.")
 
 			# Drop forming bar if any — keep only closed
 			now_ms = int(datetime.now(tz=timezone_utc()).timestamp() * 1000)
