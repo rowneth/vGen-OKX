@@ -56,6 +56,7 @@ class _FakeSession:
 		url: str,
 		params: Optional[Dict[str, Any]] = None,
 		json: Optional[Any] = None,  # noqa: A002 - mirror aiohttp signature
+		data: Optional[Any] = None,
 		headers: Optional[Dict[str, str]] = None,
 	) -> _FakeResponse:
 		self.calls.append(
@@ -64,6 +65,7 @@ class _FakeSession:
 				"url": url,
 				"params": params,
 				"json": json,
+				"data": data,
 				"headers": dict(headers or {}),
 			}
 		)
@@ -121,8 +123,8 @@ def test_submit_order_with_attached_sl_tp_sends_expected_body() -> None:
 	assert len(session.calls) == 1
 	call = session.calls[0]
 	assert call["method"] == "POST"
-	assert call["url"].endswith("/api/v1/private/order/submit")
-	body = call["json"]
+	assert call["url"].endswith("/api/v1/private/order/create")
+	body = json.loads(call["data"])
 	assert body["symbol"] == "BTC_USDT"
 	assert body["stopLossPrice"] == 64000.0
 	assert body["takeProfitPrice"] == 67000.0
@@ -147,7 +149,7 @@ def test_place_trigger_order_builds_plan_order_body() -> None:
 	_run_with_client(session, _call)
 	call = session.calls[0]
 	assert call["url"].endswith("/api/v1/private/planorder/place")
-	body = call["json"]
+	body = json.loads(call["data"])
 	assert body["triggerPrice"] == 64000.0
 	assert body["triggerType"] == 1
 	assert body["orderType"] == 5
@@ -177,11 +179,11 @@ def test_change_stop_price_posts_both_prices_and_signs_correctly() -> None:
 	_run_with_client(session, _call)
 	call = session.calls[0]
 	assert call["url"].endswith("/api/v1/private/stoporder/change_price")
-	body = call["json"]
+	body = json.loads(call["data"])
 	assert body == {"orderId": 999, "stopLossPrice": 65000.0, "takeProfitPrice": 68000.0}
 
 	# Recompute expected signature from the canonical JSON and ensure header matches.
-	canonical = json.dumps(body, separators=(",", ":"), sort_keys=True)
+	canonical = call["data"]
 	request_time = call["headers"]["Request-Time"]
 	expected = _expected_signature("test-key", "test-secret", request_time, canonical)
 	assert call["headers"]["Signature"] == expected
@@ -197,10 +199,10 @@ def test_cancel_trigger_order_sends_list_body() -> None:
 	_run_with_client(session, _call)
 	call = session.calls[0]
 	assert call["url"].endswith("/api/v1/private/planorder/cancel")
-	assert call["json"] == [{"orderId": 10}, {"orderId": 20}]
+	assert json.loads(call["data"]) == [{"orderId": 10}, {"orderId": 20}]
 
 	# Signing over a list body must be stable (insertion-ordered JSON).
-	canonical = json.dumps(call["json"], separators=(",", ":"))
+	canonical = call["data"]
 	request_time = call["headers"]["Request-Time"]
 	expected = _expected_signature("test-key", "test-secret", request_time, canonical)
 	assert call["headers"]["Signature"] == expected
@@ -215,7 +217,7 @@ def test_cancel_stop_order_sends_stop_plan_order_ids() -> None:
 	_run_with_client(session, _call)
 	call = session.calls[0]
 	assert call["url"].endswith("/api/v1/private/stoporder/cancel")
-	assert call["json"] == [{"stopPlanOrderId": 77}]
+	assert json.loads(call["data"]) == [{"stopPlanOrderId": 77}]
 
 
 def test_get_open_positions_passes_symbol_filter() -> None:

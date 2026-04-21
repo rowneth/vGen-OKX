@@ -4,30 +4,24 @@ app:
   timezone: Asia/Colombo
   log_level: INFO
 
-# OPTIMAL VOLUME FARMER — $300 -> $1M target.
+# OPTIMAL VOLUME FARMER — $30 -> $100K volume target.
 #
-# Sweep winner: micro_momentum, TP=5bps / SL=50bps, no time-stop.
-# Asymmetric bracket: wins are tiny, losses are rare but large -> ~90% WR.
-# Dynamic leverage (ebirth.net formula) keeps risk at 2.5% of equity per trade.
+# REAL FEE STRUCTURE (confirmed from live trade 2026-04-21):
+#   Maker (POST_ONLY open):  0.01%  (0.0001)
+#   Taker (TP/SL triggered): 0.05%  (0.0005)
+#   Round-trip minimum:      0.06%  (6bps)
 #
-# Expected month-end on BTC 5m (scaled linearly from $100 sim):
-#   Volume:     ~$1,000,000 (target hit)
-#   Trades:     ~3,000
-#   WR:         ~90%
-#   End equity: ~$200
-#   Rebate:     ~$83 (70% of $119 gross fees)
-#   Total:      ~$283 account + rebate
-#   Commission: ~$280 (KOL side, 70% of 0.04%)
-#   Sub fee:    +$50
-#   TOTAL income approx: $330 - $100 expected bleed = ~$230 net/month
+# TP must exceed 6bps to break even. 10bps gives +4bps net per win.
+# SL=50bps: net per loss = -56bps. Need >93% WR to break even on P&L alone.
+# Strategy is volume/rebate driven — P&L bleed is expected, offset by rebates.
 
 exchange:
   symbol: BTC_USDT
   timeframe: 5m
 
 fees:
-  maker: 0.0001                    # 1 bps — TP exits
-  taker: 0.0005                    # 5 bps — SL exits + market opens
+  maker: 0.0001                    # 0.01% — confirmed from live trade
+  taker: 0.0005                    # 0.05% — confirmed from live trade (TP/SL triggers)
   rebate_pct: 0.70
 
 farmer:
@@ -41,8 +35,10 @@ farmer:
     max_leverage: 125
     min_leverage: 5
 
-  # Winning bracket from sweep: tiny TP, wide SL -> 90% WR
-  tp_bps: 5.0                      # 0.05% TP (maker exit, cheap)
+  # Backtest-optimal: 15bps TP maximises net return ($+37 over full history)
+  # at 78% WR — the only TP where P&L is profitable even without rebate (+1.1% WR gap)
+  # Generates most volume ($268K) → highest rebate income
+  tp_bps: 15.0                     # 0.15% TP — backtest optimal
   sl_bps: 50.0                     # 0.50% SL (taker exit, rare)
   max_hold_bars: 999               # no time-stop — let TP/SL resolve
 

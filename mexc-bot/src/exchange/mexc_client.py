@@ -213,7 +213,7 @@ class MEXCClient:
 			body["takeProfitPrice"] = float(take_profit_price)
 
 		return await self._request(
-			"POST", "/api/v1/private/order/submit", body=body, auth=True
+			"POST", "/api/v1/private/order/create", body=body, auth=True
 		)
 
 	async def place_trigger_order(
@@ -422,9 +422,22 @@ class MEXCClient:
 		await self._limiter.acquire()
 
 		url = f"{self._base_url}{path}"
-		headers: Dict[str, str] = {"Content-Type": "application/json"}
-		json_body: Optional[Any] = body
-		request_param_string = self._build_request_param_string(params=params, body=body)
+		headers: Dict[str, str] = {
+			"Content-Type": "application/json",
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+			"Accept": "application/json, text/plain, */*",
+			"Accept-Language": "en-US,en;q=0.9",
+			"Origin": "https://futures.mexc.com",
+			"Referer": "https://futures.mexc.com/",
+		}
+		# Serialize body once so signing and wire bytes are identical.
+		raw_body: Optional[str] = None
+		if body is not None:
+			if isinstance(body, dict):
+				raw_body = json.dumps(body, separators=(",", ":"), sort_keys=True)
+			else:
+				raw_body = json.dumps(body, separators=(",", ":"))
+		request_param_string = raw_body if raw_body is not None else self._build_request_param_string(params=params, body=None)
 
 		if auth:
 			headers.update(self._build_auth_headers(request_param_string=request_param_string))
@@ -442,7 +455,7 @@ class MEXCClient:
 			method=method,
 			url=url,
 			params=params,
-			json=json_body,
+			data=raw_body,
 			headers=headers,
 		) as response:
 			text = await response.text()

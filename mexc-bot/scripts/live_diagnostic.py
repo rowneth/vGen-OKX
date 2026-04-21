@@ -351,7 +351,7 @@ async def run(args: argparse.Namespace) -> None:
 			print(f"  ❌ submit_order failed: {exc}")
 			print()
 			print("  ─── FOR MEXC SUPPORT ───")
-			print(f"  Endpoint      : POST https://contract.mexc.com/api/v1/private/order/submit")
+			print(f"  Endpoint      : POST https://contract.mexc.com/api/v1/private/order/create")
 			print(f"  externalOid   : {external_oid}")
 			print(f"  Request body  : {json.dumps(submit_body)}")
 			print(f"  Error         : {exc}")
