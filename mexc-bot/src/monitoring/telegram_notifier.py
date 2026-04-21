@@ -166,6 +166,48 @@ class TelegramNotifier:
 		assert self._queue is not None
 		await self._queue.put(markdown_v2_text)
 
+	async def send_and_get_id(
+		self,
+		markdown_v2_text: str,
+		reply_to_message_id: Optional[int] = None,
+	) -> Optional[int]:
+		"""Send a MarkdownV2 message directly (not queued) and return the Telegram message_id.
+
+		Use this when you need the message_id to thread a follow-up reply.
+		Returns None if sending is disabled or the request fails.
+		"""
+		if self._label:
+			markdown_v2_text = f"*\\[{_md(self._label)}\\]*  " + markdown_v2_text
+		if not self._enabled or self._stopped:
+			LOGGER.info("[telegram-disabled]\n%s", markdown_v2_text)
+			return None
+		if self._session is None:
+			self._session = aiohttp.ClientSession(timeout=self._timeout)
+			self._owns_session = True
+		url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+		payload: Dict[str, Any] = {
+			"chat_id": self._chat_id,
+			"text": markdown_v2_text,
+			"parse_mode": "MarkdownV2",
+			"disable_web_page_preview": True,
+		}
+		if reply_to_message_id is not None:
+			payload["reply_to_message_id"] = reply_to_message_id
+		try:
+			async with self._session.post(url, json=payload) as response:
+				if response.status != 200:
+					body = await response.text()
+					LOGGER.error(
+						"Telegram send_and_get_id failed status=%s body=%s",
+						response.status, body[:500],
+					)
+					return None
+				data = await response.json()
+				return int(data["result"]["message_id"])
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.error("Telegram send_and_get_id exception: %s", exc)
+			return None
+
 	async def _run_worker(self) -> None:
 		assert self._session is not None and self._queue is not None
 		url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"

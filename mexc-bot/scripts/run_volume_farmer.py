@@ -119,6 +119,8 @@ def _build_event_handler(
 	live_executor: Optional[LiveVolumeExecutor] = None,
 ):
 	loop = asyncio.get_event_loop()
+	# Mutable container so the inner handler can update it across calls
+	_state: dict = {"entry_msg_id": None}
 
 	def _escape(text: str) -> str:
 		for ch in "_*[]()~`>#+-=|{}.!":
@@ -183,7 +185,9 @@ def _build_event_handler(
 				f"Volume    {_money(p['volume'], 0)} / {_money(p.get('volume_target', 0.0), 0)}   \\({_n(vol_pct, 1)}%\\)\n"
 				f"Record    `{p['wins']}W` `{p['losses']}L`   `{_n(wr, 1)}%`"
 			)
-			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+			async def _send_entry(m: str) -> None:
+				_state["entry_msg_id"] = await notifier.send_and_get_id(m)
+			asyncio.run_coroutine_threadsafe(_send_entry(msg), loop)
 
 		elif evt.kind == "exit":
 			reason = p["reason"]
@@ -214,7 +218,11 @@ def _build_event_handler(
 				f"Volume    {_money(p['volume'], 0)} / {_money(p.get('volume_target', 0.0), 0)}\n"
 				f"Record    `{p['wins']}W` `{p['losses']}L`   `{_n(p.get('win_rate_pct', 0.0), 1)}%`"
 			)
-			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
+			reply_id = _state.get("entry_msg_id")
+			_state["entry_msg_id"] = None
+			async def _send_exit(m: str, rid: Optional[int]) -> None:
+				await notifier.send_and_get_id(m, reply_to_message_id=rid)
+			asyncio.run_coroutine_threadsafe(_send_exit(msg, reply_id), loop)
 
 		elif evt.kind == "milestone" and send_milestones:
 			pct = int(p["pct"] * 100)
