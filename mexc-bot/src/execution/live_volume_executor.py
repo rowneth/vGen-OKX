@@ -91,6 +91,7 @@ class LiveVolumeExecutor:
 	max_notional_usd: float = 5000.0  # high cap — session controls real sizing
 	post_only_fill_timeout: float = 60.0
 	poll_interval: float = 1.5
+	passive_offset_ticks: int = 3  # place this many ticks INSIDE the book to guarantee post-only accept
 	reprice_drift_ticks: int = 3   # cancel & repost if market drifts this many ticks from our price
 	max_reprice_attempts: int = 10
 	position_watch_interval: float = 3.0   # how often to poll open_positions after fill
@@ -218,15 +219,18 @@ class LiveVolumeExecutor:
 				LOGGER.warning("ticker fetch failed, falling back to bar close: %s", exc)
 				live_bid = live_ask = live_last = sess_price
 
-			# POST-ONLY SAFE: place ONE TICK INSIDE the book on the passive side.
-			#   long  -> best_bid - 1 tick   (can never cross the ask -> MEXC accepts)
-			#   short -> best_ask + 1 tick   (can never cross the bid -> MEXC accepts)
-			# This eliminates the "submitted at bid but ask lifted in-flight -> rejected"
-			# race that causes immediate 'LIVE cancelled' on volatile BTC ticks.
+			# POST-ONLY SAFE: place passive_offset_ticks INSIDE the book on the
+			# passive side. For BTC a 1-tick buffer is too thin because the book
+			# typically shifts several ticks in the 50-200ms API round-trip and
+			# MEXC still rejects the order (state=4) when it would cross on
+			# arrival. 3 ticks is a robust default for BTC.
+			#   long  -> best_bid - N ticks
+			#   short -> best_ask + N ticks
+			off = max(1, self.passive_offset_ticks) * self.tick
 			if side_str == "long":
-				raw_price = (live_bid - self.tick) if live_bid > 0 else 0.0
+				raw_price = (live_bid - off) if live_bid > 0 else 0.0
 			else:
-				raw_price = (live_ask + self.tick) if live_ask > 0 else 0.0
+				raw_price = (live_ask + off) if live_ask > 0 else 0.0
 			if raw_price <= 0:
 				raw_price = live_last if live_last > 0 else sess_price
 
@@ -351,14 +355,15 @@ class LiveVolumeExecutor:
 		Returns True if a new order was placed.
 		"""
 		await self._cancel_order(record)
-		# Re-enter one tick INSIDE the book on the passive side so post-only
-		# cannot be rejected by a cross on arrival.
+		# Re-enter passive_offset_ticks INSIDE the book so post-only cannot be
+		# rejected by a cross on arrival.
+		off = max(1, self.passive_offset_ticks) * self.tick
 		if record.side == "long":
-			passive = new_price - self.tick
+			passive = new_price - off
 			tp = passive * (1 + record.tp_bps / 10_000)
 			sl = passive * (1 - record.sl_bps / 10_000)
 		else:
-			passive = new_price + self.tick
+			passive = new_price + off
 			tp = passive * (1 - record.tp_bps / 10_000)
 			sl = passive * (1 + record.sl_bps / 10_000)
 
@@ -441,7 +446,44 @@ class LiveVolumeExecutor:
 						asyncio.create_task(self._watch_position_close(record))
 						return
 					if state == 4:
-						LOGGER.info("LIVE entry cancelled before fill oid=%s", record.external_oid)
+						# MEXC rejected the post-only (book crossed on arrival).
+						# Rather than abort, fetch fresh top-of-book and resubmit
+						# passive_offset_ticks inside -- up to max_reprice_attempts.
+						if record.reprice_attempts >= self.max_reprice_attempts:
+							LOGGER.info(
+								"LIVE entry rejected and max reprices exhausted oid=%s",
+								record.external_oid,
+							)
+							record.closed = True
+							record.close_reason = "rejected_max_retries"
+							if self._current is record:
+								self._current = None
+							await self._notify(
+								f"🚫 *LIVE cancelled* oid `{record.external_oid}` (max reprices)"
+							)
+							return
+						try:
+							ticker = await self.client.get_ticker(self.symbol)
+							if isinstance(ticker, list) and ticker:
+								ticker = ticker[0]
+							best = _as_float(
+								(ticker.get("bid1") or ticker.get("bidPrice") or ticker.get("bid"))
+								if record.side == "long"
+								else (ticker.get("ask1") or ticker.get("askPrice") or ticker.get("ask"))
+							)
+							if best <= 0:
+								best = record.entry_price_req
+						except Exception:  # noqa: BLE001
+							best = record.entry_price_req
+						LOGGER.info(
+							"LIVE rejection -- repricing oid=%s from %.2f around best=%.2f",
+							record.external_oid, record.entry_price_req, best,
+						)
+						if await self._reprice(record, best):
+							repriced = True
+							break  # restart outer loop with fresh deadline
+						# Reprice submit failed -- give up
+						LOGGER.info("LIVE reprice after rejection failed oid=%s", record.external_oid)
 						record.closed = True
 						record.close_reason = "cancelled_before_fill"
 						if self._current is record:
