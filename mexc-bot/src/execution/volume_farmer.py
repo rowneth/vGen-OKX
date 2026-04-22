@@ -123,6 +123,11 @@ class VolumeFarmerSession:
 		self._bb_ema_len = int(bb_cfg.get("ema_trend_len", 200))
 		self._bb_ema_filter = bool(bb_cfg.get("ema_trend_filter", False))
 		self._alternate = bool(f.get("alternate_direction", True))
+		# Trend-break early exit: cut losers short before they reach full SL
+		tb_cfg = f.get("trend_break", {})
+		self._tb_enabled = bool(tb_cfg.get("enabled", False))
+		self._tb_min_bars = int(tb_cfg.get("min_bars_held", 2))
+		self._tb_adverse_bps = float(tb_cfg.get("adverse_bps", 20.0))
 		fees_cfg = self.config.get("fees", {})
 		self._maker_rate = float(fees_cfg.get("maker", 0.0001))
 		self._taker_rate = float(fees_cfg.get("taker", 0.0005))
@@ -494,6 +499,16 @@ class VolumeFarmerSession:
 				self._close_position(p.tp, bar_time, reason="tp")
 			elif sl_hit:
 				self._close_position(p.sl, bar_time, reason="sl")
+			elif (
+				self._tb_enabled
+				and p.bars_held >= self._tb_min_bars
+				and (
+					(p.side == "long"  and (p.entry_price - close) / p.entry_price * 1e4 >= self._tb_adverse_bps)
+					or
+					(p.side == "short" and (close - p.entry_price) / p.entry_price * 1e4 >= self._tb_adverse_bps)
+				)
+			):
+				self._close_position(close, bar_time, reason="trend_break")
 			elif p.bars_held >= self._max_hold:
 				self._close_position(close, bar_time, reason="time_stop")
 			return  # don't open new trade on same bar we closed one

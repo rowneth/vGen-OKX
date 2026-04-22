@@ -66,18 +66,25 @@ BASE_CONFIG = {
 }
 
 
-def run_one(df: pd.DataFrame, tp_bps: float, sl_bps: float, capital_usd: float = 30.0) -> dict:
+def run_one(df: pd.DataFrame, tp_bps: float, sl_bps: float, capital_usd: float = 30.0,
+            tb_enabled: bool = False, tb_min_bars: int = 2, tb_adverse_bps: float = 20.0) -> dict:
     """Run the session over full df, return summary stats."""
     import copy
     cfg = copy.deepcopy(BASE_CONFIG)
     cfg["farmer"]["tp_bps"] = tp_bps
     cfg["farmer"]["sl_bps"] = sl_bps
     cfg["farmer"]["capital_usd"] = capital_usd
+    cfg["farmer"]["trend_break"] = {
+        "enabled": tb_enabled,
+        "min_bars_held": tb_min_bars,
+        "adverse_bps": tb_adverse_bps,
+    }
 
     session = VolumeFarmerSession(config=cfg)
 
     wins = 0
     losses = 0
+    trend_breaks = 0
     total_pnl = 0.0          # gross price-move P&L
     total_real_fees = 0.0    # CORRECTED: open=maker, close=ALWAYS taker
     total_volume = 0.0
@@ -86,11 +93,13 @@ def run_one(df: pd.DataFrame, tp_bps: float, sl_bps: float, capital_usd: float =
     TAKER_RATE = 0.0005      # 0.05%
 
     def on_event(evt: FarmerEvent) -> None:
-        nonlocal wins, losses, total_pnl, total_real_fees, total_volume
+        nonlocal wins, losses, total_pnl, total_real_fees, total_volume, trend_breaks
         if evt.kind == "exit":
             p = evt.payload
             notional = float(p.get("notional", 0))
             gross_pnl = float(p.get("gross_pnl", 0))
+            if p.get("reason") == "trend_break":
+                trend_breaks += 1
 
             # Real fees: open=maker, close=taker (TP triggers MARKET order on MEXC)
             real_open_fee = notional * MAKER_RATE
@@ -143,6 +152,7 @@ def run_one(df: pd.DataFrame, tp_bps: float, sl_bps: float, capital_usd: float =
         "end_equity_with_rebate": end_with_rebate,
         "net_per_trade": (true_net / trades) if trades else 0,
         "total_volume_usd": total_volume,
+        "trend_breaks": trend_breaks,
         "halted": session.halted,
         "halt_reason": session.halt_reason,
     }
@@ -229,8 +239,8 @@ def main() -> None:
         print(f"  Running TP={tp}bps / SL={args.sl}bps ...", end="", flush=True)
         r = run_one(df, tp_bps=tp, sl_bps=args.sl)
         results.append(r)
-        marker = "✅" if r["net_pnl_after_rebate"] >= 0 else "❌"
-        print(f"  {marker}  {r['trades']} trades, WR={r['win_rate_pct']:.1f}%, net={r['net_pnl_after_rebate']:+.2f}")
+        marker = "✅" if r["true_net_income"] >= 0 else " ❌"
+        print(f"  {marker}  {r['trades']} trades, WR={r['win_rate_pct']:.1f}%, net={r['true_net_income']:+.2f}")
 
     # ─── pretty table ────────────────────────────────────────────────
     W = 12

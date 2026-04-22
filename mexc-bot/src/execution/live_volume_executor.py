@@ -745,7 +745,7 @@ class LiveVolumeExecutor:
 				LOGGER.debug("live exit: no tracked open position (session-only exit)")
 				return
 			reason = str(payload.get("reason", ""))
-			if reason != "time_stop":
+			if reason not in ("time_stop", "trend_break"):
 				# Paper session thinks TP/SL hit based on the 5m bar high/low,
 				# but the REAL MEXC position may still be open (paper uses a
 				# synthetic entry price that drifts from the live fill). We
@@ -760,11 +760,11 @@ class LiveVolumeExecutor:
 				)
 				return
 
-			# Time stop → market close
+			# Time stop or trend break → market close
 			mexc_side = 4 if self._current.side == "long" else 2  # 4=close long, 2=close short
 			try:
 				if self.dry_run:
-					LOGGER.info("DRY-RUN market close oid=%s", self._current.external_oid)
+					LOGGER.info("DRY-RUN market close oid=%s reason=%s", self._current.external_oid, reason)
 				else:
 					await self.client.submit_order(
 						symbol=self.symbol,
@@ -775,14 +775,16 @@ class LiveVolumeExecutor:
 						reduce_only=True,
 					)
 				LOGGER.info(
-					"LIVE time-stop close submitted oid=%s", self._current.external_oid,
+					"LIVE %s close submitted oid=%s", reason, self._current.external_oid,
 				)
+				emoji = "⏹" if reason == "time_stop" else "✂️"
+				label = "time\\-stop" if reason == "time_stop" else "trend\\-break"
 				await self._notify(
-					f"⏹ *LIVE time\\-stop close* oid `{self._current.external_oid}`"
+					f"{emoji} *LIVE {label} close* oid `{self._current.external_oid}`"
 				)
 			except Exception as exc:  # noqa: BLE001
-				LOGGER.exception("LIVE time-stop close failed: %s", exc)
-				await self._notify("❌ *LIVE time\\-stop close failed* — see log")
+				LOGGER.exception("LIVE %s close failed: %s", reason, exc)
+				await self._notify(f"❌ *LIVE {reason} close failed* — see log")
 			self._current.closed = True
 			self._current.close_reason = reason
 			self._current = None

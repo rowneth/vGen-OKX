@@ -50,6 +50,14 @@ farmer:
 
   alternate_direction: true        # flip bias to keep net exposure near 0
 
+  # Trend-break early exit — backtest-optimal (3 bars / 20 bps)
+  # Cuts losers early when the move is clearly against us, before they reach
+  # full 50 bps SL. Improves End+Rebate from $20.51 → $23.60 (+15%) on BTC 5m.
+  trend_break:
+    enabled: true
+    min_bars_held: 3               # give the move 15 min to resolve first
+    adverse_bps: 20.0              # exit if price moved 20 bps against entry
+
 # Survival rails — allow heavy DD because rebate recovers it
 risk:
   daily_loss_limit_pct: 0.50       # 50% per day — very lenient
