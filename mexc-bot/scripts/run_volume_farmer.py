@@ -327,14 +327,9 @@ def _build_event_handler(
 					sl_price=sl_price,
 				)
 				if png:
-					caption = (
-						f"{side_emoji} {side.upper()} \\#{trade_num} · {symbol.replace('_', '/')}\n"
-						f"Entry `{_n(entry, 1)}`\n"
-						f"TP `{_n(tp_price, 1)}` · SL `{_n(sl_price, 1)}`"
-					)
 					await notifier.send_photo(
 						png,
-						caption=caption,
+						caption=None,
 						reply_to_message_id=_state.get("entry_msg_id"),
 					)
 			except Exception as exc:  # noqa: BLE001
@@ -359,16 +354,18 @@ def _build_event_handler(
 		else:
 			result_emoji, result_label = "⏹", reason.replace("_", " ").title()
 		side = str(info.get("side", "")).upper()
-		trade_num_close = session.wins + session.losses
+		trade_num_close = session.wins + session.losses + 1
 		entry = _as_float_safe(info.get("entry_price"))
 		exit_ = _as_float_safe(info.get("exit_price"))
 		gross = _as_float_safe(info.get("gross_pnl"))
 		open_fee = _as_float_safe(info.get("open_fee"))
 		close_fee = _as_float_safe(info.get("close_fee"))
 		net = _as_float_safe(info.get("net_pnl"))
-		# Current session stats
-		wins_now = int(session.wins)
-		losses_now = int(session.losses)
+		# Current session stats — add this trade's outcome (paper session
+		# increments wins/losses only on next bar, so we apply it here for display).
+		is_win = net > 0
+		wins_now = int(session.wins) + (1 if is_win else 0)
+		losses_now = int(session.losses) + (0 if is_win else 1)
 		total_now = wins_now + losses_now
 		wr_now = (wins_now / max(total_now, 1)) * 100
 		volume_now = float(session.total_volume_usd)
