@@ -354,18 +354,25 @@ def _build_event_handler(
 		else:
 			result_emoji, result_label = "⏹", reason.replace("_", " ").title()
 		side = str(info.get("side", "")).upper()
-		trade_num_close = session.wins + session.losses + 1
 		entry = _as_float_safe(info.get("entry_price"))
 		exit_ = _as_float_safe(info.get("exit_price"))
 		gross = _as_float_safe(info.get("gross_pnl"))
 		open_fee = _as_float_safe(info.get("open_fee"))
 		close_fee = _as_float_safe(info.get("close_fee"))
 		net = _as_float_safe(info.get("net_pnl"))
-		# Current session stats — add this trade's outcome (paper session
-		# increments wins/losses only on next bar, so we apply it here for display).
-		is_win = net > 0
-		wins_now = int(session.wins) + (1 if is_win else 0)
-		losses_now = int(session.losses) + (0 if is_win else 1)
+		# For trend_break / time_stop the paper session already incremented
+		# wins/losses synchronously before this callback fires.
+		# For tp / sl MEXC fires first so the paper session hasn't caught up yet.
+		session_already_incremented = reason in ("trend_break", "time_stop")
+		if session_already_incremented:
+			trade_num_close = session.wins + session.losses
+			wins_now = int(session.wins)
+			losses_now = int(session.losses)
+		else:
+			trade_num_close = session.wins + session.losses + 1
+			is_win = net > 0
+			wins_now = int(session.wins) + (1 if is_win else 0)
+			losses_now = int(session.losses) + (0 if is_win else 1)
 		total_now = wins_now + losses_now
 		wr_now = (wins_now / max(total_now, 1)) * 100
 		volume_now = float(session.total_volume_usd)
@@ -400,7 +407,15 @@ def _build_event_handler(
 		_state["real_exit_sent"] = True
 		_state["entry_msg_id"] = None
 		try:
-			await notifier.send_and_get_id(msg, reply_to_message_id=reply_id)
+			close_msg_id = await notifier.send_and_get_id(msg, reply_to_message_id=reply_id)
+			# Auto-react: ❤ for TP, 👎 for SL, 🤔 for other early exits
+			if close_msg_id:
+				if reason == "tp":
+					await notifier.set_reaction(close_msg_id, "❤")
+				elif reason == "sl":
+					await notifier.set_reaction(close_msg_id, "👎")
+				elif reason == "trend_break":
+					await notifier.set_reaction(close_msg_id, "🤔")
 		except Exception as exc:  # noqa: BLE001
 			LOGGER.exception("real exit send failed: %s", exc)
 

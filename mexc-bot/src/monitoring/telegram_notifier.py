@@ -252,6 +252,44 @@ class TelegramNotifier:
 			LOGGER.error("Telegram send_photo exception: %s", exc)
 			return None
 
+	async def set_reaction(
+		self,
+		message_id: int,
+		emoji: str,
+	) -> bool:
+		"""Set an emoji reaction on a message via Bot API setMessageReaction.
+
+		Args:
+			message_id: Target message to react to.
+			emoji: Single emoji to apply (e.g. "❤", "👎"). Pass "" to clear.
+
+		Returns:
+			True on success, False otherwise.
+		"""
+		if not self._enabled or self._stopped or message_id is None:
+			return False
+		if self._session is None:
+			self._session = aiohttp.ClientSession(timeout=self._timeout)
+			self._owns_session = True
+		url = f"https://api.telegram.org/bot{self._bot_token}/setMessageReaction"
+		reaction = [] if not emoji else [{"type": "emoji", "emoji": emoji}]
+		payload = {
+			"chat_id": self._chat_id,
+			"message_id": message_id,
+			"reaction": reaction,
+			"is_big": False,
+		}
+		try:
+			async with self._session.post(url, json=payload) as response:
+				if response.status != 200:
+					body = await response.text()
+					LOGGER.warning("Telegram setMessageReaction failed status=%s body=%s", response.status, body[:300])
+					return False
+				return True
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.warning("Telegram setMessageReaction exception: %s", exc)
+			return False
+
 	async def _run_worker(self) -> None:
 		assert self._session is not None and self._queue is not None
 		url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"

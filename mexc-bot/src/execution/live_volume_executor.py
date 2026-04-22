@@ -683,15 +683,16 @@ class LiveVolumeExecutor:
 		except Exception as exc:  # noqa: BLE001
 			LOGGER.exception("history_orders fetch failed oid=%s: %s", record.external_oid, exc)
 
-		# Decide reason by comparing exit price to our TP/SL
-		reason = "unknown"
-		if exit_price > 0 and self.tick > 0:
+		# Decide reason — preserve trend_break / time_stop if already set by
+		# handle_exit; otherwise derive from which price the fill is nearest.
+		if record.close_reason in ("trend_break", "time_stop"):
+			reason = record.close_reason
+		elif exit_price > 0 and self.tick > 0:
 			tp_dist = abs(exit_price - record.tp_price)
 			sl_dist = abs(exit_price - record.sl_price)
-			if tp_dist <= sl_dist:
-				reason = "tp"
-			else:
-				reason = "sl"
+			reason = "tp" if tp_dist <= sl_dist else "sl"
+		else:
+			reason = "unknown"
 
 		# Compute net PnL (approx; precise figure comes from session)
 		side_sign = 1 if record.side == "long" else -1
