@@ -592,39 +592,43 @@ class LiveVolumeExecutor:
 			if isinstance(payload, dict):
 				items = payload.get("data") if isinstance(payload.get("data"), list) else []
 
-# Find our position: matching symbol + side.
-				# MEXC keeps holdVol at its original value and increments closeVol as contracts
-				# are closed. The remaining open volume is holdVol - closeVol.
-				our_side_code = 1 if record.side == "long" else 2  # MEXC position_type: 1=long, 2=short
-				found = None
-				for pos in items or []:
-					if not isinstance(pos, dict):
-						continue
-					if pos.get("symbol") != self.symbol:
-						continue
-					if int(pos.get("positionType", pos.get("position_type", 0))) != our_side_code:
-						continue
-					hold_vol = _as_float(pos.get("holdVol", pos.get("hold_vol", 0)))
-					close_vol = _as_float(pos.get("closeVol", pos.get("close_vol", 0)))
-					if hold_vol - close_vol > 0:
-						found = pos
-						break
-
-				if found is not None:
-					position_seen = True
+			# Find our position: matching symbol + side + state.
+			# MEXC position state: 1 = holding (open), 2 = system-held, 3 = closed.
+			# We treat state in (1, 2) as still open. We also match on positionType
+			# (1=long, 2=short).
+			our_side_code = 1 if record.side == "long" else 2
+			found = None
+			for pos in items or []:
+				if not isinstance(pos, dict):
 					continue
+				if pos.get("symbol") != self.symbol:
+					continue
+				if int(pos.get("positionType", pos.get("position_type", 0))) != our_side_code:
+					continue
+				state = int(_as_float(pos.get("state", 0)))
+				hold_vol = _as_float(pos.get("holdVol", pos.get("hold_vol", 0)))
+				# Open if state says holding AND there are contracts held.
+				# (A fully-closed position on MEXC reports state=3; an open one
+				# reports state=1 or 2 with holdVol > 0.)
+				if state in (1, 2) and hold_vol > 0:
+					found = pos
+					break
 
-				# Position no longer open (or was already closed before first poll)
-				if not position_seen:
-					# Race: our fill may not yet be reflected in positions. Keep waiting a bit.
-					if time.time() - start < 10.0:
-						continue
-					# Position closed before watcher could see it (very fast TP/SL).
-					# Still notify so the close message is sent.
-					LOGGER.info(
-						"watch_position: position closed before first poll oid=%s — notifying",
-						record.external_oid,
-					)
+			if found is not None:
+				position_seen = True
+				continue
+
+			# Position no longer open (or was already closed before first poll)
+			if not position_seen:
+				# Race: our fill may not yet be reflected in positions. Keep waiting a bit.
+				if time.time() - start < 10.0:
+					continue
+				# Position closed before watcher could see it (very fast TP/SL).
+				# Still notify so the close message is sent.
+				LOGGER.info(
+					"watch_position: position closed before first poll oid=%s — notifying",
+					record.external_oid,
+				)
 
 			# Position closed — fetch history orders to find the close
 			await self._notify_real_close(record)
