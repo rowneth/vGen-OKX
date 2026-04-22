@@ -393,8 +393,8 @@ def _build_event_handler(
 			f"{wins_now}W · {losses_now}L · *{_n(wr_now, 1)}% WR*{health_line}\n"
 			f"{DIV}\n"
 			f"Balance {_money(session.equity, 2)}\n"
-			f"Vol {_money(volume_now, 0)} / {_money(vol_target_now, 0)}\n"
-			f"{_n(vol_pct_now, 1)}% of 30d goal"
+			f"{DIV}\n"
+			f"Vol {_money(volume_now, 0)} / {_money(vol_target_now, 0)} \\[{_n(vol_pct_now, 1)}%\\]"
 		)
 		reply_id = _state.get("entry_msg_id")
 		_state["real_exit_sent"] = True
