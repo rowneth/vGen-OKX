@@ -116,6 +116,7 @@ def _build_event_handler(
 	notifier: TelegramNotifier,
 	symbol: str,
 	send_milestones: bool,
+	session: "VolumeFarmerSession",
 	live_executor: Optional[LiveVolumeExecutor] = None,
 	live_mode: bool = False,
 ):
@@ -496,6 +497,7 @@ async def _run(args: argparse.Namespace) -> None:
 		notifier,
 		symbol,
 		bool(notif_cfg.get("send_milestones", True)),
+		session=session,
 		live_executor=None,  # will be rebound after client opens if --live
 	)[0]
 
@@ -575,6 +577,7 @@ async def _run(args: argparse.Namespace) -> None:
 					notifier,
 					symbol,
 					bool(notif_cfg.get("send_milestones", True)),
+					session=session,
 					live_executor=live_executor,
 					live_mode=True,
 				)
