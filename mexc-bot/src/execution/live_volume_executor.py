@@ -606,6 +606,18 @@ class LiveVolumeExecutor:
 		LOGGER.warning(
 			"watch_position: timeout after %.0fs oid=%s", self.position_watch_timeout, record.external_oid,
 		)
+		# Don't leave state stuck forever. Mark this record closed so the
+		# next entry gate doesn't block indefinitely. The position itself
+		# is still on MEXC (attached TP/SL will close it eventually, or
+		# the operator can close it manually) — we just stop tracking it.
+		record.closed = True
+		record.close_reason = "watcher_timeout"
+		if self._current is record:
+			self._current = None
+		await self._notify(
+			f"⚠️ *LIVE watcher timeout* oid `{record.external_oid}` — "
+			f"position may still be open on MEXC, please verify"
+		)
 
 	# ------------------------------------------------------------------
 	async def _notify_real_close(self, record: LiveTradeRecord) -> None:
@@ -711,14 +723,18 @@ class LiveVolumeExecutor:
 				return
 			reason = str(payload.get("reason", ""))
 			if reason != "time_stop":
-				# Exchange's attached TP/SL should handle this. Mark closed locally.
-				self._current.closed = True
-				self._current.close_reason = reason
+				# Paper session thinks TP/SL hit based on the 5m bar high/low,
+				# but the REAL MEXC position may still be open (paper uses a
+				# synthetic entry price that drifts from the live fill). We
+				# must NOT clear _current here or the next entry gate unlocks
+				# and a second overlapping position gets opened on MEXC.
+				# _watch_position_close() is the single source of truth: it
+				# polls /private/position/open_positions and only clears
+				# _current when MEXC reports the position actually gone.
 				LOGGER.info(
-					"LIVE exit expected via exchange SL/TP (reason=%s) oid=%s",
+					"LIVE session exit event ignored (reason=%s) — waiting for real MEXC close on oid=%s",
 					reason, self._current.external_oid,
 				)
-				self._current = None
 				return
 
 			# Time stop → market close
