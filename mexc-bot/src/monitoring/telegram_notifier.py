@@ -208,6 +208,50 @@ class TelegramNotifier:
 			LOGGER.error("Telegram send_and_get_id exception: %s", exc)
 			return None
 
+	async def send_photo(
+		self,
+		photo_bytes: bytes,
+		caption: Optional[str] = None,
+		reply_to_message_id: Optional[int] = None,
+	) -> Optional[int]:
+		"""Send a PNG/JPEG image to the chat and return its message_id.
+
+		Args:
+			photo_bytes: Raw image bytes (PNG or JPEG).
+			caption: Optional MarkdownV2 caption shown under the image.
+			reply_to_message_id: Thread the photo as a reply.
+
+		Returns:
+			Telegram message_id of the sent photo, or None on failure.
+		"""
+		if not self._enabled or self._stopped:
+			LOGGER.info("[telegram-disabled] send_photo skipped (%d bytes)", len(photo_bytes))
+			return None
+		if self._session is None:
+			self._session = aiohttp.ClientSession(timeout=self._timeout)
+			self._owns_session = True
+		url = f"https://api.telegram.org/bot{self._bot_token}/sendPhoto"
+		form = aiohttp.FormData()
+		form.add_field("chat_id", str(self._chat_id))
+		form.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
+		if caption:
+			full_caption = (f"*\\[{_md(self._label)}\\]*  " + caption) if self._label else caption
+			form.add_field("caption", full_caption)
+			form.add_field("parse_mode", "MarkdownV2")
+		if reply_to_message_id is not None:
+			form.add_field("reply_to_message_id", str(reply_to_message_id))
+		try:
+			async with self._session.post(url, data=form) as response:
+				if response.status != 200:
+					body = await response.text()
+					LOGGER.error("Telegram send_photo failed status=%s body=%s", response.status, body[:500])
+					return None
+				data = await response.json()
+				return int(data["result"]["message_id"])
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.error("Telegram send_photo exception: %s", exc)
+			return None
+
 	async def _run_worker(self) -> None:
 		assert self._session is not None and self._queue is not None
 		url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"

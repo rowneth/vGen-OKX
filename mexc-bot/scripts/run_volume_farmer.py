@@ -32,6 +32,7 @@ from execution.live_volume_executor import LiveVolumeExecutor  # noqa: E402
 from execution.volume_farmer import FarmerEvent, VolumeFarmerSession  # noqa: E402
 from monitoring.logger import configure_logging  # noqa: E402
 from monitoring.telegram_notifier import TelegramNotifier  # noqa: E402
+from monitoring.chart_generator import build_entry_chart  # noqa: E402
 
 LOGGER = logging.getLogger("volume_farmer_runner")
 
@@ -56,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
 	p.add_argument("--config", type=str, default="config/config_volume_farmer.yaml")
 	p.add_argument("--state-file", type=str, default=None)
 	p.add_argument("--log-file", type=str, default="data/logs/volume_farmer.log")
-	p.add_argument("--label", type=str, default="VOL-FARM")
+	p.add_argument("--label", type=str, default="")
 	p.add_argument("--duration-days", type=float, default=7.0)
 	p.add_argument("--poll-seconds", type=int, default=POLL_SECONDS)
 	p.add_argument("--resume", action="store_true")
@@ -288,29 +289,22 @@ def _build_event_handler(
 		margin = _as_float_safe(info.get("margin"))
 		open_fee = _as_float_safe(info.get("open_fee"))
 		reprice_attempts = int(info.get("reprice_attempts") or 0)
-		# Session-derived context (uses the live session object from the outer scope)
+		# Session-derived context
 		trade_num = session.wins + session.losses + 1
-		volume = float(session.total_volume_usd)
-		vol_target = float(session._volume_target)  # noqa: SLF001
-		vol_pct = volume / max(vol_target, 1.0) * 100
-		wins = int(session.wins)
-		losses = int(session.losses)
-		wr = (wins / max(wins + losses, 1)) * 100
-		reprice_tag = f"   \\(repriced {reprice_attempts}x\\)" if reprice_attempts > 0 else ""
+		reprice_tag = f" \\(repriced {reprice_attempts}x\\)" if reprice_attempts > 0 else ""
 		msg = (
-			f"{side_emoji} *LIVE {side.upper()}* · \\#{trade_num} `{symbol}`{reprice_tag}\n"
-			f"`{leverage}x` leverage\n"
+			f"{side_emoji} *{side.upper()} \\#{trade_num}* · {leverage}x{reprice_tag}\n"
+			f"`{symbol.replace('_', '/')}`\n"
 			f"{DIV}\n"
 			f"Entry   `{_n(entry, 1)}`\n"
-			f"TP  →   `{_n(tp_price, 1)}`   \\(\\+{_escape(str(tp_bps))} bps\\)\n"
-			f"SL  →   `{_n(sl_price, 1)}`   \\(\\-{_escape(str(sl_bps))} bps\\)\n"
+			f"TP  →   `{_n(tp_price, 1)}`  \+{_escape(str(tp_bps))}bps\n"
+			f"SL  →   `{_n(sl_price, 1)}`  \-{_escape(str(sl_bps))}bps\n"
 			f"{DIV}\n"
-			f"Size     {_money(notional)}   Margin {_money(margin, 2)}\n"
-			f"Fee      {_money(open_fee, 4)}   {_fee_label('maker')}\n"
+			f"Size    {_money(notional)}\n"
+			f"Margin  {_money(margin, 2)}\n"
+			f"Fee     {_money(open_fee, 4)}\n"
 			f"{DIV}\n"
-			f"Capital   {_money(session.equity, 2)}\n"
-			f"Volume    {_money(volume, 0)} / {_money(vol_target, 0)}   \\({_n(vol_pct, 1)}%\\)\n"
-			f"Record    `{wins}W` `{losses}L`   `{_n(wr, 1)}%`"
+			f"Balance {_money(session.equity, 2)}"
 		)
 		try:
 			msg_id = await notifier.send_and_get_id(msg)
@@ -318,6 +312,35 @@ def _build_event_handler(
 			_state["real_exit_sent"] = False
 		except Exception as exc:  # noqa: BLE001
 			LOGGER.exception("real entry send failed: %s", exc)
+
+		# Fire chart asynchronously — send as a reply to the entry message
+		async def _send_chart() -> None:
+			if live_executor is None or live_executor.client is None:
+				return
+			try:
+				png = await build_entry_chart(
+					client=live_executor.client,
+					symbol=symbol,
+					side=side,
+					entry_price=entry,
+					tp_price=tp_price,
+					sl_price=sl_price,
+				)
+				if png:
+					caption = (
+						f"{side_emoji} {side.upper()} \\#{trade_num} · {symbol.replace('_', '/')}\n"
+						f"Entry `{_n(entry, 1)}`\n"
+						f"TP `{_n(tp_price, 1)}` · SL `{_n(sl_price, 1)}`"
+					)
+					await notifier.send_photo(
+						png,
+						caption=caption,
+						reply_to_message_id=_state.get("entry_msg_id"),
+					)
+			except Exception as exc:  # noqa: BLE001
+				LOGGER.warning("chart send failed (non-fatal): %s", exc)
+
+		asyncio.ensure_future(_send_chart())
 
 	async def real_close_callback(info: dict) -> None:
 		"""Called by LiveVolumeExecutor the moment MEXC closes our position.
@@ -331,23 +354,50 @@ def _build_event_handler(
 			result_emoji, result_label = "✅", "TP"
 		elif reason == "sl":
 			result_emoji, result_label = "❌", "SL"
+		elif reason == "trend_break":
+			result_emoji, result_label = "✂️", "Exit"
 		else:
-			result_emoji, result_label = "⏹", reason.upper()
+			result_emoji, result_label = "⏹", reason.replace("_", " ").title()
 		side = str(info.get("side", "")).upper()
+		trade_num_close = session.wins + session.losses
 		entry = _as_float_safe(info.get("entry_price"))
 		exit_ = _as_float_safe(info.get("exit_price"))
 		gross = _as_float_safe(info.get("gross_pnl"))
 		open_fee = _as_float_safe(info.get("open_fee"))
 		close_fee = _as_float_safe(info.get("close_fee"))
 		net = _as_float_safe(info.get("net_pnl"))
+		# Current session stats
+		wins_now = int(session.wins)
+		losses_now = int(session.losses)
+		total_now = wins_now + losses_now
+		wr_now = (wins_now / max(total_now, 1)) * 100
+		volume_now = float(session.total_volume_usd)
+		vol_target_now = float(session._volume_target)  # noqa: SLF001
+		vol_pct_now = volume_now / max(vol_target_now, 1.0) * 100
+		# Health badge — only meaningful after 10 trades
+		if total_now < 10:
+			health = ""
+		elif wr_now >= 87.0:
+			health = "🟢 On Track"
+		elif wr_now >= 78.0:
+			health = "🟡 Watch"
+		else:
+			health = "🔴 ⚠ Warning"
+		health_line = f"\n{health}" if health else ""
 		msg = (
-			f"{result_emoji} *LIVE {side} {result_label}* · `{symbol}`\n"
+			f"{result_emoji} *{result_label} · {side} \\#{trade_num_close}*\n"
+			f"`{symbol.replace('_', '/')}`\n"
 			f"`{_n(entry, 1)}` → `{_n(exit_, 1)}`\n"
 			f"{DIV}\n"
-			f"Gross PnL    {_signed_money(gross)}\n"
-			f"Open fee     {_signed_money(-open_fee)}   {_fee_label('maker')}\n"
-			f"Close fee    {_signed_money(-close_fee)}   {_fee_label('taker')}\n"
-			f"Net PnL      {_signed_money(net)}"
+			f"Gross   {_signed_money(gross)}\n"
+			f"Fees    {_signed_money(-(open_fee + close_fee))}\n"
+			f"*Net     {_signed_money(net)}*\n"
+			f"{DIV}\n"
+			f"{wins_now}W · {losses_now}L · *{_n(wr_now, 1)}% WR*{health_line}\n"
+			f"{DIV}\n"
+			f"Balance {_money(session.equity, 2)}\n"
+			f"Vol {_money(volume_now, 0)} / {_money(vol_target_now, 0)}\n"
+			f"{_n(vol_pct_now, 1)}% of 30d goal"
 		)
 		reply_id = _state.get("entry_msg_id")
 		_state["real_exit_sent"] = True

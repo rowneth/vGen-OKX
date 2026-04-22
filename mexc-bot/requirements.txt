@@ -9,6 +9,8 @@ sqlalchemy
 pytest
 rich
 plotly
+mplfinance
+matplotlib
 pyarrow
 tabulate
 streamlit
