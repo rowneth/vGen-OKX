@@ -166,6 +166,13 @@ def _build_event_handler(
 				)
 
 		if evt.kind == "entry":
+			# In LIVE mode the paper session's entry is a simulation only -- the
+			# real order may be rejected, repriced many times, or filled at a
+			# very different price. All Telegram must reflect confirmed MEXC
+			# state. The real-time fill callback (real_entry_callback) is the
+			# only code path that may announce an opened trade.
+			if live_mode:
+				return
 			side = p["side"]
 			side_emoji = "🟢" if side == "long" else "🔴"
 			trade_num = p["round_trips"] + 1
@@ -260,6 +267,57 @@ def _build_event_handler(
 			)
 			asyncio.run_coroutine_threadsafe(notifier.send_raw(msg), loop)
 
+	async def real_entry_callback(info: dict) -> None:
+		"""Called by LiveVolumeExecutor the moment MEXC confirms a fill.
+
+		This is the ONLY place that may announce a new live trade to
+		Telegram. It uses confirmed MEXC values (real fill price, real
+		maker fee, real TP/SL attached to the order) plus current session
+		stats (capital/volume/record) for the context lines.
+		"""
+		side = str(info.get("side", "long"))
+		side_emoji = "🟢" if side == "long" else "🔴"
+		entry = _as_float_safe(info.get("entry_price"))
+		tp_price = _as_float_safe(info.get("tp_price"))
+		sl_price = _as_float_safe(info.get("sl_price"))
+		tp_bps = _as_float_safe(info.get("tp_bps"))
+		sl_bps = _as_float_safe(info.get("sl_bps"))
+		leverage = int(round(_as_float_safe(info.get("leverage"))))
+		notional = _as_float_safe(info.get("notional"))
+		margin = _as_float_safe(info.get("margin"))
+		open_fee = _as_float_safe(info.get("open_fee"))
+		reprice_attempts = int(info.get("reprice_attempts") or 0)
+		# Session-derived context (uses the live session object from the outer scope)
+		trade_num = session.wins + session.losses + 1
+		volume = float(session.total_volume_usd)
+		vol_target = float(session._volume_target)  # noqa: SLF001
+		vol_pct = volume / max(vol_target, 1.0) * 100
+		wins = int(session.wins)
+		losses = int(session.losses)
+		wr = (wins / max(wins + losses, 1)) * 100
+		reprice_tag = f"   \\(repriced {reprice_attempts}x\\)" if reprice_attempts > 0 else ""
+		msg = (
+			f"{side_emoji} *LIVE {side.upper()}* · \\#{trade_num} `{symbol}`{reprice_tag}\n"
+			f"`{leverage}x` leverage\n"
+			f"{DIV}\n"
+			f"Entry   `{_n(entry, 1)}`\n"
+			f"TP  →   `{_n(tp_price, 1)}`   \\(\\+{_escape(str(tp_bps))} bps\\)\n"
+			f"SL  →   `{_n(sl_price, 1)}`   \\(\\-{_escape(str(sl_bps))} bps\\)\n"
+			f"{DIV}\n"
+			f"Size     {_money(notional)}   Margin {_money(margin, 2)}\n"
+			f"Fee      {_money(open_fee, 4)}   {_fee_label('maker')}\n"
+			f"{DIV}\n"
+			f"Capital   {_money(session.equity, 2)}\n"
+			f"Volume    {_money(volume, 0)} / {_money(vol_target, 0)}   \\({_n(vol_pct, 1)}%\\)\n"
+			f"Record    `{wins}W` `{losses}L`   `{_n(wr, 1)}%`"
+		)
+		try:
+			msg_id = await notifier.send_and_get_id(msg)
+			_state["entry_msg_id"] = msg_id
+			_state["real_exit_sent"] = False
+		except Exception as exc:  # noqa: BLE001
+			LOGGER.exception("real entry send failed: %s", exc)
+
 	async def real_close_callback(info: dict) -> None:
 		"""Called by LiveVolumeExecutor the moment MEXC closes our position.
 
@@ -298,7 +356,7 @@ def _build_event_handler(
 		except Exception as exc:  # noqa: BLE001
 			LOGGER.exception("real exit send failed: %s", exc)
 
-	return handler, real_close_callback
+	return handler, real_close_callback, real_entry_callback
 
 
 def _as_float_safe(x: Any, default: float = 0.0) -> float:
@@ -509,9 +567,11 @@ async def _run(args: argparse.Namespace) -> None:
 					notify_callback=notifier.send_raw,
 				)
 				await live_executor.startup()
-				# Re-bind handler now that executor exists, and wire the
-				# real-time close callback so MEXC TP/SL fills notify instantly.
-				handler, real_close_cb = _build_event_handler(
+				# Re-bind handler now that executor exists, and wire both
+				# real-time callbacks so Telegram only fires on confirmed
+				# MEXC state (entry fill / position close), never on paper
+				# simulation.
+				handler, real_close_cb, real_entry_cb = _build_event_handler(
 					notifier,
 					symbol,
 					bool(notif_cfg.get("send_milestones", True)),
@@ -519,6 +579,7 @@ async def _run(args: argparse.Namespace) -> None:
 					live_mode=True,
 				)
 				session.event_callback = handler
+				live_executor.real_entry_callback = real_entry_cb
 				live_executor.real_close_callback = real_close_cb
 				LOGGER.info("Live executor ready.")
 

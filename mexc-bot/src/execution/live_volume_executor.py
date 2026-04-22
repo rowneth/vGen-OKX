@@ -98,6 +98,7 @@ class LiveVolumeExecutor:
 	position_watch_timeout: float = 3600.0  # give up watching after this many seconds
 	dry_run: bool = False
 	notify_callback: Optional[Callable[[str], Awaitable[None]]] = None
+	real_entry_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 	real_close_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
 	# contract spec (populated by startup)
@@ -325,10 +326,9 @@ class LiveVolumeExecutor:
 				"LIVE entry submitted: oid=%s orderId=%s side=%s vol=%d entry=%.2f lev=%dx",
 				external_oid, record.order_id, side_str, vol_contracts, entry_price, order_leverage,
 			)
-			await self._notify(
-				f"📤 *LIVE order* `{side_str.upper()}` `{vol_contracts}` contracts "
-				f"oid `{external_oid}` orderId `{record.order_id}`"
-			)
+			# NOTE: no Telegram yet -- we only announce a trade AFTER MEXC
+			# confirms the fill (state=3). Pre-fill notifications are misleading
+			# because post-only orders can be rejected or repriced many times.
 
 			# Poll for fill outside the lock so other events aren't blocked
 			asyncio.create_task(self._poll_fill(record))
@@ -437,11 +437,34 @@ class LiveVolumeExecutor:
 							record.fill_fee_maker, record.fill_fee_taker,
 							record.reprice_attempts,
 						)
-						await self._notify(
-							f"✅ *LIVE fill* oid `{record.external_oid}` @ "
-							f"`{record.fill_price:,.2f}` maker fee "
-							f"`${record.fill_fee_maker:.4f}`"
-						)
+						# Fire the real-entry callback so Telegram can announce a
+						# trade using ONLY confirmed MEXC values (real fill price,
+						# real maker fee from /private/order endpoint, real
+						# TP/SL prices attached to the order). No more pre-fill
+						# announcements that later turn out to be cancelled.
+						if self.real_entry_callback is not None:
+							real_notional = record.fill_price * record.vol_contracts * self.contract_size
+							real_margin = real_notional / record.leverage if record.leverage > 0 else 0.0
+							try:
+								await self.real_entry_callback({
+									"symbol": self.symbol,
+									"side": record.side,
+									"entry_price": record.fill_price,
+									"tp_price": record.tp_price,
+									"sl_price": record.sl_price,
+									"tp_bps": record.tp_bps,
+									"sl_bps": record.sl_bps,
+									"leverage": record.leverage,
+									"vol_contracts": record.vol_contracts,
+									"notional": real_notional,
+									"margin": real_margin,
+									"open_fee": record.fill_fee_maker,
+									"external_oid": record.external_oid,
+									"order_id": record.order_id,
+									"reprice_attempts": record.reprice_attempts,
+								})
+							except Exception as exc:  # noqa: BLE001
+								LOGGER.exception("real_entry_callback failed: %s", exc)
 						# Start watching the exchange position for real-time close detection
 						asyncio.create_task(self._watch_position_close(record))
 						return
