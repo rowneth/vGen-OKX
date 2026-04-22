@@ -634,21 +634,56 @@ class LiveVolumeExecutor:
 			await self._notify_real_close(record)
 			return
 
+		# Timeout elapsed. Before giving up, check once more whether MEXC still
+		# shows the position open. If yes, extend the watch indefinitely — we
+		# must NEVER mark a record closed while real contracts are still live,
+		# otherwise the next signal will stack an orphan on top.
+		try:
+			payload = await self.client.get_open_positions(symbol=self.symbol)
+			items = payload if isinstance(payload, list) else (
+				payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), list) else []
+			)
+			our_side_code = 1 if record.side == "long" else 2
+			still_open = False
+			for pos in items or []:
+				if not isinstance(pos, dict):
+					continue
+				if pos.get("symbol") != self.symbol:
+					continue
+				if int(pos.get("positionType", pos.get("position_type", 0))) != our_side_code:
+					continue
+				state = int(_as_float(pos.get("state", 0)))
+				hold_vol = _as_float(pos.get("holdVol", pos.get("hold_vol", 0)))
+				if state in (1, 2) and hold_vol > 0:
+					still_open = True
+					break
+		except Exception:  # noqa: BLE001
+			still_open = True  # be safe: if we can't verify, assume open
+
+		if still_open:
+			# Position genuinely still open. Log a heartbeat and keep watching
+			# by recursing — this resets the timer without unbounded stack
+			# growth (Python async recursion depth here is O(hours/timeout)).
+			LOGGER.info(
+				"watch_position: %.0fs elapsed but MEXC still shows position open for oid=%s — continuing",
+				self.position_watch_timeout, record.external_oid,
+			)
+			await self._notify(
+				f"ℹ️ *LIVE watcher heartbeat* — position still open after "
+				f"{int(self.position_watch_timeout/60)}min, continuing to monitor"
+			)
+			await self._watch_position_close(record)
+			return
+
+		# Position is genuinely gone but we couldn't catch the close event
+		# (e.g. missed a poll due to network hiccups). Fall through to the
+		# close-order lookup so at least the Telegram notification fires.
 		LOGGER.warning(
-			"watch_position: timeout after %.0fs oid=%s", self.position_watch_timeout, record.external_oid,
+			"watch_position: timeout after %.0fs and position no longer open — "
+			"falling back to history lookup oid=%s",
+			self.position_watch_timeout, record.external_oid,
 		)
-		# Don't leave state stuck forever. Mark this record closed so the
-		# next entry gate doesn't block indefinitely. The position itself
-		# is still on MEXC (attached TP/SL will close it eventually, or
-		# the operator can close it manually) — we just stop tracking it.
-		record.closed = True
-		record.close_reason = "watcher_timeout"
-		if self._current is record:
-			self._current = None
-		await self._notify(
-			f"⚠️ *LIVE watcher timeout* oid `{record.external_oid}` — "
-			f"position may still be open on MEXC, please verify"
-		)
+		await self._notify_real_close(record)
 
 	# ------------------------------------------------------------------
 	async def _notify_real_close(self, record: LiveTradeRecord) -> None:
