@@ -95,10 +95,12 @@ async def build_entry_chart(
 
 def _parse_klines(resp: object) -> Optional[pd.DataFrame]:
     """Parse MEXC klines API response into an OHLCV DataFrame."""
-    # Response shape: {"code":0, "data": {"time":[], "open":[], "high":[], "low":[], "close":[], "vol":[]}}
+    # MEXCClient._request unwraps payload["data"] so ``resp`` is the inner dict
+    # with {"time":[], "open":[], ...} directly. But when called raw, the outer
+    # shape is {"code":0, "data": {...}}. Handle both.
     if not isinstance(resp, dict):
         return None
-    data = resp.get("data", {})
+    data = resp.get("data") if "data" in resp and isinstance(resp.get("data"), dict) else resp
     if not isinstance(data, dict):
         return None
 
