@@ -38,7 +38,7 @@ farmer:
   # Backtest-optimal: 15bps TP maximises net return ($+37 over full history)
   # at 78% WR — the only TP where P&L is profitable even without rebate (+1.1% WR gap)
   # Generates most volume ($268K) → highest rebate income
-  tp_bps: 15.0                     # 0.15% TP — backtest optimal
+  tp_bps: 8.0                      # 0.08% TP
   sl_bps: 50.0                     # 0.50% SL (taker exit, rare)
   max_hold_bars: 999               # no time-stop — let TP/SL resolve
 
