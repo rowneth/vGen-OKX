@@ -662,6 +662,15 @@ async def _run(args: argparse.Namespace) -> None:
 				f"Target: `{_fmt(session._volume_target, 0)}` USD"
 			)
 
+			def _esc_md(v: float, d: int = 2) -> str:
+				s = f"{v:,.{d}f}"
+				for ch in "_*[]()~`>#+-=|{}.!":
+					s = s.replace(ch, f"\\{ch}")
+				return s
+
+			_last_known_balance = session.equity if session.equity > 0 else None
+			_consecutive_balance_failures = 0
+
 			while not stop_event.is_set():
 				if datetime.now() >= deadline:
 					LOGGER.info("Duration elapsed; stopping.")
@@ -669,6 +678,58 @@ async def _run(args: argparse.Namespace) -> None:
 				if session.halted:
 					LOGGER.info("Session halted (%s); stopping poll loop.", session.halt_reason)
 					break
+				# -- real-time balance check (every poll cycle) --
+				_balance_ok = True
+				if api_key and api_secret:
+					try:
+						_assets = await client.get_account_info()
+						_cur_bal = _extract_usdt_equity(_assets)
+						if _cur_bal is not None and _cur_bal > 0:
+							if (
+								_last_known_balance is not None
+								and _cur_bal > _last_known_balance + 0.50
+							):
+								_dep = _cur_bal - _last_known_balance
+								_new_margin = _cur_bal * 0.05
+								_dep_msg = (
+									"💰 *New deposit detected\\!*\n"
+									f"Previous Balance: `{_esc_md(_last_known_balance)}` USDT\n"
+									f"New Balance: `{_esc_md(_cur_bal)}` USDT\n"
+									f"Deposit Amount: `{_esc_md(_dep)}` USDT\n"
+									f"New Margin \\(5%\\): `{_esc_md(_new_margin)}` USDT"
+								)
+								LOGGER.info(
+									"Deposit detected: %.2f -> %.2f USDT (+%.2f)",
+									_last_known_balance, _cur_bal, _dep,
+								)
+								asyncio.ensure_future(notifier.send_raw(_dep_msg))
+								session.equity = _cur_bal
+								session.start_equity = _cur_bal
+								session.peak_equity = max(session.peak_equity, _cur_bal)
+							_last_known_balance = _cur_bal
+							_consecutive_balance_failures = 0
+						else:
+							LOGGER.warning("Balance fetch returned no USDT equity.")
+							_consecutive_balance_failures += 1
+							if _consecutive_balance_failures >= 3:
+								_balance_ok = False
+					except Exception as _bal_exc:  # noqa: BLE001
+						LOGGER.warning(
+							"Balance fetch failed (%s); consecutive=%d",
+							_bal_exc, _consecutive_balance_failures,
+						)
+						_consecutive_balance_failures += 1
+						if _consecutive_balance_failures >= 3:
+							_balance_ok = False
+
+				if not _balance_ok:
+					LOGGER.warning("Skipping candle processing: balance fetch failed 3+ times.")
+					try:
+						await asyncio.wait_for(stop_event.wait(), timeout=args.poll_seconds)
+						break
+					except asyncio.TimeoutError:
+						continue
+
 				try:
 					fresh = await _fetch_candles(client, symbol, interval)
 					fresh = _drop_forming(fresh, interval, int(datetime.now(tz=timezone_utc()).timestamp() * 1000))
