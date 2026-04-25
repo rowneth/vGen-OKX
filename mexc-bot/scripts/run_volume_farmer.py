@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import pathlib
@@ -113,6 +114,19 @@ def _fmt(v: float, digits: int = 2) -> str:
 	return f"{v:,.{digits}f}"
 
 
+def _write_daily_trade_log(log_dir: pathlib.Path, record: Dict[str, Any]) -> None:
+	"""Append one trade record to data/logs/trades/YYYY-MM-DD.jsonl (UTC date)."""
+	try:
+		trades_dir = log_dir / "trades"
+		trades_dir.mkdir(parents=True, exist_ok=True)
+		day = datetime.utcnow().strftime("%Y-%m-%d")
+		log_file = trades_dir / f"{day}.jsonl"
+		with log_file.open("a", encoding="utf-8") as fh:
+			fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+	except Exception as exc:  # noqa: BLE001
+		LOGGER.warning("daily trade log write failed: %s", exc)
+
+
 def _build_event_handler(
 	notifier: TelegramNotifier,
 	symbol: str,
@@ -120,6 +134,7 @@ def _build_event_handler(
 	session: "VolumeFarmerSession",
 	live_executor: Optional[LiveVolumeExecutor] = None,
 	live_mode: bool = False,
+	log_dir: Optional[pathlib.Path] = None,
 ):
 	loop = asyncio.get_event_loop()
 	# Mutable container so the inner handler can update it across calls
@@ -406,6 +421,28 @@ def _build_event_handler(
 		reply_id = _state.get("entry_msg_id")
 		_state["real_exit_sent"] = True
 		_state["entry_msg_id"] = None
+		if log_dir is not None:
+			_write_daily_trade_log(log_dir, {
+				"ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+				"symbol": info.get("symbol", symbol),
+				"side": side,
+				"reason": reason,
+				"entry_price": entry,
+				"exit_price": exit_,
+				"vol_contracts": info.get("vol_contracts"),
+				"notional": info.get("notional"),
+				"open_fee": _as_float_safe(info.get("open_fee")),
+				"close_fee": _as_float_safe(info.get("close_fee")),
+				"gross_pnl": gross,
+				"net_pnl": net,
+				"trade_num": trade_num_close,
+				"wins": wins_now,
+				"losses": losses_now,
+				"win_rate_pct": round(wr_now, 2),
+				"equity": float(session.equity),
+				"total_volume_usd": round(volume_now, 2),
+				"external_oid": info.get("external_oid"),
+			})
 		try:
 			close_msg_id = await notifier.send_and_get_id(msg, reply_to_message_id=reply_id)
 			# Auto-react: ❤ for TP, 👎 for SL, 🤔 for other early exits
@@ -561,6 +598,7 @@ async def _run(args: argparse.Namespace) -> None:
 		bool(notif_cfg.get("send_milestones", True)),
 		session=session,
 		live_executor=None,  # will be rebound after client opens if --live
+		log_dir=log_file.parent,
 	)[0]
 
 	stop_event = asyncio.Event()
@@ -642,6 +680,7 @@ async def _run(args: argparse.Namespace) -> None:
 					session=session,
 					live_executor=live_executor,
 					live_mode=True,
+					log_dir=log_file.parent,
 				)
 				session.event_callback = handler
 				live_executor.real_entry_callback = real_entry_cb
