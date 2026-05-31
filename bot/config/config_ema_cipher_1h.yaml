@@ -1,0 +1,138 @@
+app:
+  name: mexc-ema-cipher-1h
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+exchange:
+  name: mexc_futures
+  base_url_rest: https://contract.mexc.com
+  base_url_ws: wss://contract.mexc.com/edge
+  symbol: BTC_USDT
+  timeframe: 1h
+  tick_size: 0.1
+  recv_window_ms: 5000
+  request_timeout_seconds: 15
+  heartbeat_timeout_seconds: 30
+  rate_limits:
+    requests_per_second: 10
+    burst_capacity: 20
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+
+strategy:
+  name: ema_cipher_divergence
+  emas:
+    fast: 50
+    mid: 55
+    slow: 200
+    cross_lookback_bars: 9999
+  wavetrend:
+    channel_len: 9
+    average_len: 12
+    signal_len: 3
+    cross_zero_threshold: 0.0
+  money_flow:
+    period: 60
+    multiplier: 150.0
+    pos_y: 2.5
+  divergence:
+    required: false
+    lookback_bars: 30
+    fractal_left: 2
+    fractal_right: 2
+  retracement:
+    lookback_bars: 10  # 10h
+    tolerance_atr: 0.35
+  stop:
+    swing_lookback_bars: 8
+    buffer_atr: 0.25
+  take_profit:
+    rr_ratio: 2.0
+  atr:
+    period: 14
+  confirmation:
+    require_directional_body: true
+  wavetrend_zone:
+    long_wt2_max: 0.0
+    short_wt2_min: 0.0
+  exits:
+    time_stop_candles: 12  # 12h on 1h
+    partial_tp:
+      enabled: false
+      tp1_size_fraction: 0.5
+      tp1_rr_fraction: 0.5
+      move_stop_to_breakeven: false
+  signal_quality:
+    min_rr_ratio: 2.0
+    min_fee_cover_multiple: 4.0
+
+risk:
+  risk_per_trade_pct: 0.01
+  max_open_positions: 1
+  daily_drawdown_limit_pct: 0.05
+  consecutive_losses_limit: 4
+  consecutive_losses_pause_hours: 4
+  max_leverage: 5
+  max_spread_pct: 0.0005
+  cooldown_bars_after_stop: 2
+  emergency_market_exit_enabled: true
+  startup_checks:
+    require_futures_trade_permission: true
+    require_withdrawal_disabled: true
+
+execution:
+  entry_order_type: limit
+  entry_time_in_force: post_only
+  cancel_on_miss: true
+  allow_market_orders_for_emergency_exit_only: true
+  slippage:
+    base_ticks_per_fill: 1
+    extra_ticks_if_low_volume: 1
+    low_volume_threshold_ratio: 0.5
+  maker_fill_model:
+    enabled: true
+    base_fill_probability: 0.65
+    max_fill_probability: 0.98
+    min_fill_probability: 0.10
+
+backtest:
+  start_lookback_months: 24
+  initial_equity: 10000.0
+  average_volume_lookback: 50
+  enforce_single_position: true
+  use_realistic_fills: true
+  include_fees: true
+  include_slippage: true
+  stress_test:
+    enabled: true
+    win_rate_drop_percentage_points: 5
+
+storage:
+  historical_data_dir: data/historical
+  sqlite_path: data/bot_audit_ema_cipher_1h.db
+  parquet_compression: snappy
+
+notifications:
+  telegram:
+    enabled: false
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+    send_signals: true
+    send_entries: true
+    send_partials: true
+    send_exits: true
+    send_errors: true
+    daily_report_hour: 0
+
+reporting:
+  output_dir: data/reports
+  create_html: true
+  create_markdown: true
+  include_monthly_returns: true
+  include_trades_per_day_distribution: true
+  include_win_rate_by_month: true
+  include_equity_vs_btc_overlay: true
+  include_winner_loser_distribution: true

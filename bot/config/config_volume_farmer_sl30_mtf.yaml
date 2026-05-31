@@ -1,0 +1,85 @@
+app:
+  name: volume-farmer-sl30-mtf
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# SL30 + MTF COMBINED — proposed live config if both backtest changes pass.
+#
+# Changes from config_volume_farmer_optimal.yaml:
+#   1. sl_bps: 30.0          (was 50.0)
+#   2. entry.mode: multi_timeframe with 3m micro + 15m macro
+#   3. alternate_direction: false
+#   4. trend_break.adverse_bps: 18.0  (scaled with SL)
+#
+# Decision rules — ALL must hold for deployment (set in advance):
+#   WR >= 80% on 5m 12-month data
+#   end+rebate >= baseline+10% on 5m 12-month data
+#   max_drawdown <= baseline+5pp
+#   trades >= 50% of baseline count
+#   avg_loss_bps_weighted <= 25
+
+exchange:
+  symbol: BTC_USDT
+  timeframes:
+    entry: 5m
+    micro: 3m
+    macro: 15m
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+  rebate_pct: 0.70
+
+farmer:
+  capital_usd: 30.0
+  leverage: 0
+
+  margin_fraction_per_trade: 0.05
+
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    max_leverage: 125
+    min_leverage: 5
+
+  tp_bps: 8.0
+  sl_bps: 30.0           # CHANGED from 50.0
+  max_hold_bars: 999
+
+  entry:
+    mode: multi_timeframe
+    primary_3m_lookback_bars: 5
+    macro_15m_lookback_bars: 5
+    require_alignment: true
+    allow_neutral_micro: true
+    skip_neutral_macro: true
+    min_bar_range_bps: 4.0
+    max_bar_range_bps: 40.0
+
+  alternate_direction: false   # CHANGED — MTF alignment replaces forced L/S/L/S
+
+  trend_break:
+    enabled: true
+    min_bars_held: 3
+    adverse_bps: 18.0      # CHANGED — scaled with new SL (was 20.0)
+
+  h1_veto:
+    enabled: false         # explicitly off — rejected experiment
+
+risk:
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 100000.0
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: false
+    send_daily: false
+    send_errors: false

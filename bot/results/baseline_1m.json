@@ -1,0 +1,30 @@
+{
+  "config_name": "config_volume_farmer_optimal",
+  "timeframe": "5m",
+  "period_days": 25.4,
+  "total_trades": 982,
+  "wr_pct": 76.78,
+  "break_even_wr_pct": 86.21,
+  "wr_gap_pct": -9.42,
+  "avg_win_bps": 8.0,
+  "avg_loss_bps_weighted": 26.13,
+  "by_exit_reason": {
+    "tp": 754,
+    "trend_break": 214,
+    "sl_ambiguous": 1,
+    "sl": 13
+  },
+  "gross_pnl": 2.4492,
+  "fees_paid": 30.865,
+  "rebate_earned": 21.6055,
+  "end_equity": 1.5842,
+  "end_plus_rebate": 23.1897,
+  "net_per_trade": -0.006935,
+  "max_drawdown_pct": 94.87,
+  "volume_usd": 102883.0,
+  "halted_early": false,
+  "halt_reason": null,
+  "entries_attempted": 1806,
+  "entries_skipped_by_mtf": 0,
+  "generated_at": "2026-04-27T19:18:24Z"
+}

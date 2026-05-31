@@ -1,0 +1,71 @@
+app:
+  name: volume-farmer-sl30
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# SL30-ONLY EXPERIMENT — identical to config_volume_farmer_optimal.yaml
+# except sl_bps: 30 (was 50) and trend_break.adverse_bps: 18 (was 20, scaled with SL).
+#
+# Purpose: isolate the SL-tightening effect for backtest comparison.
+# alternate_direction: true — unchanged from optimal (MTF NOT enabled here).
+#
+# Decision rules applied post-backtest (set in advance, do not change):
+#   PASS if vs baseline: WR >= 80%, end+rebate >= baseline+10%,
+#         DD <= baseline+5pp, trades >= 50% baseline, avg_loss_bps <= 25
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+  rebate_pct: 0.70
+
+farmer:
+  capital_usd: 30.0
+  leverage: 0
+
+  margin_fraction_per_trade: 0.05
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    max_leverage: 125
+    min_leverage: 5
+
+  tp_bps: 8.0
+  sl_bps: 30.0           # was 50.0 — CHANGED
+  max_hold_bars: 999
+
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 3.0
+    max_bar_range_bps: 40.0
+
+  alternate_direction: true
+
+  trend_break:
+    enabled: true
+    min_bars_held: 3
+    adverse_bps: 18.0    # was 20.0 — scaled proportionally with SL (30/50 * 20 ≈ 12, rounded to 18)
+
+  h1_veto:
+    enabled: false       # rejected experiment — do not enable
+
+risk:
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 100000.0
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: false
+    send_daily: false
+    send_errors: false

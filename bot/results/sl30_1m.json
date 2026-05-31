@@ -1,0 +1,30 @@
+{
+  "config_name": "config_volume_farmer_sl30",
+  "timeframe": "5m",
+  "period_days": 25.4,
+  "total_trades": 772,
+  "wr_pct": 73.83,
+  "break_even_wr_pct": 78.95,
+  "wr_gap_pct": -5.11,
+  "avg_win_bps": 8.0,
+  "avg_loss_bps_weighted": 23.1,
+  "by_exit_reason": {
+    "tp": 570,
+    "trend_break": 157,
+    "sl": 44,
+    "sl_ambiguous": 1
+  },
+  "gross_pnl": 0.486,
+  "fees_paid": 28.9862,
+  "rebate_earned": 20.2903,
+  "end_equity": 1.4998,
+  "end_plus_rebate": 21.7901,
+  "net_per_trade": -0.010635,
+  "max_drawdown_pct": 95.04,
+  "volume_usd": 96621.0,
+  "halted_early": true,
+  "halt_reason": "max_drawdown 95.04%",
+  "entries_attempted": 1354,
+  "entries_skipped_by_mtf": 0,
+  "generated_at": "2026-04-27T19:18:25Z"
+}

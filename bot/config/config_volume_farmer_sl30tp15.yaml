@@ -1,0 +1,71 @@
+app:
+  name: volume-farmer-paper-sl30tp15
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# PAPER-ONLY experimental config: SL=30 / TP=15.
+#
+# 12-month backtest (BTC_USDT 5m, 102,945 bars):
+#   With trend_break ON  : WR 59.1%, gap -7.6%, end+rebate $16.03  (BAD)
+#   Trend_break OFF      : WR 66.2%, gap -0.5%, end+rebate $25.68
+#
+# Trend_break exits winners early when SL is already tight — disabled here.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+  rebate_pct: 0.70
+
+farmer:
+  capital_usd: 30.0
+  leverage: 0
+  margin_fraction_per_trade: 0.05
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    max_leverage: 125
+    min_leverage: 5
+
+  tp_bps: 15.0
+  sl_bps: 30.0
+  max_hold_bars: 999
+
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 4.0
+    max_bar_range_bps: 40.0
+
+  alternate_direction: true
+
+  # Disabled — with SL=30 the trend_break exits winners (see header).
+  trend_break:
+    enabled: false
+    min_bars_held: 3
+    adverse_bps: 20.0
+
+risk:
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 100000.0
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: true
+    send_daily: true
+    send_errors: true
+    send_milestones: true
+    daily_report_hour: 0
+
+reporting:
+  output_dir: data/reports

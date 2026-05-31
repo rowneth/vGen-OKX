@@ -19,6 +19,10 @@ __pycache__/
 .DS_Store
 
 # Local data outputs
+bot/data/historical/*.parquet
+bot/data/reports/
+bot/data/*.db
+bot/data/*.png
 mexc-bot/data/historical/*.parquet
 mexc-bot/data/reports/
 mexc-bot/data/*.db

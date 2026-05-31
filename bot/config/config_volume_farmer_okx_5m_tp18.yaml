@@ -1,0 +1,71 @@
+app:
+  name: volume-farmer-okx-5m-tp18
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# OKX paper config: 5m / TP=18bps / SL=30bps / trend_break OFF.
+#
+# Strategy chosen from 360d vectorized backtest (scripts/backtest_vectorized.py):
+#   - 5m + 18bps TP picked over 1m for better slip-to-target ratio
+#     (1m slippage of 8bps eats 44% of TP target; 5m slippage of ~3bps eats only 17%)
+#   - trend_break OFF because at 40% rebate the early exits forgo more wins
+#     than they save in losses (~$3 worse over 360d in backtest).
+#   - WR-gap +2.07% — only config in family with positive gross alpha.
+#
+# Fees set to OKX rates the user provided: 0.02% maker / 0.06% taker / 40% rebate.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0002
+  taker: 0.0006
+  rebate_pct: 0.40
+
+farmer:
+  capital_usd: 30.0
+  leverage: 0
+  margin_fraction_per_trade: 0.05
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    max_leverage: 125
+    min_leverage: 5
+
+  tp_bps: 18.0
+  sl_bps: 30.0
+  max_hold_bars: 999
+
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 4.0
+    max_bar_range_bps: 40.0
+
+  alternate_direction: true
+
+  trend_break:
+    enabled: false
+
+risk:
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: false
+
+target:
+  volume_usd: 1000000.0
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: false
+    send_daily: false
+    send_errors: false
+    send_milestones: false
+    daily_report_hour: 0
+
+reporting:
+  output_dir: data/reports

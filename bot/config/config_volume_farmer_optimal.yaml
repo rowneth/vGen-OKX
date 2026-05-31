@@ -1,0 +1,85 @@
+app:
+  name: volume-farmer-optimal
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# OPTIMAL VOLUME FARMER — $30 -> $100K volume target.
+#
+# REAL FEE STRUCTURE (confirmed from live trade 2026-04-21):
+#   Maker (POST_ONLY open):  0.01%  (0.0001)
+#   Taker (TP/SL triggered): 0.05%  (0.0005)
+#   Round-trip minimum:      0.06%  (6bps)
+#
+# TP must exceed 6bps to break even. 10bps gives +4bps net per win.
+# SL=50bps: net per loss = -56bps. Need >93% WR to break even on P&L alone.
+# Strategy is volume/rebate driven — P&L bleed is expected, offset by rebates.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0001                    # 0.01% — confirmed from live trade
+  taker: 0.0005                    # 0.05% — confirmed from live trade (TP/SL triggers)
+  rebate_pct: 0.70
+
+farmer:
+  capital_usd: 30.0               # was 300.0
+  leverage: 0                      # 0 = dynamic
+
+  margin_fraction_per_trade: 0.05  # 5% of equity as margin
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025      # 2.5% risk per trade
+    max_leverage: 125
+    min_leverage: 5
+
+  # Backtest-optimal: 15bps TP maximises net return ($+37 over full history)
+  # at 78% WR — the only TP where P&L is profitable even without rebate (+1.1% WR gap)
+  # Generates most volume ($268K) → highest rebate income
+  tp_bps: 8.0                      # 0.08% TP
+  sl_bps: 50.0                     # 0.50% SL (taker exit, rare)
+  max_hold_bars: 999               # no time-stop — let TP/SL resolve
+
+  # Winning entry: micro-momentum + alternation (simplest, highest volume)
+  # min_bar_range_bps: 3.0 (was 4.0) — backtest grid 2026-04-27 showed +20.3%
+  # trades, +2.7pt WR, +2.7pt WR-gap, +13.8% end+rebate. Strict improvement
+  # on every metric. Lowering further to 2 or 1 reverses gains (picks up chop).
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 3.0         # skip dead bars (was 4.0)
+    max_bar_range_bps: 40.0        # skip violent bars (widens if SL is 50bps)
+
+  alternate_direction: true        # flip bias to keep net exposure near 0
+
+  # Trend-break early exit — backtest-optimal (3 bars / 20 bps)
+  # Cuts losers early when the move is clearly against us, before they reach
+  # full 50 bps SL. Improves End+Rebate from $20.51 → $23.60 (+15%) on BTC 5m.
+  trend_break:
+    enabled: true
+    min_bars_held: 3               # give the move 15 min to resolve first
+    adverse_bps: 20.0              # exit if price moved 20 bps against entry
+
+# Survival rails — allow heavy DD because rebate recovers it
+risk:
+  daily_loss_limit_pct: 0.50       # 50% per day — very lenient
+  max_drawdown_pct: 0.95           # 95% absolute DD halt
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 100000.0              # was 1000000.0
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: true
+    send_daily: true
+    send_errors: true
+    send_milestones: true
+    daily_report_hour: 0
+
+reporting:
+  output_dir: data/reports

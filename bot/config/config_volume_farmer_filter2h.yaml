@@ -1,0 +1,65 @@
+app:
+  name: volume-farmer-filter2h
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# FILTER-2H VARIANT — identical to config_volume_farmer_optimal.yaml
+# except session_filter: skip UTC hours [1, 6] only.
+#
+# Single-variable test: does blocking 2 low-quality hours improve net bps
+# without losing enough volume to negate the gain?
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0001
+  taker: 0.0005
+  rebate_pct: 0.70
+
+farmer:
+  capital_usd: 30.0
+  leverage: 0
+
+  margin_fraction_per_trade: 0.05
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    max_leverage: 125
+    min_leverage: 5
+
+  tp_bps: 8.0
+  sl_bps: 50.0
+  max_hold_bars: 999
+
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 3.0
+    max_bar_range_bps: 40.0
+    skip_hours: [1, 6]             # ← ONLY change vs optimal
+
+  alternate_direction: true
+
+  trend_break:
+    enabled: true
+    min_bars_held: 3
+    adverse_bps: 20.0
+
+risk:
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: false     # run full dataset
+
+target:
+  volume_usd: 999999999
+
+notifications:
+  telegram:
+    enabled: false
+
+reporting:
+  output_dir: data/reports
