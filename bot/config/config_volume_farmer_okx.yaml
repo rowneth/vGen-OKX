@@ -34,7 +34,7 @@ farmer:
   capital_usd: 500.0
   leverage: 0                      # 0 = dynamic
 
-  margin_fraction_per_trade: 0.05  # 5% of equity as margin
+  margin_fraction_per_trade: 0.03  # 3% of equity as margin
   sizing:
     dynamic_leverage: true
     risk_per_trade_pct: 0.025      # 2.5% risk per trade
