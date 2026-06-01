@@ -28,6 +28,7 @@ import os
 import pathlib
 import signal
 import sys
+import io
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -46,6 +47,7 @@ from monitoring.telegram_notifier import TelegramNotifier  # noqa: E402
 
 LOGGER = logging.getLogger("vf_okx")
 
+_SEP = "━" * 22
 
 SEED_CANDLES = 100
 DEFAULT_POLL_SECONDS = 20
@@ -96,6 +98,64 @@ def _normalize_okx_candles(raw: list) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows).sort_values("open_time").reset_index(drop=True)
     return df
+
+
+def _draw_entry_chart(
+    bars: pd.DataFrame,
+    side: str,
+    entry_price: float,
+    tp_price: float,
+    sl_price: float,
+) -> Optional[bytes]:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        df = bars.tail(30).reset_index(drop=True)
+        n = len(df)
+        if n < 3:
+            return None
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        fig.patch.set_facecolor("#0d1117")
+        ax.set_facecolor("#161b22")
+
+        for i, row in df.iterrows():
+            op, hi, lo, cl = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+            color = "#26a69a" if cl >= op else "#ef5350"
+            ax.plot([i, i], [lo, hi], color=color, linewidth=0.8, zorder=1)
+            body_lo, body_hi = min(op, cl), max(op, cl)
+            height = max(body_hi - body_lo, (hi - lo) * 0.005 + 0.01)
+            ax.add_patch(plt.Rectangle((i - 0.35, body_lo), 0.7, height, color=color, zorder=2))
+
+        x_end = n + 2
+        ax.plot([0, x_end], [tp_price, tp_price], color="#22c55e", linewidth=1.2, linestyle="--", alpha=0.85, zorder=3)
+        ax.plot([0, x_end], [sl_price, sl_price], color="#ef4444", linewidth=1.2, linestyle="--", alpha=0.85, zorder=3)
+        ax.plot([0, x_end], [entry_price, entry_price], color="#60a5fa", linewidth=1.0, linestyle="-", alpha=0.75, zorder=3)
+
+        ax.text(x_end + 0.2, tp_price, f"TP {tp_price:,.1f}", color="#22c55e", va="center", fontsize=7.5, fontweight="bold")
+        ax.text(x_end + 0.2, entry_price, f"  {entry_price:,.1f}", color="#60a5fa", va="center", fontsize=7.5)
+        ax.text(x_end + 0.2, sl_price, f"SL {sl_price:,.1f}", color="#ef4444", va="center", fontsize=7.5, fontweight="bold")
+
+        marker = "^" if side.lower() == "long" else "v"
+        ax.scatter([n - 1], [entry_price], marker=marker, color="#60a5fa", s=120, zorder=5, edgecolors="white", linewidths=0.5)
+
+        ax.set_xlim(-0.5, x_end + 6)
+        ax.set_xticks([])
+        ax.tick_params(axis="y", colors="#6b7280", labelsize=7, right=True, left=False, labelright=True, labelleft=False)
+        for spine in ax.spines.values():
+            spine.set_color("#30363d")
+
+        fig.tight_layout(pad=0.5)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception as exc:
+        LOGGER.warning("chart draw failed: %s", exc)
+        return None
 
 
 async def _seed_history(client: OKXClient, symbol: str, tf: str, n: int) -> pd.DataFrame:
@@ -169,19 +229,38 @@ def _write_daily_trade_log(log_dir: pathlib.Path, record: Dict[str, Any]) -> Non
         LOGGER.warning("trade log write failed: %s", exc)
 
 
-def _make_event_handler(log_dir: pathlib.Path, symbol: str, session: VolumeFarmerSession,
-                        live_executor: Optional["LiveVolumeExecutorOKX"] = None,
-                        notifier: Optional[TelegramNotifier] = None,
-                        mode_label: str = "PAPER"):
-    _pending_entry: Dict[str, Any] = {}
+def _make_event_handler(
+    log_dir: pathlib.Path,
+    symbol: str,
+    session: VolumeFarmerSession,
+    live_executor: Optional["LiveVolumeExecutorOKX"] = None,
+    notifier: Optional[TelegramNotifier] = None,
+    mode_label: str = "PAPER",
+    client: Optional["OKXClient"] = None,
+    tf: str = "5m",
+):
+    _pending: Dict[str, Any] = {}
+    _esc = TelegramNotifier.escape
+
+    async def _send_entry_with_chart(text: str, side: str, entry: float, tp: float, sl: float) -> None:
+        msg_id = await notifier.send_and_get_id(text)
+        _pending["msg_id"] = msg_id
+        if client is not None and msg_id is not None:
+            try:
+                raw = await client.get_candles(symbol, tf, limit=35)
+                bars = _normalize_okx_candles(raw)
+                chart = _draw_entry_chart(bars[bars["closed"]], side, entry, tp, sl)
+                if chart:
+                    await notifier.send_photo(chart, reply_to_message_id=msg_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("chart send failed: %s", exc)
+
+    async def _send_exit(text: str) -> None:
+        await notifier.send_and_get_id(text, reply_to_message_id=_pending.get("msg_id"))
 
     def _tg(msg: str) -> None:
-        if notifier is None or not notifier.enabled:
-            return
-        try:
+        if notifier and notifier.enabled:
             asyncio.create_task(notifier.send_raw(msg))
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.debug("tg send failed: %s", exc)
 
     def on_event(evt: FarmerEvent) -> None:
         if live_executor is not None:
@@ -189,106 +268,134 @@ def _make_event_handler(log_dir: pathlib.Path, symbol: str, session: VolumeFarme
                 live_executor.consume_session_event(evt)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("live executor error: %s", exc)
+
         if evt.kind == "entry":
             p = evt.payload
-            _pending_entry.update({
-                "ts_entry": evt.time.isoformat(),
-                "side": p.get("side", "").upper(),
-                "entry_price": p.get("price"),
-                "notional": p.get("notional"),
-                "leverage": p.get("leverage"),
-                "open_fee": p.get("open_fee"),
-                "tp": p.get("tp"),
-                "sl": p.get("sl"),
-            })
+            side = p["side"]
+            entry = p["price"]
+            tp = p["tp"]
+            sl = p["sl"]
+            tp_bps = p.get("tp_bps", abs(tp - entry) / entry * 10_000)
+            sl_bps = p.get("sl_bps", abs(sl - entry) / entry * 10_000)
+            notional = p["notional"]
+            margin = p.get("margin", 0.0)
+            lev = p.get("leverage", 0)
+            open_fee = p.get("open_fee", 0)
+            equity = p.get("equity", session.equity)
+            trade_num = p.get("round_trips", session.round_trips) + 1
+
+            _pending.update({"side": side, "entry": entry, "tp": tp, "sl": sl,
+                              "open_fee": open_fee, "msg_id": None})
+
             LOGGER.info(
                 "ENTRY %s %s  price=%.2f  notional=$%.2f  lev=%.1fx  tp=%.2f  sl=%.2f",
-                p["side"].upper(), symbol, p["price"], p["notional"],
-                p.get("leverage", 0), p["tp"], p["sl"],
+                side.upper(), symbol, entry, notional, lev, tp, sl,
             )
-            esc = TelegramNotifier.escape
-            e_mode = esc(mode_label)
-            e_side = esc(p["side"].upper())
-            e_sym = esc(symbol)
-            e_px = esc(f"{p['price']:.2f}")
-            e_notional = esc(f"${p['notional']:.2f}")
-            e_tp = esc(f"{p['tp']:.2f}")
-            e_sl = esc(f"{p['sl']:.2f}")
-            e_lev = esc(f"{p.get('leverage', 0):.0f}x")
-            _tg(
-                f"📈 *{e_mode} ENTRY*\n"
-                f"`{e_side}` {e_sym}\n"
-                f"px {e_px}  notional {e_notional}\n"
-                f"TP {e_tp}  SL {e_sl}  lev {e_lev}"
-            )
+
+            if notifier and notifier.enabled:
+                arrow = "🟢" if side == "long" else "🔴"
+                text = (
+                    f"{arrow} *{_esc(side.upper())} \\#{_esc(str(trade_num))} · {_esc(mode_label)}*\n"
+                    f"{_esc(symbol)} · {_esc(tf)}\n"
+                    f"{_SEP}\n"
+                    f"Entry →  `{entry:,.2f}`\n"
+                    f"TP    →  `{tp:,.2f}`   `+{tp_bps:.1f}bps`\n"
+                    f"SL    →  `{sl:,.2f}`   `-{sl_bps:.1f}bps`\n"
+                    f"{_SEP}\n"
+                    f"Margin  `${margin:,.2f}`  ·  Lev `{lev:.0f}×`\n"
+                    f"Size    `${notional:,.2f}`\n"
+                    f"{_SEP}\n"
+                    f"Open fee  `${open_fee:.4f}` \\(maker\\)\n"
+                    f"{_SEP}\n"
+                    f"Balance  `${equity:.4f}`"
+                )
+                asyncio.create_task(_send_entry_with_chart(text, side, entry, tp, sl))
+
         elif evt.kind == "exit":
             p = evt.payload
+            side = p["side"]
+            reason = p["reason"]
+            entry_px = p["entry_price"]
+            exit_px = p["exit_price"]
+            gross = p["gross_pnl"]
+            net = p["net_pnl"]
+            close_fee = p.get("close_fee", 0)
+            close_fee_type = p.get("close_fee_type", "taker")
+            equity = p["equity"]
+            wins = p["wins"]
+            losses = p["losses"]
+            wr = p.get("win_rate_pct", 0)
+            trade_num = p["round_trips"]
+            vol_now = p.get("volume", 0)
+            vol_target = p.get("volume_target", 0)
+
             record = {
-                "ts": evt.time.isoformat(),
-                "symbol": symbol,
-                "side": p["side"].upper(),
-                "reason": p["reason"],
-                "entry_price": p["entry_price"],
-                "exit_price": p["exit_price"],
+                "ts": evt.time.isoformat(), "symbol": symbol,
+                "side": side, "reason": reason,
+                "entry_price": entry_px, "exit_price": exit_px,
                 "notional": p["notional"],
-                "open_fee": _pending_entry.get("open_fee", p.get("open_fee")),
-                "close_fee": p.get("close_fee"),
-                "gross_pnl": p["gross_pnl"],
-                "net_pnl": p["net_pnl"],
-                "trade_num": p["round_trips"],
-                "wins": p["wins"],
-                "losses": p["losses"],
-                "win_rate_pct": p.get("win_rate_pct"),
-                "equity": p["equity"],
-                "total_volume_usd": p.get("volume"),
-                "bars_held": p["bars_held"],
+                "open_fee": _pending.get("open_fee", p.get("open_fee")),
+                "close_fee": close_fee, "gross_pnl": gross, "net_pnl": net,
+                "trade_num": trade_num, "wins": wins, "losses": losses,
+                "win_rate_pct": wr, "equity": equity,
+                "total_volume_usd": vol_now, "bars_held": p["bars_held"],
             }
             _write_daily_trade_log(log_dir, record)
-            sign = "+" if p["net_pnl"] >= 0 else ""
+
+            sign = "+" if net >= 0 else ""
             LOGGER.info(
                 "EXIT  %s  %s  %s -> %s  net=%s$%.4f  eq=$%.4f  vol=$%.0f  wr=%.1f%%  trade #%d",
-                p["reason"], p["side"].upper(), p["entry_price"], p["exit_price"],
-                sign, p["net_pnl"], p["equity"], p.get("volume", 0),
-                p.get("win_rate_pct", 0), p["round_trips"],
+                reason, side.upper(), entry_px, exit_px, sign, net, equity,
+                vol_now, wr, trade_num,
             )
-            emoji = "✅" if p["net_pnl"] >= 0 else "❌"
-            esc = TelegramNotifier.escape
-            e_mode = esc(mode_label)
-            e_reason = esc(p["reason"])
-            e_side = esc(p["side"].upper())
-            e_entry = esc(f"{p['entry_price']:.2f}")
-            e_exit = esc(f"{p['exit_price']:.2f}")
-            e_net = esc(f"{sign}${p['net_pnl']:.4f}")
-            e_eq = esc(f"${p['equity']:.4f}")
-            e_vol = esc(f"${p.get('volume', 0):,.0f}")
-            e_wr = esc(f"{p.get('win_rate_pct', 0):.1f}%")
-            _tg(
-                f"{emoji} *{e_mode} EXIT* `{e_reason}`\n"
-                f"{e_side} {e_entry} → {e_exit}\n"
-                f"net `{e_net}`  eq `{e_eq}`\n"
-                f"vol `{e_vol}`  wr `{e_wr}`  trade `#{p['round_trips']}`"
-            )
-            _pending_entry.clear()
+
+            if notifier and notifier.enabled:
+                emoji = "✅" if reason == "tp" else ("❌" if reason == "sl" else "⏱")
+                g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
+                n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
+                vol_pct = vol_now / vol_target * 100 if vol_target else 0
+                text = (
+                    f"{emoji} *{_esc(reason.upper())} · {_esc(side.upper())} \\#{_esc(str(trade_num))} · {_esc(mode_label)}*\n"
+                    f"{_esc(symbol)}  `{entry_px:,.2f}` → `{exit_px:,.2f}`\n"
+                    f"{_SEP}\n"
+                    f"Gross   `{g_str}`\n"
+                    f"Fee     `${close_fee:.4f}` \\({_esc(close_fee_type)}\\)\n"
+                    f"Net     `{n_str}`\n"
+                    f"{_SEP}\n"
+                    f"`{wins}W · {losses}L · {wr:.1f}% WR`\n"
+                    f"{_SEP}\n"
+                    f"Balance  `${equity:.4f}`\n"
+                    f"{_SEP}\n"
+                    f"Vol  `${vol_now:,.0f}` / `${vol_target:,.0f}`  \\[`{vol_pct:.1f}%`\\]"
+                )
+                asyncio.create_task(_send_exit(text))
+            _pending.clear()
+
         elif evt.kind == "halt":
             LOGGER.warning("HALT: %s", evt.payload.get("reason"))
-            esc = TelegramNotifier.escape
-            e_mode = esc(mode_label)
-            e_reason = esc(evt.payload.get("reason", "?"))
-            e_eq = esc(f"${evt.payload.get('equity', 0):.4f}")
-            e_vol = esc(f"${evt.payload.get('volume', 0):,.0f}")
-            _tg(
-                f"🛑 *{e_mode} HALT*\n"
-                f"reason: `{e_reason}`\n"
-                f"equity: `{e_eq}`\n"
-                f"volume: `{e_vol}`"
-            )
+            if notifier and notifier.enabled:
+                reason = evt.payload.get("reason", "?")
+                eq = evt.payload.get("equity", 0)
+                vol = evt.payload.get("volume", 0)
+                _tg(
+                    f"🛑 *HALT · {_esc(mode_label)}*\n"
+                    f"{_SEP}\n"
+                    f"Reason  `{_esc(reason)}`\n"
+                    f"Equity  `${eq:.4f}`\n"
+                    f"Volume  `${vol:,.0f}`"
+                )
+
         elif evt.kind == "milestone":
-            LOGGER.info("MILESTONE %s%%  volume=$%.0f", int(evt.payload.get("pct", 0) * 100),
-                        evt.payload.get("volume", 0))
-            esc = TelegramNotifier.escape
-            e_pct = esc(f"{int(evt.payload.get('pct', 0) * 100)}%")
-            e_vol = esc(f"${evt.payload.get('volume', 0):,.0f}")
-            _tg(f"🎯 *MILESTONE* `{e_pct}` of volume target — `{e_vol}`")
+            pct = int(evt.payload.get("pct", 0) * 100)
+            vol = evt.payload.get("volume", 0)
+            vol_target = evt.payload.get("volume_target", 0)
+            LOGGER.info("MILESTONE %d%%  volume=$%.0f", pct, vol)
+            if notifier and notifier.enabled:
+                _tg(
+                    f"🎯 *Milestone {_esc(str(pct))}%* of volume target\n"
+                    f"Vol  `${vol:,.0f}` / `${vol_target:,.0f}`"
+                )
+
     return on_event
 
 
@@ -359,7 +466,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     session = VolumeFarmerSession(config=cfg)
     # Provisional handler — replaced below once execution mode is decided.
-    handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER")
+    handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER", tf=tf)
     session.event_callback = handler
 
     stop_evt = asyncio.Event()
@@ -423,29 +530,41 @@ async def main_async(args: argparse.Namespace) -> int:
         )
         # Rebuild handler now that we have the live_executor (if any).
         handler = _make_event_handler(log_dir, symbol, session, live_executor,
-                                      notifier=notifier, mode_label=mode_label)
+                                      notifier=notifier, mode_label=mode_label,
+                                      client=client, tf=tf)
         session.event_callback = handler
 
-        # STARTUP message — go.
+        # STARTUP message.
         if notifier.enabled:
-            last_bar_ts = history["open_time"].iloc[-1] if not history.empty else "n/a"
-            esc = TelegramNotifier.escape
-            tp_bps = cfg["farmer"]["tp_bps"]
-            sl_bps = cfg["farmer"]["sl_bps"]
+            _esc = TelegramNotifier.escape
             cap = cfg["farmer"]["capital_usd"]
             maker_bps = cfg["fees"]["maker"] * 1e4
             taker_bps = cfg["fees"]["taker"] * 1e4
             rebate_pct = cfg["fees"]["rebate_pct"] * 100
             dur = f"{args.duration_days}d" if args.duration_days else "unbounded"
+            atr_cfg = cfg.get("farmer", {}).get("atr", {})
+            atr_min = atr_cfg.get("min_usd", 0)
+            atr_tp_mult = atr_cfg.get("tp_mult", 0.5)
+            atr_sl_mult = atr_cfg.get("sl_mult", 1.5)
+            limit_tp = cfg.get("farmer", {}).get("limit_tp", False)
+            min_lev = cfg.get("farmer", {}).get("sizing", {}).get("min_leverage", 5)
+            max_lev = cfg.get("farmer", {}).get("sizing", {}).get("max_leverage", 125)
+            vol_target = cfg.get("target", {}).get("volume_usd", 0)
             startup_msg = (
-                f"🚀 *vGen OKX bot started* `{esc(mode_label)}`\n"
-                f"config: `{esc(cfg_path.name)}`\n"
-                f"symbol: `{esc(symbol)}`  tf: `{esc(tf)}`\n"
-                f"tp/sl: `{esc(f'{tp_bps:.0f}/{sl_bps:.0f}bps')}`  cap: `{esc(f'${cap:.2f}')}`\n"
-                f"fees: `{esc(f'{maker_bps:.0f}/{taker_bps:.0f}bps')}`  "
-                f"rebate: `{esc(f'{rebate_pct:.0f}%')}`\n"
-                f"seeded `{len(history)}` bars, last `{esc(str(last_bar_ts))}`\n"
-                f"poll: `{esc(f'{args.poll_seconds}s')}`  duration: `{esc(dur)}`"
+                f"🚀 *vGen OKX · {_esc(mode_label)}*\n"
+                f"{_esc(symbol)} · {_esc(tf)}\n"
+                f"{_SEP}\n"
+                f"Capital    `${cap:.2f}`\n"
+                f"Lev        `{min_lev}-{max_lev}×` \\(dynamic\\)\n"
+                f"ATR filter `≥${atr_min:.0f}` \\(Wilder\\-14\\)\n"
+                f"TP `{atr_tp_mult}×` ATR  ·  SL `{atr_sl_mult}×` ATR\n"
+                f"Limit TP   `{'✓' if limit_tp else '✗'}` \\(maker fill\\)\n"
+                f"{_SEP}\n"
+                f"Maker  `{maker_bps:.0f}bps`  ·  rebate `{rebate_pct:.0f}%`\n"
+                f"Taker  `{taker_bps:.0f}bps`\n"
+                f"{_SEP}\n"
+                f"Target  `${vol_target:,.0f}` volume\n"
+                f"Duration  `{_esc(dur)}`  ·  poll `{args.poll_seconds}s`"
             )
             await notifier.send_raw(startup_msg)
 
@@ -471,15 +590,14 @@ async def main_async(args: argparse.Namespace) -> int:
                 s["round_trips"], s["win_rate_pct"], s["equity"], s["volume_usd"], s["total_pnl"])
     if notifier.enabled:
         try:
-            esc = TelegramNotifier.escape
-            e_wr = esc(f"{s['win_rate_pct']:.2f}%")
-            e_eq = esc(f"${s['equity']:.4f}")
-            e_vol = esc(f"${s['volume_usd']:,.0f}")
-            e_pnl = esc(f"${s['total_pnl']:.4f}")
+            pnl_str = f"+${s['total_pnl']:.4f}" if s["total_pnl"] >= 0 else f"-${abs(s['total_pnl']):.4f}"
             await notifier.send_raw(
-                f"⏹️ *vGen OKX bot stopped*\n"
-                f"trades: `{s['round_trips']}`  wr: `{e_wr}`\n"
-                f"eq: `{e_eq}`  vol: `{e_vol}`  pnl: `{e_pnl}`"
+                f"⏹ *vGen OKX stopped · {TelegramNotifier.escape(mode_label)}*\n"
+                f"{_SEP}\n"
+                f"Trades  `{s['round_trips']}`  ·  WR `{s['win_rate_pct']:.1f}%`\n"
+                f"{_SEP}\n"
+                f"Equity  `${s['equity']:.4f}`  ·  PnL  `{pnl_str}`\n"
+                f"Vol     `${s['volume_usd']:,.0f}`"
             )
             await notifier.stop()
         except Exception as exc:  # noqa: BLE001
