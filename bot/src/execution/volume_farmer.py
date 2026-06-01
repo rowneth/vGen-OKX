@@ -45,6 +45,8 @@ class _Position:
 	tp: float
 	sl: float
 	bars_held: int = 0
+	tp_bps: float = 0.0
+	sl_bps: float = 0.0
 
 
 @dataclass
@@ -158,6 +160,18 @@ class VolumeFarmerSession:
 		self._tb_enabled = bool(tb_cfg.get("enabled", False))
 		self._tb_min_bars = int(tb_cfg.get("min_bars_held", 2))
 		self._tb_adverse_bps = float(tb_cfg.get("adverse_bps", 20.0))
+		# ATR-relative TP/SL and session filter
+		atr_cfg = f.get("atr", {})
+		self._atr_period = int(atr_cfg.get("period", 14))
+		self._atr_relative = bool(atr_cfg.get("relative", False))
+		self._atr_tp_mult = float(atr_cfg.get("tp_mult", 0.5))
+		self._atr_sl_mult = float(atr_cfg.get("sl_mult", 1.5))
+		self._atr_tp_bps_min = float(atr_cfg.get("tp_bps_min", 5.0))
+		self._atr_sl_bps_min = float(atr_cfg.get("sl_bps_min", 8.0))
+		self._atr_min_usd = float(atr_cfg.get("min_usd", 0.0))
+		self._limit_tp = bool(f.get("limit_tp", False))
+		self._pending_tp_bps: float = self._tp_bps
+		self._pending_sl_bps: float = self._sl_bps
 		fees_cfg = self.config.get("fees", {})
 		self._maker_rate = float(fees_cfg.get("maker", 0.0001))
 		self._taker_rate = float(fees_cfg.get("taker", 0.0005))
@@ -277,6 +291,18 @@ class VolumeFarmerSession:
 		if bar_range_bps > self._max_range_bps:
 			return None
 
+		# ATR session filter + ATR-relative pending TP/SL
+		atr_val = self._compute_atr(history)
+		if self._atr_min_usd > 0 and (np.isnan(atr_val) or atr_val < self._atr_min_usd):
+			return None  # skip: ATR below high-vol threshold
+		if self._atr_relative and not np.isnan(atr_val):
+			atr_bps = atr_val / open_p * 10_000
+			self._pending_tp_bps = max(self._atr_tp_bps_min, self._atr_tp_mult * atr_bps)
+			self._pending_sl_bps = max(self._atr_sl_bps_min, self._atr_sl_mult * atr_bps)
+		else:
+			self._pending_tp_bps = self._tp_bps
+			self._pending_sl_bps = self._sl_bps
+
 		if self._entry_mode == "micro_momentum":
 			bias = "long" if close_p > open_p else "short"
 		elif self._entry_mode == "mean_revert":
@@ -387,7 +413,25 @@ class VolumeFarmerSession:
 		return "long" if long_ok else "short"
 
 	# ------------------------------------------------------------------
-	def _calc_leverage(self, margin: float) -> float:
+	def _compute_atr(self, history: pd.DataFrame) -> float:
+		"""Wilder ATR-14 from bar history. Returns NaN if insufficient data."""
+		if len(history) < self._atr_period + 1:
+			return float("nan")
+		tail = history.tail(max(50, self._atr_period * 3))
+		hi = tail["high"].astype(float).values
+		lo = tail["low"].astype(float).values
+		cl = tail["close"].astype(float).values
+		prev_cl = np.concatenate([[cl[0]], cl[:-1]])
+		tr = np.maximum(hi - lo, np.maximum(np.abs(hi - prev_cl), np.abs(lo - prev_cl)))
+		period = self._atr_period
+		atr = float(tr[:period].mean())
+		alpha = 1.0 / period
+		for k in range(period, len(tr)):
+			atr = atr * (1.0 - alpha) + tr[k] * alpha
+		return atr
+
+	# ------------------------------------------------------------------
+	def _calc_leverage(self, margin: float, sl_bps: Optional[float] = None) -> float:
 		"""Dynamic leverage: lev = risk$ / (margin$ * SL_fraction).
 
 		Mirrors the ebirth.net leverage calculator.
@@ -396,7 +440,8 @@ class VolumeFarmerSession:
 		if not self._dynamic_leverage or margin <= 0:
 			return self._leverage if self._leverage > 0 else 20.0
 		risk_usd = self.equity * self._risk_pct
-		sl_frac = self._sl_bps / 10_000.0
+		_sl = sl_bps if sl_bps is not None else self._sl_bps
+		sl_frac = _sl / 10_000.0
 		if sl_frac <= 0:
 			return self._max_leverage
 		lev = risk_usd / (margin * sl_frac)
@@ -408,17 +453,18 @@ class VolumeFarmerSession:
 		self._flat_skip_bars = 0
 		self._dull_last_emit_at = 0
 		margin = self.equity * self._margin_frac
-		leverage = self._calc_leverage(margin)
+		leverage = self._calc_leverage(margin, sl_bps=self._pending_sl_bps)
 		notional = margin * leverage
 		open_fee = notional * self._maker_rate  # limit order = maker
 		self.total_fees_gross += open_fee
 		self.total_volume_usd += notional
 		self.equity -= open_fee  # fee paid on open
-		tp = price * (1 + self._tp_bps / 10_000) if side == "long" else price * (1 - self._tp_bps / 10_000)
-		sl = price * (1 - self._sl_bps / 10_000) if side == "long" else price * (1 + self._sl_bps / 10_000)
+		tp = price * (1 + self._pending_tp_bps / 10_000) if side == "long" else price * (1 - self._pending_tp_bps / 10_000)
+		sl = price * (1 - self._pending_sl_bps / 10_000) if side == "long" else price * (1 + self._pending_sl_bps / 10_000)
 		self.position = _Position(
 			side=side, entry_price=price, entry_time=bar_time,
 			notional=notional, tp=tp, sl=sl,
+			tp_bps=self._pending_tp_bps, sl_bps=self._pending_sl_bps,
 		)
 		self._emit(FarmerEvent(
 			kind="entry", time=bar_time,
@@ -429,8 +475,8 @@ class VolumeFarmerSession:
 				"open_fee": open_fee,
 				"fee_type": "maker",
 				"tp": tp, "sl": sl,
-				"tp_bps": self._tp_bps,
-				"sl_bps": self._sl_bps,
+				"tp_bps": self._pending_tp_bps,
+				"sl_bps": self._pending_sl_bps,
 				"equity": self.equity,
 				"volume": self.total_volume_usd,
 				"volume_target": self._volume_target,
@@ -452,10 +498,14 @@ class VolumeFarmerSession:
 		else:
 			pnl_pct = (p.entry_price - exit_price) / p.entry_price
 		gross_pnl = pnl_pct * p.notional
-		# All exits (TP / SL / time_stop) on MEXC futures fire the exchange-
-		# attached trigger order which executes as a MARKET fill → taker fee.
-		# (Attached TP/SL cannot be limit orders on MEXC futures.)
-		close_fee = p.notional * self._taker_rate
+		# TP exits: use maker rate when limit_tp is enabled (OKX supports limit TP orders).
+		# All other exits (SL, trend_break, time_stop) are taker market fills.
+		if self._limit_tp and reason == "tp":
+			close_fee = p.notional * self._maker_rate
+			close_fee_type = "maker"
+		else:
+			close_fee = p.notional * self._taker_rate
+			close_fee_type = "taker"
 		net_pnl = gross_pnl - close_fee
 		self.total_fees_gross += close_fee
 		self.total_volume_usd += p.notional
@@ -476,7 +526,6 @@ class VolumeFarmerSession:
 				self.cooldown_bars_left = self._consec_loss_cooldown_bars
 				self.consec_losses = 0  # reset streak so next losses start fresh
 		open_fee = p.notional * self._maker_rate
-		close_fee_type = "taker"
 		fee_overage = close_fee - p.notional * self._maker_rate
 		wr_running = round(self.wins / self.round_trips * 100.0, 1) if self.round_trips else 0.0
 		self.ledger.append({
