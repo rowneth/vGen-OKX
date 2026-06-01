@@ -64,7 +64,7 @@ farmer:
     sl_mult: 1.5                   # SL = 1.5 × ATR_bps
     tp_bps_min: 5.0                # floor: at least 5 bps TP
     sl_bps_min: 8.0                # floor: at least 8 bps SL
-    min_usd: 167.6                 # skip when ATR < $167.6 (p67 on BTC 5m)
+    min_usd: 120.0                 # skip when ATR < $120 (recalibrated Jun 2026; current ATR ~$146)
 
   # Trend-break disabled — ATR-relative SL already sizes appropriately
   trend_break:
