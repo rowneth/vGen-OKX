@@ -111,45 +111,65 @@ def _draw_entry_chart(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+
+        BG      = "#0b0e11"
+        BULL    = "#089981"
+        BEAR    = "#f23645"
+        C_ENTRY = "#3b82f6"
+        C_TP    = "#22c55e"
+        C_SL    = "#ef4444"
 
         df = bars.tail(30).reset_index(drop=True)
         n = len(df)
         if n < 3:
             return None
 
-        fig, ax = plt.subplots(figsize=(10, 4))
-        fig.patch.set_facecolor("#0d1117")
-        ax.set_facecolor("#161b22")
+        lows  = df["low"].astype(float)
+        highs = df["high"].astype(float)
+        all_p = list(lows) + list(highs) + [tp_price, sl_price, entry_price]
+        p_range = max(all_p) - min(all_p)
+        pad = p_range * 0.12
+        y_lo = min(all_p) - pad
+        y_hi = max(all_p) + pad
+
+        fig, ax = plt.subplots(figsize=(10, 3.6))
+        fig.patch.set_facecolor(BG)
+        ax.set_facecolor(BG)
+        ax.set_xlim(-0.8, n + 4.5)
+        ax.set_ylim(y_lo, y_hi)
+        ax.axis("off")
 
         for i, row in df.iterrows():
             op, hi, lo, cl = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
-            color = "#26a69a" if cl >= op else "#ef5350"
-            ax.plot([i, i], [lo, hi], color=color, linewidth=0.8, zorder=1)
-            body_lo, body_hi = min(op, cl), max(op, cl)
-            height = max(body_hi - body_lo, (hi - lo) * 0.005 + 0.01)
-            ax.add_patch(plt.Rectangle((i - 0.35, body_lo), 0.7, height, color=color, zorder=2))
+            color = BULL if cl >= op else BEAR
+            ax.plot([i, i], [lo, hi], color=color, linewidth=0.7, zorder=1, solid_capstyle="round")
+            body_lo = min(op, cl)
+            height  = max(abs(cl - op), p_range * 0.004)
+            ax.add_patch(mpatches.FancyBboxPatch(
+                (i - 0.32, body_lo), 0.64, height,
+                boxstyle="square,pad=0", facecolor=color, edgecolor="none", zorder=2,
+            ))
 
-        x_end = n + 2
-        ax.plot([0, x_end], [tp_price, tp_price], color="#22c55e", linewidth=1.2, linestyle="--", alpha=0.85, zorder=3)
-        ax.plot([0, x_end], [sl_price, sl_price], color="#ef4444", linewidth=1.2, linestyle="--", alpha=0.85, zorder=3)
-        ax.plot([0, x_end], [entry_price, entry_price], color="#60a5fa", linewidth=1.0, linestyle="-", alpha=0.75, zorder=3)
+        lx = n + 0.5  # label x
+        for price, color, tag in [
+            (tp_price,    C_TP,    f"TP  {tp_price:,.1f}"),
+            (entry_price, C_ENTRY, f"    {entry_price:,.1f}"),
+            (sl_price,    C_SL,    f"SL  {sl_price:,.1f}"),
+        ]:
+            ax.plot([-0.8, n - 0.5], [price, price], color=color,
+                    linewidth=0.9, linestyle="--", alpha=0.8, zorder=3)
+            ax.text(lx, price, tag, color=color, va="center",
+                    fontsize=7.5, fontweight="bold", zorder=4,
+                    fontfamily="monospace")
 
-        ax.text(x_end + 0.2, tp_price, f"TP {tp_price:,.1f}", color="#22c55e", va="center", fontsize=7.5, fontweight="bold")
-        ax.text(x_end + 0.2, entry_price, f"  {entry_price:,.1f}", color="#60a5fa", va="center", fontsize=7.5)
-        ax.text(x_end + 0.2, sl_price, f"SL {sl_price:,.1f}", color="#ef4444", va="center", fontsize=7.5, fontweight="bold")
+        mk = "^" if side.lower() == "long" else "v"
+        ax.scatter([n - 1], [entry_price], marker=mk, color=C_ENTRY,
+                   s=90, zorder=5, edgecolors="white", linewidths=0.4)
 
-        marker = "^" if side.lower() == "long" else "v"
-        ax.scatter([n - 1], [entry_price], marker=marker, color="#60a5fa", s=120, zorder=5, edgecolors="white", linewidths=0.5)
-
-        ax.set_xlim(-0.5, x_end + 6)
-        ax.set_xticks([])
-        ax.tick_params(axis="y", colors="#6b7280", labelsize=7, right=True, left=False, labelright=True, labelleft=False)
-        for spine in ax.spines.values():
-            spine.set_color("#30363d")
-
-        fig.tight_layout(pad=0.5)
+        fig.subplots_adjust(left=0.01, right=0.82, top=0.97, bottom=0.02)
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
+        fig.savefig(buf, format="png", dpi=140, facecolor=BG)
         plt.close(fig)
         buf.seek(0)
         return buf.read()
@@ -238,29 +258,33 @@ def _make_event_handler(
     mode_label: str = "PAPER",
     client: Optional["OKXClient"] = None,
     tf: str = "5m",
+    bot_label: str = "",
 ):
     _pending: Dict[str, Any] = {}
     _esc = TelegramNotifier.escape
+    _lbl = f"\n{_SEP}\n\\[{_esc(bot_label)}\\]" if bot_label else ""
 
     async def _send_entry_with_chart(text: str, side: str, entry: float, tp: float, sl: float) -> None:
-        msg_id = await notifier.send_and_get_id(text)
-        _pending["msg_id"] = msg_id
-        if client is not None and msg_id is not None:
+        chart: Optional[bytes] = None
+        if client is not None:
             try:
                 raw = await client.get_candles(symbol, tf, limit=35)
                 bars = _normalize_okx_candles(raw)
                 chart = _draw_entry_chart(bars[bars["closed"]], side, entry, tp, sl)
-                if chart:
-                    await notifier.send_photo(chart, reply_to_message_id=msg_id)
             except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("chart send failed: %s", exc)
+                LOGGER.warning("chart generation failed: %s", exc)
+        if chart:
+            msg_id = await notifier.send_photo(chart, caption=text)
+        else:
+            msg_id = await notifier.send_and_get_id(text)
+        _pending["msg_id"] = msg_id
 
     async def _send_exit(text: str, reply_to: Optional[int]) -> None:
         await notifier.send_and_get_id(text, reply_to_message_id=reply_to)
 
     def _tg(msg: str) -> None:
         if notifier and notifier.enabled:
-            asyncio.create_task(notifier.send_raw(msg))
+            asyncio.create_task(notifier.send_raw(msg + _lbl))
 
     def on_event(evt: FarmerEvent) -> None:
         if live_executor is not None:
@@ -308,6 +332,7 @@ def _make_event_handler(
                     f"Open fee  `${open_fee:.4f}` \\(maker\\)\n"
                     f"{_SEP}\n"
                     f"Balance  `${equity:.4f}`"
+                    f"{_lbl}"
                 )
                 asyncio.create_task(_send_entry_with_chart(text, side, entry, tp, sl))
 
@@ -367,6 +392,7 @@ def _make_event_handler(
                     f"Balance  `${equity:.4f}`\n"
                     f"{_SEP}\n"
                     f"Vol  `${vol_now:,.0f}` / `${vol_target:,.0f}`  \\[`{vol_pct:.1f}%`\\]"
+                    f"{_lbl}"
                 )
                 entry_msg_id = _pending.get("msg_id")
                 asyncio.create_task(_send_exit(text, entry_msg_id))
@@ -460,6 +486,7 @@ async def main_async(args: argparse.Namespace) -> int:
     # Telegram notifier — enabled when TG creds present in env, unless --no-telegram.
     os.environ.setdefault("BOT_LABEL", args.label or "okx")
     notifier = TelegramNotifier()
+    notifier._label = ""  # noqa: SLF001 — label appended manually at message bottom
     if args.no_telegram:
         notifier._enabled = False  # noqa: SLF001
     if notifier.enabled:
@@ -467,7 +494,8 @@ async def main_async(args: argparse.Namespace) -> int:
 
     session = VolumeFarmerSession(config=cfg)
     # Provisional handler — replaced below once execution mode is decided.
-    handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER", tf=tf)
+    handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER", tf=tf,
+                                   bot_label=args.label or "okx-paper")
     session.event_callback = handler
 
     stop_evt = asyncio.Event()
@@ -532,7 +560,7 @@ async def main_async(args: argparse.Namespace) -> int:
         # Rebuild handler now that we have the live_executor (if any).
         handler = _make_event_handler(log_dir, symbol, session, live_executor,
                                       notifier=notifier, mode_label=mode_label,
-                                      client=client, tf=tf)
+                                      client=client, tf=tf, bot_label=args.label or "okx-paper")
         session.event_callback = handler
 
         # STARTUP message.
@@ -565,7 +593,9 @@ async def main_async(args: argparse.Namespace) -> int:
                 f"Taker  `{taker_bps:.0f}bps`\n"
                 f"{_SEP}\n"
                 f"Target  `${vol_target:,.0f}` volume\n"
-                f"Duration  `{_esc(dur)}`  ·  poll `{args.poll_seconds}s`"
+                f"Duration  `{_esc(dur)}`  ·  poll `{args.poll_seconds}s`\n"
+                f"{_SEP}\n"
+                f"\\[{_esc(args.label or 'okx-paper')}\\]"
             )
             await notifier.send_raw(startup_msg)
 
@@ -598,7 +628,9 @@ async def main_async(args: argparse.Namespace) -> int:
                 f"Trades  `{s['round_trips']}`  ·  WR `{s['win_rate_pct']:.1f}%`\n"
                 f"{_SEP}\n"
                 f"Equity  `${s['equity']:.4f}`  ·  PnL  `{pnl_str}`\n"
-                f"Vol     `${s['volume_usd']:,.0f}`"
+                f"Vol     `${s['volume_usd']:,.0f}`\n"
+                f"{_SEP}\n"
+                f"\\[{TelegramNotifier.escape(args.label or 'okx-paper')}\\]"
             )
             await notifier.stop()
         except Exception as exc:  # noqa: BLE001

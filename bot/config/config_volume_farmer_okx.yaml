@@ -31,7 +31,7 @@ fees:
   rebate_pct: 0.40                 # 40% rebate on maker fees
 
 farmer:
-  capital_usd: 30.0
+  capital_usd: 500.0
   leverage: 0                      # 0 = dynamic
 
   margin_fraction_per_trade: 0.05  # 5% of equity as margin
