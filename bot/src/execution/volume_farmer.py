@@ -718,6 +718,20 @@ class VolumeFarmerSession:
 
 	# ------------------------------------------------------------------
 	def save_state(self, path: pathlib.Path) -> None:
+		pos_data: Optional[Dict[str, Any]] = None
+		if self.position is not None:
+			p = self.position
+			pos_data = {
+				"side": p.side,
+				"entry_price": p.entry_price,
+				"entry_time": p.entry_time.isoformat(),
+				"notional": p.notional,
+				"tp": p.tp,
+				"sl": p.sl,
+				"bars_held": p.bars_held,
+				"tp_bps": p.tp_bps,
+				"sl_bps": p.sl_bps,
+			}
 		state = {
 			"equity": self.equity,
 			"peak_equity": self.peak_equity,
@@ -736,6 +750,7 @@ class VolumeFarmerSession:
 			"daily_pnl": self.daily_pnl,
 			"daily_pnl_date": self.daily_pnl_date,
 			"milestones_hit": self.milestones_hit,
+			"position": pos_data,
 			"ledger": self.ledger[-500:],  # cap
 			"saved_at": datetime.now(tz=timezone.utc).isoformat(),
 		}
@@ -748,7 +763,7 @@ class VolumeFarmerSession:
 		s = json.loads(path.read_text(encoding="utf-8"))
 		for key in [
 			"equity", "peak_equity", "start_equity", "total_volume_usd",
-			"total_fees", "total_pnl", "wins", "losses", "round_trips",
+			"total_fees_gross", "total_pnl", "wins", "losses", "round_trips",
 			"consec_losses", "cooldown_bars_left", "halted", "halt_reason",
 			"last_side", "daily_pnl", "daily_pnl_date", "milestones_hit",
 		]:
@@ -756,3 +771,66 @@ class VolumeFarmerSession:
 				setattr(self, key, s[key])
 		if "ledger" in s:
 			self.ledger = list(s["ledger"])
+		if s.get("position") is not None:
+			p = s["position"]
+			self.position = _Position(
+				side=str(p["side"]),
+				entry_price=float(p["entry_price"]),
+				entry_time=pd.Timestamp(p["entry_time"]),
+				notional=float(p["notional"]),
+				tp=float(p["tp"]),
+				sl=float(p["sl"]),
+				bars_held=int(p.get("bars_held", 0)),
+				tp_bps=float(p.get("tp_bps", 0.0)),
+				sl_bps=float(p.get("sl_bps", 0.0)),
+			)
+			LOGGER.info(
+				"load_state: restored open %s position  entry=%.2f  tp=%.2f  sl=%.2f",
+				self.position.side, self.position.entry_price,
+				self.position.tp, self.position.sl,
+			)
+
+	def reconcile_orphan_position(self, bars: "pd.DataFrame") -> Optional[str]:
+		"""Walk candle history to resolve an open position saved from a prior run.
+
+		Filters bars to those after position entry, then applies normal
+		TP/SL logic. Calls _close_position (which fires the exit event callback)
+		if the level was hit. Returns "tp", "sl", or None (still open).
+		"""
+		if self.position is None:
+			return None
+		pos = self.position
+		after = bars[bars["open_time"] > pos.entry_time].copy()
+		if after.empty:
+			LOGGER.info("reconcile: no bars after entry — position stays open")
+			return None
+		for _, bar in after.iterrows():
+			if not bar.get("closed", True):
+				continue
+			hi = float(bar["high"])
+			lo = float(bar["low"])
+			bar_time = bar["open_time"]
+			if pos.side == "long":
+				if hi >= pos.tp:
+					LOGGER.info("reconcile: orphan LONG hit TP at %.2f (bar %s)", pos.tp, bar_time)
+					self._close_position(pos.tp, bar_time, "tp")
+					self.position = None
+					return "tp"
+				if lo <= pos.sl:
+					LOGGER.info("reconcile: orphan LONG hit SL at %.2f (bar %s)", pos.sl, bar_time)
+					self._close_position(pos.sl, bar_time, "sl")
+					self.position = None
+					return "sl"
+			else:
+				if lo <= pos.tp:
+					LOGGER.info("reconcile: orphan SHORT hit TP at %.2f (bar %s)", pos.tp, bar_time)
+					self._close_position(pos.tp, bar_time, "tp")
+					self.position = None
+					return "tp"
+				if hi >= pos.sl:
+					LOGGER.info("reconcile: orphan SHORT hit SL at %.2f (bar %s)", pos.sl, bar_time)
+					self._close_position(pos.sl, bar_time, "sl")
+					self.position = None
+					return "sl"
+		LOGGER.info("reconcile: position still open (tp=%.2f sl=%.2f) — resuming", pos.tp, pos.sl)
+		return None

@@ -389,6 +389,7 @@ def _make_event_handler(
     tf: str = "5m",
     bot_label: str = "",
     intrabar: Optional[Dict[str, Any]] = None,
+    state_path: Optional[pathlib.Path] = None,
 ):
     _pending: Dict[str, Any] = {}
     _esc = TelegramNotifier.escape
@@ -469,6 +470,11 @@ def _make_event_handler(
                     f"{_lbl}"
                 )
                 asyncio.create_task(_send_entry_with_chart(text, side, entry, tp, sl))
+            if state_path is not None:
+                try:
+                    session.save_state(state_path)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("state save failed (entry): %s", exc)
 
         elif evt.kind == "exit":
             p = evt.payload
@@ -537,6 +543,11 @@ def _make_event_handler(
                 entry_msg_id = _pending.get("msg_id")
                 asyncio.create_task(_send_exit(text, entry_msg_id))
             _pending.clear()
+            if state_path is not None:
+                try:
+                    session.save_state(state_path)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("state save failed (exit): %s", exc)
 
         elif evt.kind == "halt":
             LOGGER.warning("HALT: %s", evt.payload.get("reason"))
@@ -565,24 +576,6 @@ def _make_event_handler(
 
     return on_event
 
-
-def _save_state(session: VolumeFarmerSession, path: pathlib.Path) -> None:
-    state = {
-        "equity": session.equity,
-        "peak_equity": session.peak_equity,
-        "start_equity": session.start_equity,
-        "total_volume_usd": session.total_volume_usd,
-        "total_fees_gross": session.total_fees_gross,
-        "total_pnl": session.total_pnl,
-        "wins": session.wins,
-        "losses": session.losses,
-        "round_trips": session.round_trips,
-        "halted": session.halted,
-        "halt_reason": session.halt_reason,
-        "saved_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2))
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -889,7 +882,8 @@ async def main_async(args: argparse.Namespace) -> int:
     session = VolumeFarmerSession(config=cfg)
     # Provisional handler — replaced below once execution mode is decided.
     handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER", tf=tf,
-                                   bot_label=args.label or "okx-paper", intrabar=_intrabar)
+                                   bot_label=args.label or "okx-paper", intrabar=_intrabar,
+                                   state_path=state_path)
     session.event_callback = handler
 
     stop_evt = asyncio.Event()
@@ -955,8 +949,29 @@ async def main_async(args: argparse.Namespace) -> int:
         handler = _make_event_handler(log_dir, symbol, session, live_executor,
                                       notifier=notifier, mode_label=mode_label,
                                       client=client, tf=tf, bot_label=args.label or "okx-paper",
-                                      intrabar=_intrabar)
+                                      intrabar=_intrabar, state_path=state_path)
         session.event_callback = handler
+
+        # Load persisted state and reconcile any orphan position.
+        _esc_resume = TelegramNotifier.escape
+        _bot_lbl = args.label or "okx-paper"
+        had_position = False
+        if state_path.exists():
+            try:
+                session.load_state(state_path)
+                LOGGER.info(
+                    "state loaded: trades=%d  eq=%.4f  vol=%.0f  position=%s",
+                    session.round_trips, session.equity, session.total_volume_usd,
+                    session.position.side if session.position else "none",
+                )
+                had_position = session.position is not None
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("state load failed (starting fresh): %s", exc)
+
+        orphan_result: Optional[str] = None
+        if session.position is not None:
+            closed_bars = history[history["closed"]].copy()
+            orphan_result = session.reconcile_orphan_position(closed_bars)
 
         # STARTUP message.
         if notifier.enabled:
@@ -993,6 +1008,26 @@ async def main_async(args: argparse.Namespace) -> int:
                 f"\\[{_esc(args.label or 'okx-paper')}\\]"
             )
             await notifier.send_raw(startup_msg)
+            if had_position and orphan_result is not None:
+                icon = "✅" if orphan_result == "tp" else "❌"
+                await notifier.send_raw(
+                    f"{icon} *Orphan position resolved on restart*\n"
+                    f"{_SEP}\n"
+                    f"Result  `{_esc_resume(orphan_result.upper())}`\n"
+                    f"Equity  `${session.equity:.4f}`\n"
+                    f"{_SEP}\n"
+                    f"\\[{_esc_resume(_bot_lbl)}\\]"
+                )
+            elif had_position and orphan_result is None:
+                pos = session.position
+                await notifier.send_raw(
+                    f"⏸ *Resuming with open position*\n"
+                    f"{_SEP}\n"
+                    f"`{_esc_resume(pos.side.upper())}`  entry `{pos.entry_price:,.2f}`\n"
+                    f"TP `{pos.tp:,.2f}`  ·  SL `{pos.sl:,.2f}`\n"
+                    f"{_SEP}\n"
+                    f"\\[{_esc_resume(_bot_lbl)}\\]"
+                )
 
         start_time = datetime.now(tz=timezone.utc)
         poll_task = asyncio.create_task(_poll_loop(
@@ -1020,7 +1055,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 except asyncio.CancelledError:
                     pass
 
-    _save_state(session, state_path)
+    session.save_state(state_path)
     s = session.summary()
     LOGGER.info("FINAL: trades=%d  wr=%.2f%%  eq=$%.4f  vol=$%.0f  pnl=$%.4f",
                 s["round_trips"], s["win_rate_pct"], s["equity"], s["volume_usd"], s["total_pnl"])
