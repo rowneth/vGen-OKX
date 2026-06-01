@@ -9,7 +9,7 @@ User=root
 WorkingDirectory=/root/vGen-OKX/bot
 EnvironmentFile=-/root/vGen-OKX/bot/.env
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/root/vGen-OKX/.venv/bin/python /root/vGen-OKX/bot/scripts/run_volume_farmer_okx.py \
+ExecStart=/root/vGen-OKX/bot/.venv/bin/python3 /root/vGen-OKX/bot/scripts/run_volume_farmer_okx.py \
     --config /root/vGen-OKX/bot/config/config_volume_farmer_okx.yaml \
     --label okx-paper \
     --duration-days 365
