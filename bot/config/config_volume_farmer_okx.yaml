@@ -81,7 +81,7 @@ risk:
   stop_on_volume_target: true
 
 target:
-  volume_usd: 100000.0
+  volume_usd: 5000000.0
   min_fee_cover_pct: 0.40
 
 notifications:

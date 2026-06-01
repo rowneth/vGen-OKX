@@ -197,6 +197,11 @@ async def _poll_loop(
     end_at: Optional[datetime],
     log_dir: pathlib.Path,
     on_event,
+    notifier: Optional[TelegramNotifier] = None,
+    mode_label: str = "PAPER",
+    bot_label: str = "",
+    cfg: Optional[Dict[str, Any]] = None,
+    intrabar: Optional[Dict[str, Any]] = None,
 ) -> None:
     bar_seconds = _parse_timeframe_seconds(tf)
     last_bar_ts: Optional[pd.Timestamp] = (
@@ -220,6 +225,71 @@ async def _poll_loop(
             LOGGER.warning("candle fetch failed: %s", exc)
             await asyncio.sleep(poll_sec)
             continue
+
+        # Intrabar TP/SL detection — fire Telegram immediately on hit, don't wait for bar close.
+        if notifier and notifier.enabled and session.position is not None and cfg is not None and intrabar is not None:
+            pos = session.position
+            unclosed = df_new[~df_new["closed"]]
+            if not unclosed.empty:
+                cur_hi = float(unclosed["high"].iloc[-1])
+                cur_lo = float(unclosed["low"].iloc[-1])
+                hit: Optional[str] = None
+                if pos.side == "long":
+                    if cur_hi >= pos.tp:
+                        hit = "tp"
+                    elif cur_lo <= pos.sl:
+                        hit = "sl"
+                else:
+                    if cur_lo <= pos.tp:
+                        hit = "tp"
+                    elif cur_hi >= pos.sl:
+                        hit = "sl"
+                ikey = f"{round(pos.entry_price, 4)}"
+                if hit and intrabar.get(ikey) != hit:
+                    intrabar[ikey] = hit
+                    exit_px = pos.tp if hit == "tp" else pos.sl
+                    limit_tp = cfg.get("farmer", {}).get("limit_tp", False)
+                    maker_r = cfg["fees"]["maker"]
+                    taker_r = cfg["fees"]["taker"]
+                    close_r = maker_r if (hit == "tp" and limit_tp) else taker_r
+                    fee_type = "maker" if (hit == "tp" and limit_tp) else "taker"
+                    if pos.side == "long":
+                        gross = (exit_px - pos.entry_price) / pos.entry_price * pos.notional
+                    else:
+                        gross = (pos.entry_price - exit_px) / pos.entry_price * pos.notional
+                    close_fee = pos.notional * close_r
+                    net = gross - close_fee
+                    est_wins = session.wins + (1 if net > 0 else 0)
+                    est_losses = session.losses + (0 if net > 0 else 1)
+                    est_trips = session.round_trips + 1
+                    est_wr = est_wins / est_trips * 100 if est_trips else 0
+                    est_equity = session.equity + gross - close_fee
+                    est_vol = session.total_volume_usd + pos.notional
+                    vol_target = cfg.get("target", {}).get("volume_usd", 0)
+                    vol_pct = est_vol / vol_target * 100 if vol_target else 0
+                    _esc = TelegramNotifier.escape
+                    g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
+                    n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
+                    emoji = "✅" if hit == "tp" else "❌"
+                    _lbl = f"\n{_SEP}\n\\[{_esc(bot_label)}\\]" if bot_label else ""
+                    text = (
+                        f"{emoji} *{_esc(hit.upper())} · {_esc(pos.side.upper())} \\#{_esc(str(est_trips))} · {_esc(mode_label)}*\n"
+                        f"{_esc(symbol)}  `{pos.entry_price:,.2f}` → `{exit_px:,.2f}`\n"
+                        f"{_SEP}\n"
+                        f"Gross   `{g_str}`\n"
+                        f"Fee     `${close_fee:.4f}` \\({_esc(fee_type)}\\)\n"
+                        f"Net     `{n_str}`\n"
+                        f"{_SEP}\n"
+                        f"`{est_wins}W · {est_losses}L · {est_wr:.1f}% WR`\n"
+                        f"{_SEP}\n"
+                        f"Balance  `${est_equity:.4f}`\n"
+                        f"{_SEP}\n"
+                        f"Vol  `${est_vol:,.0f}` / `${vol_target:,.0f}`  \\[`{vol_pct:.1f}%`\\]"
+                        f"{_lbl}"
+                    )
+                    entry_msg_id = intrabar.get(f"{ikey}_msg_id")
+                    asyncio.create_task(notifier.send_and_get_id(text, reply_to_message_id=entry_msg_id))
+                    LOGGER.info("INTRABAR %s detected for %s pos @ %.2f, notified", hit, pos.side, pos.entry_price)
 
         closed_new = df_new[df_new["closed"]].copy()
         if not closed_new.empty:
@@ -259,6 +329,7 @@ def _make_event_handler(
     client: Optional["OKXClient"] = None,
     tf: str = "5m",
     bot_label: str = "",
+    intrabar: Optional[Dict[str, Any]] = None,
 ):
     _pending: Dict[str, Any] = {}
     _esc = TelegramNotifier.escape
@@ -278,6 +349,10 @@ def _make_event_handler(
         else:
             msg_id = await notifier.send_and_get_id(text)
         _pending["msg_id"] = msg_id
+        # Share entry msg_id with poll loop so intrabar reply threading works
+        if intrabar is not None:
+            ikey = f"{round(entry, 4)}"
+            intrabar[f"{ikey}_msg_id"] = msg_id
 
     async def _send_exit(text: str, reply_to: Optional[int]) -> None:
         await notifier.send_and_get_id(text, reply_to_message_id=reply_to)
@@ -374,7 +449,13 @@ def _make_event_handler(
                 vol_now, wr, trade_num,
             )
 
-            if notifier and notifier.enabled:
+            ikey = f"{round(entry_px, 4)}"
+            already_notified = intrabar is not None and intrabar.get(ikey) == reason
+            if already_notified and intrabar is not None:
+                intrabar.pop(ikey, None)
+                intrabar.pop(f"{ikey}_msg_id", None)
+
+            if notifier and notifier.enabled and not already_notified:
                 emoji = "✅" if reason == "tp" else ("❌" if reason == "sl" else "⏱")
                 g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
                 n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
@@ -492,10 +573,12 @@ async def main_async(args: argparse.Namespace) -> int:
     if notifier.enabled:
         await notifier.start()
 
+    _intrabar: Dict[str, Any] = {}  # shared state: poll loop ↔ event handler
+
     session = VolumeFarmerSession(config=cfg)
     # Provisional handler — replaced below once execution mode is decided.
     handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER", tf=tf,
-                                   bot_label=args.label or "okx-paper")
+                                   bot_label=args.label or "okx-paper", intrabar=_intrabar)
     session.event_callback = handler
 
     stop_evt = asyncio.Event()
@@ -560,7 +643,8 @@ async def main_async(args: argparse.Namespace) -> int:
         # Rebuild handler now that we have the live_executor (if any).
         handler = _make_event_handler(log_dir, symbol, session, live_executor,
                                       notifier=notifier, mode_label=mode_label,
-                                      client=client, tf=tf, bot_label=args.label or "okx-paper")
+                                      client=client, tf=tf, bot_label=args.label or "okx-paper",
+                                      intrabar=_intrabar)
         session.event_callback = handler
 
         # STARTUP message.
@@ -602,6 +686,8 @@ async def main_async(args: argparse.Namespace) -> int:
         poll_task = asyncio.create_task(_poll_loop(
             client, session, symbol, tf, args.poll_seconds,
             history, end_at, log_dir, handler,
+            notifier=notifier, mode_label=mode_label,
+            bot_label=args.label or "okx-paper", cfg=cfg, intrabar=_intrabar,
         ))
         try:
             done, _ = await asyncio.wait(
