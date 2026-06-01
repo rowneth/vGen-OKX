@@ -255,8 +255,8 @@ def _make_event_handler(
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("chart send failed: %s", exc)
 
-    async def _send_exit(text: str) -> None:
-        await notifier.send_and_get_id(text, reply_to_message_id=_pending.get("msg_id"))
+    async def _send_exit(text: str, reply_to: Optional[int]) -> None:
+        await notifier.send_and_get_id(text, reply_to_message_id=reply_to)
 
     def _tg(msg: str) -> None:
         if notifier and notifier.enabled:
@@ -368,7 +368,8 @@ def _make_event_handler(
                     f"{_SEP}\n"
                     f"Vol  `${vol_now:,.0f}` / `${vol_target:,.0f}`  \\[`{vol_pct:.1f}%`\\]"
                 )
-                asyncio.create_task(_send_exit(text))
+                entry_msg_id = _pending.get("msg_id")
+                asyncio.create_task(_send_exit(text, entry_msg_id))
             _pending.clear()
 
         elif evt.kind == "halt":
