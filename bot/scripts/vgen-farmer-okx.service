@@ -6,17 +6,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/vGen/mexc-bot
-EnvironmentFile=-/root/vGen/mexc-bot/.env
+WorkingDirectory=/root/vGen-OKX/bot
+EnvironmentFile=-/root/vGen-OKX/bot/.env
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/root/vGen/.venv/bin/python /root/vGen/mexc-bot/scripts/run_volume_farmer_okx.py \
-    --config /root/vGen/mexc-bot/config/config_volume_farmer_okx.yaml \
+ExecStart=/root/vGen-OKX/.venv/bin/python /root/vGen-OKX/bot/scripts/run_volume_farmer_okx.py \
+    --config /root/vGen-OKX/bot/config/config_volume_farmer_okx.yaml \
     --label okx-paper \
     --duration-days 365
 Restart=always
 RestartSec=15
-StandardOutput=append:/root/vGen/mexc-bot/logs/farmer_okx.log
-StandardError=append:/root/vGen/mexc-bot/logs/farmer_okx.log
+StandardOutput=append:/root/vGen-OKX/bot/logs/farmer_okx.log
+StandardError=append:/root/vGen-OKX/bot/logs/farmer_okx.log
 KillSignal=SIGINT
 TimeoutStopSec=30
 
