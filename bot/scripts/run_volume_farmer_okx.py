@@ -106,68 +106,116 @@ def _draw_entry_chart(
     entry_price: float,
     tp_price: float,
     sl_price: float,
+    symbol: str = "BTC_USDT",
+    tf: str = "5m",
 ) -> Optional[bytes]:
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
+        import matplotlib.gridspec as gridspec
 
-        BG      = "#0b0e11"
+        BG      = "#0d1117"
+        PANEL   = "#0d1117"
         BULL    = "#089981"
         BEAR    = "#f23645"
-        C_ENTRY = "#3b82f6"
-        C_TP    = "#22c55e"
-        C_SL    = "#ef4444"
+        C_ENTRY = "#f0c040"
+        C_TP    = "#089981"
+        C_SL    = "#f23645"
+        GRID    = "#1c2333"
+        TEXT    = "#c9d1d9"
 
-        df = bars.tail(30).reset_index(drop=True)
+        df = bars.tail(40).reset_index(drop=True)
         n = len(df)
         if n < 3:
             return None
 
-        lows  = df["low"].astype(float)
-        highs = df["high"].astype(float)
-        all_p = list(lows) + list(highs) + [tp_price, sl_price, entry_price]
-        p_range = max(all_p) - min(all_p)
-        pad = p_range * 0.12
-        y_lo = min(all_p) - pad
-        y_hi = max(all_p) + pad
+        fig = plt.figure(figsize=(12, 6.2), facecolor=BG)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[3, 1], hspace=0.03, figure=fig)
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
 
-        fig, ax = plt.subplots(figsize=(10, 3.6))
-        fig.patch.set_facecolor(BG)
-        ax.set_facecolor(BG)
-        ax.set_xlim(-0.8, n + 4.5)
-        ax.set_ylim(y_lo, y_hi)
-        ax.axis("off")
+        for ax in (ax1, ax2):
+            ax.set_facecolor(PANEL)
+            ax.yaxis.set_label_position("right")
+            ax.yaxis.tick_right()
+            ax.tick_params(colors=TEXT, labelsize=8, which="both", direction="out", length=3)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#21262d")
 
+        # Candlesticks + volume bars
         for i, row in df.iterrows():
-            op, hi, lo, cl = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+            op  = float(row["open"])
+            hi  = float(row["high"])
+            lo  = float(row["low"])
+            cl  = float(row["close"])
+            vol = float(row.get("volume", 0))
             color = BULL if cl >= op else BEAR
-            ax.plot([i, i], [lo, hi], color=color, linewidth=0.7, zorder=1, solid_capstyle="round")
+            ax1.plot([i, i], [lo, hi], color=color, linewidth=0.75, zorder=2)
             body_lo = min(op, cl)
-            height  = max(abs(cl - op), p_range * 0.004)
-            ax.add_patch(mpatches.FancyBboxPatch(
-                (i - 0.32, body_lo), 0.64, height,
-                boxstyle="square,pad=0", facecolor=color, edgecolor="none", zorder=2,
+            height  = max(abs(cl - op), (hi - lo) * 0.008 + 0.5)
+            ax1.add_patch(mpatches.FancyBboxPatch(
+                (i - 0.36, body_lo), 0.72, height,
+                boxstyle="square,pad=0", facecolor=color, edgecolor="none", zorder=3,
             ))
+            ax2.bar(i, vol, width=0.72, color=color, alpha=0.85, edgecolor="none")
 
-        lx = n + 0.5  # label x
-        for price, color, tag in [
-            (tp_price,    C_TP,    f"TP  {tp_price:,.1f}"),
-            (entry_price, C_ENTRY, f"    {entry_price:,.1f}"),
-            (sl_price,    C_SL,    f"SL  {sl_price:,.1f}"),
-        ]:
-            ax.plot([-0.8, n - 0.5], [price, price], color=color,
-                    linewidth=0.9, linestyle="--", alpha=0.8, zorder=3)
-            ax.text(lx, price, tag, color=color, va="center",
-                    fontsize=7.5, fontweight="bold", zorder=4,
-                    fontfamily="monospace")
+        # Price levels
+        ax1.axhline(entry_price, color=C_ENTRY, linewidth=1.1, linestyle="--", zorder=4, alpha=0.9)
+        ax1.axhline(tp_price,    color=C_TP,    linewidth=1.1, linestyle="-",  zorder=4, alpha=0.9)
+        ax1.axhline(sl_price,    color=C_SL,    linewidth=1.1, linestyle="-",  zorder=4, alpha=0.9)
 
-        mk = "^" if side.lower() == "long" else "v"
-        ax.scatter([n - 1], [entry_price], marker=mk, color=C_ENTRY,
-                   s=90, zorder=5, edgecolors="white", linewidths=0.4)
+        # Grid
+        ax1.grid(True, color=GRID, linewidth=0.5, linestyle="-", zorder=1)
+        ax2.grid(True, color=GRID, linewidth=0.5, linestyle="-", axis="y", zorder=1)
 
-        fig.subplots_adjust(left=0.01, right=0.82, top=0.97, bottom=0.02)
+        # Y-axis limits
+        all_p = list(df["low"].astype(float)) + list(df["high"].astype(float)) + [tp_price, sl_price]
+        p_range = max(all_p) - min(all_p)
+        ax1.set_ylim(min(all_p) - p_range * 0.10, max(all_p) + p_range * 0.10)
+        ax1.set_ylabel("Price (USDT)", color=TEXT, fontsize=8, rotation=270, labelpad=14)
+        ax1.tick_params(axis="y", colors=TEXT, labelsize=8)
+
+        # Volume y-axis
+        ax2.set_ylabel("Volume", color=TEXT, fontsize=8, rotation=270, labelpad=14)
+        ax2.tick_params(axis="y", colors=TEXT, labelsize=7)
+
+        # X-axis timestamps
+        step = max(1, n // 7)
+        ticks = list(range(0, n, step))
+        if "open_time" in df.columns and hasattr(df["open_time"].iloc[0], "strftime"):
+            labels = [df["open_time"].iloc[i].strftime("%b %d, %H:%M") for i in ticks]
+        else:
+            labels = [str(i) for i in ticks]
+        ax2.set_xticks(ticks)
+        ax2.set_xticklabels(labels, rotation=0, ha="center", fontsize=7.5, color=TEXT)
+        plt.setp(ax1.get_xticklabels(), visible=False)
+
+        # Legend (top-left of price panel)
+        legend_elements = [
+            mpatches.Patch(facecolor=C_ENTRY, edgecolor="none", label=f"Entry  {entry_price:,.1f}"),
+            mpatches.Patch(facecolor=C_TP,    edgecolor="none", label=f"TP     {tp_price:,.1f}"),
+            mpatches.Patch(facecolor=C_SL,    edgecolor="none", label=f"SL     {sl_price:,.1f}"),
+        ]
+        ax1.legend(
+            handles=legend_elements, loc="upper left",
+            framealpha=0.75, facecolor="#161b22", edgecolor="#30363d",
+            labelcolor=TEXT, fontsize=8.5,
+            handlelength=1.2, handleheight=0.9, borderpad=0.7, labelspacing=0.4,
+            prop={"family": "monospace", "size": 8.5},
+        )
+
+        # Title
+        arrow = "▼" if side.lower() == "short" else "▲"
+        dir_label = "SHORT" if side.lower() == "short" else "LONG"
+        fig.suptitle(
+            f"{symbol}  {tf}  —  {arrow} {dir_label}  entry {entry_price:,.1f}",
+            color=TEXT, fontsize=11, y=0.99, x=0.44,
+        )
+
+        ax1.set_xlim(-0.8, n - 0.2)
+        fig.subplots_adjust(left=0.04, right=0.92, top=0.95, bottom=0.08)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=140, facecolor=BG)
         plt.close(fig)
@@ -341,7 +389,7 @@ def _make_event_handler(
             try:
                 raw = await client.get_candles(symbol, tf, limit=35)
                 bars = _normalize_okx_candles(raw)
-                chart = _draw_entry_chart(bars[bars["closed"]], side, entry, tp, sl)
+                chart = _draw_entry_chart(bars[bars["closed"]], side, entry, tp, sl, symbol=symbol, tf=tf)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("chart generation failed: %s", exc)
         if chart:
