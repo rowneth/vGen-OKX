@@ -49,6 +49,17 @@ LOGGER = logging.getLogger("vf_okx")
 
 _SEP = "━" * 22
 
+_MENU_BUTTONS = [
+    [
+        {"text": "📊 Status",    "callback_data": "cmd_status"},
+        {"text": "📈 Position",  "callback_data": "cmd_position"},
+    ],
+    [
+        {"text": "💰 Fees",      "callback_data": "cmd_fees"},
+        {"text": "📋 Trades",    "callback_data": "cmd_trades"},
+    ],
+]
+
 SEED_CANDLES = 100
 DEFAULT_POLL_SECONDS = 20
 
@@ -574,6 +585,258 @@ def _save_state(session: VolumeFarmerSession, path: pathlib.Path) -> None:
     path.write_text(json.dumps(state, indent=2))
 
 
+def _fmt_uptime(seconds: float) -> str:
+    h, rem = divmod(int(seconds), 3600)
+    m = rem // 60
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def _build_status_text(
+    session: "VolumeFarmerSession",
+    cfg: Dict[str, Any],
+    mode_label: str,
+    bot_label: str,
+    start_time: datetime,
+) -> str:
+    _esc = TelegramNotifier.escape
+    uptime = _fmt_uptime((datetime.now(tz=timezone.utc) - start_time).total_seconds())
+    eq = session.equity
+    start_eq = session.start_equity
+    peak = session.peak_equity
+    dd_pct = (peak - eq) / peak * 100 if peak > 0 else 0.0
+    pnl = session.total_pnl
+    pnl_pct = pnl / start_eq * 100 if start_eq > 0 else 0.0
+    wr = session.wins / session.round_trips * 100 if session.round_trips else 0.0
+    pos_str = f"{session.position.side.upper()} open" if session.position else "flat"
+    status_str = "Halted" if session.halted else "Running"
+    pnl_sign = "+" if pnl >= 0 else ""
+    sym = cfg["exchange"]["symbol"]
+    tf = cfg["exchange"]["timeframe"]
+    return (
+        f"📊 *Status*\n"
+        f"{_SEP}\n"
+        f"Mode      `{_esc(mode_label)}`  ·  `{_esc(sym)}` `{_esc(tf)}`\n"
+        f"Uptime    `{_esc(uptime)}`\n"
+        f"{_SEP}\n"
+        f"Equity    `${eq:.4f}`  \\(start `${start_eq:.2f}`\\)\n"
+        f"Peak      `${peak:.4f}`\n"
+        f"Drawdown  `{dd_pct:.2f}%`\n"
+        f"PnL       `{pnl_sign}${abs(pnl):.4f}`  \\(`{pnl_sign}{pnl_pct:.2f}%`\\)\n"
+        f"{_SEP}\n"
+        f"Trades    `{session.round_trips}`  ·  WR `{wr:.1f}%`\n"
+        f"W / L     `{session.wins}` / `{session.losses}`\n"
+        f"Position  `{_esc(pos_str)}`\n"
+        f"{_SEP}\n"
+        f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`\n"
+        f"{_SEP}\n"
+        f"\\[{_esc(bot_label)}\\]"
+    )
+
+
+async def _build_position_text(
+    session: "VolumeFarmerSession",
+    client: Any,
+    symbol: str,
+    tf: str,
+    bot_label: str,
+) -> str:
+    _esc = TelegramNotifier.escape
+    if session.position is None:
+        return (
+            f"📈 *Position*\n"
+            f"{_SEP}\n"
+            f"No open position\n"
+            f"{_SEP}\n"
+            f"\\[{_esc(bot_label)}\\]"
+        )
+    pos = session.position
+    current_price = pos.entry_price
+    try:
+        raw = await client.get_candles(symbol, tf, limit=2)
+        df_cur = _normalize_okx_candles(raw)
+        current_price = float(df_cur["close"].iloc[-1])
+    except Exception:
+        pass
+    qty = pos.notional / pos.entry_price
+    if pos.side == "long":
+        upnl = (current_price - pos.entry_price) * qty
+    else:
+        upnl = (pos.entry_price - current_price) * qty
+    upnl_pct = upnl / session.equity * 100 if session.equity > 0 else 0.0
+    upnl_sign = "+" if upnl >= 0 else ""
+    dist_tp = abs(pos.tp - current_price) / current_price * 10_000
+    dist_sl = abs(pos.sl - current_price) / current_price * 10_000
+    arrow = "🟢" if pos.side == "long" else "🔴"
+    return (
+        f"📈 *Position*\n"
+        f"{_SEP}\n"
+        f"{arrow} `{_esc(pos.side.upper())}`  ·  `{_esc(symbol)}`\n"
+        f"Entry    `{pos.entry_price:,.2f}`\n"
+        f"Current  `{current_price:,.2f}`\n"
+        f"{_SEP}\n"
+        f"TP  `{pos.tp:,.2f}`  \\({dist_tp:.1f}bps away\\)\n"
+        f"SL  `{pos.sl:,.2f}`  \\({dist_sl:.1f}bps away\\)\n"
+        f"Bars held  `{pos.bars_held}`\n"
+        f"{_SEP}\n"
+        f"Notional  `${pos.notional:,.2f}`\n"
+        f"uPnL      `{upnl_sign}${abs(upnl):.4f}`  \\(`{upnl_sign}{upnl_pct:.2f}%`\\)\n"
+        f"{_SEP}\n"
+        f"\\[{_esc(bot_label)}\\]"
+    )
+
+
+def _build_fees_text(
+    session: "VolumeFarmerSession",
+    cfg: Dict[str, Any],
+    bot_label: str,
+) -> str:
+    _esc = TelegramNotifier.escape
+    fees_cfg = cfg.get("fees", {})
+    rebate_pct = float(fees_cfg.get("rebate_pct", 0.40))
+    rebate_earned = session.total_fees_gross * rebate_pct
+    vol_target = float(cfg.get("target", {}).get("volume_usd", 5_000_000))
+    vol_pct = session.total_volume_usd / vol_target * 100 if vol_target else 0.0
+    maker_bps = float(fees_cfg.get("maker", 0.0002)) * 10_000
+    taker_bps = float(fees_cfg.get("taker", 0.0005)) * 10_000
+    return (
+        f"💰 *Fees & Rebate*\n"
+        f"{_SEP}\n"
+        f"Volume    `${session.total_volume_usd:,.0f}`\n"
+        f"Target    `${vol_target:,.0f}`  \\(`{vol_pct:.1f}%` done\\)\n"
+        f"{_SEP}\n"
+        f"Gross fees  `${session.total_fees_gross:.4f}`\n"
+        f"Rebate {rebate_pct*100:.0f}%  `${rebate_earned:.4f}`\n"
+        f"{_SEP}\n"
+        f"Maker `{maker_bps:.0f}bps`  ·  Taker `{taker_bps:.0f}bps`\n"
+        f"Trades  `{session.round_trips}`\n"
+        f"{_SEP}\n"
+        f"\\[{_esc(bot_label)}\\]"
+    )
+
+
+def _build_trades_text(
+    session: "VolumeFarmerSession",
+    bot_label: str,
+) -> str:
+    _esc = TelegramNotifier.escape
+    recent = list(reversed(session.ledger[-8:])) if session.ledger else []
+    lines: list = [f"📋 *Recent Trades*\n{_SEP}"]
+    if not recent:
+        lines.append("No trades yet")
+    else:
+        base_num = session.round_trips
+        for i, t in enumerate(recent):
+            num = base_num - i
+            icon = "✅" if t["reason"] == "tp" else "❌"
+            net = t["net_pnl"]
+            sign = "+" if net >= 0 else ""
+            side_ch = "L" if t["side"] == "long" else "S"
+            lines.append(
+                f"\\#{_esc(str(num))}  {icon} {_esc(side_ch)}  `{sign}${abs(net):.4f}`"
+            )
+    lines.append(_SEP)
+    total_net = sum(t["net_pnl"] for t in session.ledger)
+    sign = "+" if total_net >= 0 else ""
+    wr = session.wins / session.round_trips * 100 if session.round_trips else 0.0
+    lines.append(
+        f"Total  `{sign}${abs(total_net):.4f}`  ·  WR `{wr:.1f}%`"
+    )
+    lines.append(f"{_SEP}\n\\[{_esc(bot_label)}\\]")
+    return "\n".join(lines)
+
+
+async def _dispatch_cmd(
+    data: str,
+    session: "VolumeFarmerSession",
+    client: Any,
+    symbol: str,
+    tf: str,
+    cfg: Dict[str, Any],
+    mode_label: str,
+    bot_label: str,
+    start_time: datetime,
+) -> Optional[str]:
+    if data == "cmd_status":
+        return _build_status_text(session, cfg, mode_label, bot_label, start_time)
+    if data == "cmd_position":
+        return await _build_position_text(session, client, symbol, tf, bot_label)
+    if data == "cmd_fees":
+        return _build_fees_text(session, cfg, bot_label)
+    if data == "cmd_trades":
+        return _build_trades_text(session, bot_label)
+    return None
+
+
+async def _command_loop(
+    notifier: TelegramNotifier,
+    session: "VolumeFarmerSession",
+    client: Any,
+    symbol: str,
+    tf: str,
+    cfg: Dict[str, Any],
+    mode_label: str,
+    bot_label: str,
+    stop_evt: asyncio.Event,
+    start_time: datetime,
+) -> None:
+    if not notifier.enabled:
+        return
+    _esc = TelegramNotifier.escape
+
+    menu_msg_id: Optional[int] = await notifier.send_with_buttons(
+        f"🎛 *Controls* — tap to query the bot\n"
+        f"{_SEP}\n"
+        f"\\[{_esc(bot_label)}\\]",
+        _MENU_BUTTONS,
+    )
+
+    offset = 0
+    while not stop_evt.is_set():
+        try:
+            updates = await notifier.get_updates(offset=offset, timeout=20)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.debug("command loop error: %s", exc)
+            await asyncio.sleep(5)
+            continue
+
+        for upd in updates:
+            offset = upd["update_id"] + 1
+
+            if "callback_query" in upd:
+                cq = upd["callback_query"]
+                cq_id = cq["id"]
+                data = cq.get("data", "")
+                await notifier.answer_callback(cq_id)
+                try:
+                    text = await _dispatch_cmd(
+                        data, session, client, symbol, tf, cfg,
+                        mode_label, bot_label, start_time,
+                    )
+                    if text:
+                        await notifier.send_and_get_id(text, reply_to_message_id=menu_msg_id)
+                except Exception as exc:
+                    LOGGER.warning("command dispatch error: %s", exc)
+
+            elif "message" in upd:
+                msg = upd["message"]
+                raw_text = (msg.get("text") or "").strip()
+                if raw_text.startswith("/"):
+                    cmd = raw_text.split()[0].lstrip("/").split("@")[0]
+                    try:
+                        text = await _dispatch_cmd(
+                            f"cmd_{cmd}", session, client, symbol, tf, cfg,
+                            mode_label, bot_label, start_time,
+                        )
+                        if text:
+                            await notifier.send_and_get_id(
+                                text, reply_to_message_id=msg.get("message_id"),
+                            )
+                    except Exception as exc:
+                        LOGGER.warning("command dispatch error: %s", exc)
+
+
 async def main_async(args: argparse.Namespace) -> int:
     cfg_path = pathlib.Path(args.config)
     if not cfg_path.is_absolute():
@@ -731,23 +994,31 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             await notifier.send_raw(startup_msg)
 
+        start_time = datetime.now(tz=timezone.utc)
         poll_task = asyncio.create_task(_poll_loop(
             client, session, symbol, tf, args.poll_seconds,
             history, end_at, log_dir, handler,
             notifier=notifier, mode_label=mode_label,
             bot_label=args.label or "okx-paper", cfg=cfg, intrabar=_intrabar,
         ))
+        cmd_task = asyncio.create_task(_command_loop(
+            notifier, session, client, symbol, tf, cfg,
+            mode_label, bot_label=args.label or "okx-paper",
+            stop_evt=stop_evt, start_time=start_time,
+        ))
         try:
-            done, _ = await asyncio.wait(
-                {poll_task, asyncio.create_task(stop_evt.wait())},
+            await asyncio.wait(
+                {poll_task, cmd_task, asyncio.create_task(stop_evt.wait())},
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            poll_task.cancel()
-            try:
-                await poll_task
-            except asyncio.CancelledError:
-                pass
+            for t in (poll_task, cmd_task):
+                t.cancel()
+            for t in (poll_task, cmd_task):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
     _save_state(session, state_path)
     s = session.summary()

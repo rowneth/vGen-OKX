@@ -12,6 +12,7 @@ no-ops (so tests and dev runs can call them freely).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -299,6 +300,82 @@ class TelegramNotifier:
 		except Exception as exc:  # noqa: BLE001
 			LOGGER.warning("Telegram setMessageReaction exception: %s", exc)
 			return False
+
+	async def get_updates(self, offset: int = 0, timeout: int = 20) -> list:
+		"""Long-poll getUpdates; returns list of update dicts."""
+		if not self._enabled or not self._bot_token:
+			return []
+		if self._session is None:
+			self._session = aiohttp.ClientSession(timeout=self._timeout)
+			self._owns_session = True
+		url = f"https://api.telegram.org/bot{self._bot_token}/getUpdates"
+		params = {
+			"offset": offset,
+			"timeout": timeout,
+			"allowed_updates": json.dumps(["message", "callback_query"]),
+		}
+		req_timeout = aiohttp.ClientTimeout(total=timeout + 10)
+		try:
+			async with self._session.get(url, params=params, timeout=req_timeout) as resp:
+				if resp.status != 200:
+					return []
+				data = await resp.json()
+				return data.get("result", [])
+		except asyncio.CancelledError:
+			raise
+		except Exception as exc:
+			LOGGER.debug("get_updates error: %s", exc)
+			return []
+
+	async def answer_callback(self, callback_query_id: str, text: str = "") -> None:
+		"""Answer a Telegram callback query to clear the loading spinner."""
+		if not self._enabled or not self._bot_token:
+			return
+		if self._session is None:
+			self._session = aiohttp.ClientSession(timeout=self._timeout)
+			self._owns_session = True
+		url = f"https://api.telegram.org/bot{self._bot_token}/answerCallbackQuery"
+		payload: Dict[str, Any] = {"callback_query_id": callback_query_id}
+		if text:
+			payload["text"] = text[:200]
+		try:
+			async with self._session.post(url, json=payload) as resp:
+				if resp.status != 200:
+					body = await resp.text()
+					LOGGER.debug("answerCallbackQuery failed: %s %s", resp.status, body[:200])
+		except Exception as exc:
+			LOGGER.debug("answer_callback error: %s", exc)
+
+	async def send_with_buttons(
+		self,
+		markdown_v2_text: str,
+		buttons: list,
+	) -> Optional[int]:
+		"""Send a MarkdownV2 message with an inline keyboard. Returns message_id."""
+		if not self._enabled or not self._bot_token:
+			return None
+		if self._session is None:
+			self._session = aiohttp.ClientSession(timeout=self._timeout)
+			self._owns_session = True
+		url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+		payload: Dict[str, Any] = {
+			"chat_id": self._chat_id,
+			"text": markdown_v2_text,
+			"parse_mode": "MarkdownV2",
+			"disable_web_page_preview": True,
+			"reply_markup": {"inline_keyboard": buttons},
+		}
+		try:
+			async with self._session.post(url, json=payload) as resp:
+				if resp.status != 200:
+					body = await resp.text()
+					LOGGER.error("send_with_buttons failed: %s %s", resp.status, body[:300])
+					return None
+				data = await resp.json()
+				return int(data["result"]["message_id"])
+		except Exception as exc:
+			LOGGER.error("send_with_buttons error: %s", exc)
+			return None
 
 	async def _run_worker(self) -> None:
 		assert self._session is not None and self._queue is not None
