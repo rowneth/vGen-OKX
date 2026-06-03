@@ -101,6 +101,8 @@ notifications:
       cooldown_minutes: 60
       mention_handles:
         - "@rowneth"
+        - "@Litchth"
+        - "@ChaanaCM"
 
 reporting:
   output_dir: data/reports

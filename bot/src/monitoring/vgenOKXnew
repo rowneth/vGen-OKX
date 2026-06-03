@@ -1,0 +1,10 @@
+cd /Users/rowneth/vGen/bot && git commit -m "feat(tg): rich message templates + kline chart + exit reply threading
+
+- Entry: dark candlestick chart (30 bars) with entry/TP/SL lines sent as
+  photo reply; message shows price, bps, margin, leverage, fee, balance
+- Exit: threaded reply to entry message; shows gross/fee/net, W/L/WR,
+  balance, volume progress
+- Startup/stop: redesigned with SEP dividers, ATR/fee/target details
+- _draw_entry_chart: matplotlib Agg, dark theme, triangle entry marker
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" && git push origin main
