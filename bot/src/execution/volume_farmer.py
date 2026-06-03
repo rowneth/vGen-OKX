@@ -67,6 +67,8 @@ class VolumeFarmerSession:
 	position: Optional[_Position] = field(default=None, init=False)
 	total_volume_usd: float = field(default=0.0, init=False)
 	total_fees_gross: float = field(default=0.0, init=False)
+	total_rebate_accrued: float = field(default=0.0, init=False)
+	total_rebate_transferred: float = field(default=0.0, init=False)
 	total_pnl: float = field(default=0.0, init=False)
 	wins: int = field(default=0, init=False)
 	losses: int = field(default=0, init=False)
@@ -80,6 +82,7 @@ class VolumeFarmerSession:
 	daily_pnl: float = field(default=0.0, init=False)
 	daily_pnl_date: str = field(default="", init=False)
 	milestones_hit: List[float] = field(default_factory=list, init=False)
+	last_rebate_reminder_at: Optional[str] = field(default=None, init=False)
 
 	def __post_init__(self) -> None:
 		f = self.config["farmer"]
@@ -185,6 +188,17 @@ class VolumeFarmerSession:
 		target_cfg = self.config.get("target", {})
 		self._volume_target = float(target_cfg.get("volume_usd", 1_000_000.0))
 		self._milestones = [0.1, 0.25, 0.5, 0.75, 1.0]
+		# Auto rebate-top-up reminder: pings configured members on Telegram
+		# when the wallet looks shaky and there's enough available rebate to
+		# rescue it. Cooldown prevents spam.
+		notif_tg_cfg = self.config.get("notifications", {}).get("telegram", {}) or {}
+		rr_cfg = notif_tg_cfg.get("rebate_reminder", {}) or {}
+		self._rr_enabled = bool(rr_cfg.get("enabled", True))
+		self._rr_equity_floor_pct = float(rr_cfg.get("equity_floor_pct", 0.85))
+		self._rr_drawdown_pct = float(rr_cfg.get("drawdown_pct", 0.08))
+		self._rr_min_rebate_usd = float(rr_cfg.get("min_rebate_usd", 5.0))
+		self._rr_cooldown_minutes = int(rr_cfg.get("cooldown_minutes", 60))
+		self._rr_mention_handles = list(rr_cfg.get("mention_handles", []))
 
 	# ------------------------------------------------------------------
 	def _emit(self, evt: FarmerEvent) -> None:
@@ -457,6 +471,7 @@ class VolumeFarmerSession:
 		notional = margin * leverage
 		open_fee = notional * self._maker_rate  # limit order = maker
 		self.total_fees_gross += open_fee
+		self.total_rebate_accrued += open_fee * self._rebate_pct
 		self.total_volume_usd += notional
 		self.equity -= open_fee  # fee paid on open
 		tp = price * (1 + self._pending_tp_bps / 10_000) if side == "long" else price * (1 - self._pending_tp_bps / 10_000)
@@ -508,6 +523,7 @@ class VolumeFarmerSession:
 			close_fee_type = "taker"
 		net_pnl = gross_pnl - close_fee
 		self.total_fees_gross += close_fee
+		self.total_rebate_accrued += close_fee * self._rebate_pct
 		self.total_volume_usd += p.notional
 		self.total_pnl += net_pnl
 		self.equity += gross_pnl - close_fee
@@ -601,6 +617,8 @@ class VolumeFarmerSession:
 		if self._check_halt(bar_time):
 			return
 
+		self._check_rebate_reminder(bar_time)
+
 		high = float(last["high"])
 		low = float(last["low"])
 		close = float(last["close"])
@@ -689,6 +707,100 @@ class VolumeFarmerSession:
 		self._open_position(side, close, bar_time)
 
 	# ------------------------------------------------------------------
+	def _check_rebate_reminder(self, bar_time: pd.Timestamp) -> None:
+		"""Emit a `rebate_reminder` event when wallet is shaky and rebate could rescue it.
+
+		Fires when (a) the wallet has fallen below the safety floor or peak
+		drawdown exceeds the configured threshold, (b) at least
+		`min_rebate_usd` of unclaimed rebate sits in the pool, and (c) the
+		cooldown since the last reminder has elapsed. Suggests transferring
+		whichever is smaller — the available rebate, or the gap back to
+		start equity.
+		"""
+		if not self._rr_enabled or self.halted:
+			return
+		available = self.available_rebate
+		if available < self._rr_min_rebate_usd:
+			return
+		dd = (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9)
+		below_floor = self.equity < self.start_equity * self._rr_equity_floor_pct
+		over_dd = dd >= self._rr_drawdown_pct
+		if not (below_floor or over_dd):
+			return
+		# Cooldown
+		if self.last_rebate_reminder_at:
+			try:
+				last = pd.Timestamp(self.last_rebate_reminder_at)
+				if (bar_time - last) < pd.Timedelta(minutes=self._rr_cooldown_minutes):
+					return
+			except Exception:  # noqa: BLE001
+				pass
+		gap_to_start = max(0.0, self.start_equity - self.equity)
+		suggested = min(available, gap_to_start) if gap_to_start > 0 else available
+		if suggested < self._rr_min_rebate_usd:
+			suggested = available
+		reasons: List[str] = []
+		if below_floor:
+			reasons.append(
+				f"balance ${self.equity:.2f} below floor "
+				f"({self._rr_equity_floor_pct*100:.0f}% of start)"
+			)
+		if over_dd:
+			reasons.append(f"drawdown {dd*100:.1f}% from peak")
+		self.last_rebate_reminder_at = bar_time.isoformat()
+		self._emit(FarmerEvent(
+			kind="rebate_reminder", time=bar_time,
+			payload={
+				"equity": self.equity,
+				"start_equity": self.start_equity,
+				"peak_equity": self.peak_equity,
+				"drawdown_pct": dd,
+				"available_rebate": available,
+				"suggested_amount": round(suggested, 4),
+				"reasons": reasons,
+				"mention_handles": list(self._rr_mention_handles),
+			},
+		))
+
+	# ------------------------------------------------------------------
+	@property
+	def available_rebate(self) -> float:
+		"""Rebate accrued from fees but not yet transferred to equity."""
+		return max(0.0, self.total_rebate_accrued - self.total_rebate_transferred)
+
+	# ------------------------------------------------------------------
+	def transfer_rebate(self, amount: float) -> Dict[str, Any]:
+		"""Move up to *amount* USD from the rebate pool into trading equity.
+
+		The transferred amount is capped at :pyattr:`available_rebate`. Equity
+		(and peak equity) are bumped so subsequent trade sizing immediately
+		reflects the top-up, but :pyattr:`start_equity` is left untouched so
+		PnL accounting stays honest.
+		"""
+		req = float(amount)
+		if req <= 0:
+			return {
+				"requested": req, "transferred": 0.0,
+				"available_rebate": self.available_rebate,
+				"equity": self.equity, "reason": "non_positive_amount",
+			}
+		moved = min(req, self.available_rebate)
+		if moved <= 0:
+			return {
+				"requested": req, "transferred": 0.0,
+				"available_rebate": self.available_rebate,
+				"equity": self.equity, "reason": "no_rebate_available",
+			}
+		self.total_rebate_transferred += moved
+		self.equity += moved
+		self.peak_equity = max(self.peak_equity, self.equity)
+		return {
+			"requested": req, "transferred": moved,
+			"available_rebate": self.available_rebate,
+			"equity": self.equity, "reason": "ok",
+		}
+
+	# ------------------------------------------------------------------
 	def summary(self) -> Dict[str, Any]:
 		wr = (self.wins / self.round_trips * 100.0) if self.round_trips else 0.0
 		net_fees = self.total_fees_gross * (1.0 - self._rebate_pct)
@@ -703,6 +815,9 @@ class VolumeFarmerSession:
 			"fees_gross": round(self.total_fees_gross, 4),
 			"fees_net": round(net_fees, 4),
 			"rebate_estimate": round(self.total_fees_gross * self._rebate_pct, 4),
+			"rebate_accrued": round(self.total_rebate_accrued, 4),
+			"rebate_transferred": round(self.total_rebate_transferred, 4),
+			"rebate_available": round(self.available_rebate, 4),
 			"total_pnl": round(self.total_pnl, 4),
 			"fee_cover_pct": round(fee_cover, 2),
 			"round_trips": self.round_trips,
@@ -738,6 +853,8 @@ class VolumeFarmerSession:
 			"start_equity": self.start_equity,
 			"total_volume_usd": self.total_volume_usd,
 			"total_fees_gross": self.total_fees_gross,
+			"total_rebate_accrued": self.total_rebate_accrued,
+			"total_rebate_transferred": self.total_rebate_transferred,
 			"total_pnl": self.total_pnl,
 			"wins": self.wins,
 			"losses": self.losses,
@@ -750,6 +867,7 @@ class VolumeFarmerSession:
 			"daily_pnl": self.daily_pnl,
 			"daily_pnl_date": self.daily_pnl_date,
 			"milestones_hit": self.milestones_hit,
+			"last_rebate_reminder_at": self.last_rebate_reminder_at,
 			"position": pos_data,
 			"ledger": self.ledger[-500:],  # cap
 			"saved_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -763,9 +881,11 @@ class VolumeFarmerSession:
 		s = json.loads(path.read_text(encoding="utf-8"))
 		for key in [
 			"equity", "peak_equity", "start_equity", "total_volume_usd",
-			"total_fees_gross", "total_pnl", "wins", "losses", "round_trips",
-			"consec_losses", "cooldown_bars_left", "halted", "halt_reason",
-			"last_side", "daily_pnl", "daily_pnl_date", "milestones_hit",
+			"total_fees_gross", "total_rebate_accrued",
+			"total_rebate_transferred", "total_pnl", "wins", "losses",
+			"round_trips", "consec_losses", "cooldown_bars_left", "halted",
+			"halt_reason", "last_side", "daily_pnl", "daily_pnl_date",
+			"milestones_hit", "last_rebate_reminder_at",
 		]:
 			if key in s:
 				setattr(self, key, s[key])

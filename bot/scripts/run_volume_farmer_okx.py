@@ -574,6 +574,35 @@ def _make_event_handler(
                     f"Vol  `${vol:,.0f}` / `${vol_target:,.0f}`"
                 )
 
+        elif evt.kind == "rebate_reminder":
+            p = evt.payload
+            equity = float(p.get("equity", 0.0))
+            available = float(p.get("available_rebate", 0.0))
+            suggested = float(p.get("suggested_amount", available))
+            dd_pct = float(p.get("drawdown_pct", 0.0)) * 100
+            reasons = p.get("reasons", []) or []
+            handles = p.get("mention_handles", []) or []
+            reason_str = "; ".join(reasons) if reasons else "wallet low"
+            LOGGER.warning(
+                "REBATE REMINDER eq=$%.2f available=$%.2f suggested=$%.2f reason=%s",
+                equity, available, suggested, reason_str,
+            )
+            if notifier and notifier.enabled:
+                mention_line = " ".join(_esc(h) for h in handles) if handles else ""
+                head = mention_line + "\n" if mention_line else ""
+                _tg(
+                    f"{head}"
+                    f"⚠️ *Rebate top\\-up needed*\n"
+                    f"{_SEP}\n"
+                    f"Wallet            `${equity:.2f}`\n"
+                    f"Available rebate  `${available:.2f}`\n"
+                    f"Drawdown          `{dd_pct:.1f}%`\n"
+                    f"{_SEP}\n"
+                    f"Please transfer  `${suggested:.2f}`  to main wallet\n"
+                    f"Reason: {_esc(reason_str)}\n"
+                    f"Run: `/rebate {suggested:.2f}`"
+                )
+
     return on_event
 
 
@@ -686,7 +715,9 @@ def _build_fees_text(
     _esc = TelegramNotifier.escape
     fees_cfg = cfg.get("fees", {})
     rebate_pct = float(fees_cfg.get("rebate_pct", 0.40))
-    rebate_earned = session.total_fees_gross * rebate_pct
+    rebate_accrued = session.total_rebate_accrued
+    rebate_transferred = session.total_rebate_transferred
+    rebate_available = session.available_rebate
     vol_target = float(cfg.get("target", {}).get("volume_usd", 5_000_000))
     vol_pct = session.total_volume_usd / vol_target * 100 if vol_target else 0.0
     maker_bps = float(fees_cfg.get("maker", 0.0002)) * 10_000
@@ -697,11 +728,17 @@ def _build_fees_text(
         f"Volume    `${session.total_volume_usd:,.0f}`\n"
         f"Target    `${vol_target:,.0f}`  \\(`{vol_pct:.1f}%` done\\)\n"
         f"{_SEP}\n"
-        f"Gross fees  `${session.total_fees_gross:.4f}`\n"
-        f"Rebate {rebate_pct*100:.0f}%  `${rebate_earned:.4f}`\n"
+        f"Gross fees       `${session.total_fees_gross:.4f}`\n"
+        f"Rebate {rebate_pct*100:.0f}% total `${rebate_accrued:.4f}`\n"
+        f"Transferred      `${rebate_transferred:.4f}`\n"
+        f"Available rebate `${rebate_available:.4f}`\n"
+        f"{_SEP}\n"
+        f"Balance   `${session.equity:.4f}`\n"
         f"{_SEP}\n"
         f"Maker `{maker_bps:.0f}bps`  ·  Taker `{taker_bps:.0f}bps`\n"
         f"Trades  `{session.round_trips}`\n"
+        f"{_SEP}\n"
+        f"Tip: `/rebate <amount>` tops up your balance\n"
         f"{_SEP}\n"
         f"\\[{_esc(bot_label)}\\]"
     )
@@ -760,6 +797,86 @@ async def _dispatch_cmd(
     return None
 
 
+def _build_rebate_text(
+    session: "VolumeFarmerSession",
+    result: Dict[str, Any],
+    bot_label: str,
+) -> str:
+    _esc = TelegramNotifier.escape
+    requested = float(result.get("requested", 0.0))
+    transferred = float(result.get("transferred", 0.0))
+    available = float(result.get("available_rebate", session.available_rebate))
+    equity = float(result.get("equity", session.equity))
+    reason = str(result.get("reason", "ok"))
+    if reason == "ok" and transferred > 0:
+        head = "💸 *Rebate transferred*"
+        body = (
+            f"Requested  `${requested:.4f}`\n"
+            f"Transferred  `${transferred:.4f}`\n"
+            f"{_SEP}\n"
+            f"New wallet balance  `${equity:.4f}`\n"
+            f"Available rebate    `${available:.4f}`"
+        )
+    elif reason == "no_rebate_available":
+        head = "⚠️ *Rebate transfer skipped*"
+        body = (
+            f"No rebate available yet\n"
+            f"{_SEP}\n"
+            f"Wallet balance   `${equity:.4f}`\n"
+            f"Available rebate `${available:.4f}`"
+        )
+    elif reason == "non_positive_amount":
+        head = "⚠️ *Rebate transfer skipped*"
+        body = (
+            f"Amount must be > 0\n"
+            f"Usage: `/rebate <amount>`"
+        )
+    else:
+        head = "⚠️ *Rebate transfer*"
+        body = (
+            f"Requested  `${requested:.4f}`\n"
+            f"Transferred  `${transferred:.4f}`\n"
+            f"Wallet balance  `${equity:.4f}`\n"
+            f"Available rebate `${available:.4f}`"
+        )
+    return (
+        f"{head}\n"
+        f"{_SEP}\n"
+        f"{body}\n"
+        f"{_SEP}\n"
+        f"\\[{_esc(bot_label)}\\]"
+    )
+
+
+def _handle_rebate_command(
+    session: "VolumeFarmerSession",
+    raw_text: str,
+    bot_label: str,
+    state_path: Optional[pathlib.Path],
+) -> str:
+    parts = raw_text.split()
+    amount: Optional[float] = None
+    if len(parts) >= 2:
+        try:
+            amount = float(parts[1].lstrip("$").replace(",", ""))
+        except ValueError:
+            amount = None
+    if amount is None:
+        result = {
+            "requested": 0.0, "transferred": 0.0,
+            "available_rebate": session.available_rebate,
+            "equity": session.equity, "reason": "non_positive_amount",
+        }
+    else:
+        result = session.transfer_rebate(amount)
+        if result.get("transferred", 0.0) > 0 and state_path is not None:
+            try:
+                session.save_state(state_path)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("state save failed (rebate): %s", exc)
+    return _build_rebate_text(session, result, bot_label)
+
+
 async def _command_loop(
     notifier: TelegramNotifier,
     session: "VolumeFarmerSession",
@@ -771,6 +888,7 @@ async def _command_loop(
     bot_label: str,
     stop_evt: asyncio.Event,
     start_time: datetime,
+    state_path: Optional[pathlib.Path] = None,
 ) -> None:
     if not notifier.enabled:
         return
@@ -818,10 +936,15 @@ async def _command_loop(
                 if raw_text.startswith("/"):
                     cmd = raw_text.split()[0].lstrip("/").split("@")[0]
                     try:
-                        text = await _dispatch_cmd(
-                            f"cmd_{cmd}", session, client, symbol, tf, cfg,
-                            mode_label, bot_label, start_time,
-                        )
+                        if cmd == "rebate":
+                            text = _handle_rebate_command(
+                                session, raw_text, bot_label, state_path,
+                            )
+                        else:
+                            text = await _dispatch_cmd(
+                                f"cmd_{cmd}", session, client, symbol, tf, cfg,
+                                mode_label, bot_label, start_time,
+                            )
                         if text:
                             await notifier.send_and_get_id(
                                 text, reply_to_message_id=msg.get("message_id"),
@@ -1040,6 +1163,7 @@ async def main_async(args: argparse.Namespace) -> int:
             notifier, session, client, symbol, tf, cfg,
             mode_label, bot_label=args.label or "okx-paper",
             stop_evt=stop_evt, start_time=start_time,
+            state_path=state_path,
         ))
         try:
             await asyncio.wait(
