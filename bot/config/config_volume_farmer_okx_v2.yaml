@@ -1,0 +1,147 @@
+app:
+  name: volume-farmer-okx-v2
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# OKX VOLUME FARMER — v2 with time-stop + maker-exit re-peg loop.
+#
+# v1 → v2 changes (from analysis of 133 live trades, total PnL -$80, RR 0.25):
+#   1. Time-stop closes the trade after MAX_HOLD_BARS=2 (10 minutes) if the
+#      market hasn't already paid us via TP. Slow drifts that used to ride
+#      the wide SL band now exit at touch — same volume, much smaller loss.
+#   2. Maker-only exit: the time-stop closes through a post_only re-peg loop
+#      so it lands at the maker fee (~2bps) instead of the taker market dump
+#      (~5bps + overage). Native SL stays as a last-resort taker floor.
+#
+# IMPORTANT — DEMO FIRST. Set --demo on the runner (or x-simulated-trading
+# header on the client) before pointing this at real money.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0002                    # 0.020% OKX maker
+  taker: 0.0005                    # 0.050% OKX taker
+  rebate_pct: 0.40                 # 40% rebate on maker fees
+
+farmer:
+  capital_usd: 500.0
+  leverage: 0                      # 0 = dynamic
+
+  margin_fraction_per_trade: 0.03  # 3% of equity as margin
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    # Capped at 100x to match OKX retail live max on BTC-USDT-SWAP.
+    # Anything above is unreachable in production; demo allows 125x but we
+    # keep the bot's sizing honest so paper/demo/live all behave identically.
+    max_leverage: 100
+    min_leverage: 5
+
+  # Fallback fixed TP/SL (used when atr.relative = false)
+  tp_bps: 8.0
+  sl_bps: 50.0
+  # Catastrophic-floor SL stays wide (50bps); the primary exit for losers is
+  # now the time-stop below, NOT the price stop.
+  max_hold_bars: 999               # legacy fallback; superseded by time_stop block
+
+  # Feature 1 — quick-bar time stop.
+  # Hold-horizon backtest (15k+ trades, scripts/analyze_hold_horizon.py): per-trade
+  # net is monotonic in hold length — every extra bar loses more. 40% of winners hit
+  # TP on bar 1; whatever is still open after that drifts against us. max_hold=1 (5m)
+  # is the data-proven optimum (-3.04 vs -3.65 bps/trade at 2 bars).
+  time_stop:
+    enabled: true
+    max_hold_bars: 1               # close non-winners after 1 bar (5m on 5m TF)
+    bar_seconds: 300
+
+  # Feature 2 — maker-only exit re-peg loop on the time-stop path.
+  # Existing TP is already post_only/maker; this routes the time-stop close
+  # through the same maker discipline.
+  maker_exit:
+    enabled: true
+    repeg_ms: 750                  # how long we wait for a fill before re-pegging
+    max_repegs: 8                  # max passive re-pins before taker fallback
+    max_exit_seconds: 20.0         # hard ceiling on time-to-fill
+    max_adverse_bps: 15.0          # cross spread to market if touch drifts >15bps
+    poll_ms: 120                   # order-state polling cadence inside one re-peg
+
+  # Entry re-peg loop (B). Follows the touch so post_only entries actually
+  # fill in trending markets. The single-shot timeout approach left too many
+  # entries unfilled when the market trended away from the bar-close price
+  # within the 30s timeout window. With re-peg we cancel + replace at the
+  # current touch on no-fill, staying at the front of the maker queue.
+  # taker_fallback=true means: after 6 re-pegs without a maker fill, send a
+  # market order to guarantee the entry. Costs an extra ~1.8bps net (after
+  # rebate) on the fallback fills only; preserves volume which is the goal.
+  entry_repeg:
+    enabled: true
+    repeg_ms: 8000                 # 8s per peg — enough to catch a counter-flow take
+    max_repegs: 6                  # 6 attempts × 8s = up to 48s of chase
+    max_entry_seconds: 60.0        # hard ceiling regardless of attempt count
+    poll_ms: 150
+    taker_fallback: true           # OKX best-practice for volume-farming entries
+
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 3.0
+    max_bar_range_bps: 40.0
+    # Skip the worst UTC hours. 360d backtest (scripts/analyze_bad_hours.py):
+    # hours 12 & 21 are robustly below-average in both halves (-4 to -4.8 bps);
+    # 04 flagged by the live demo-v2 sample. Blocking [4,12,21] drops ~11% of
+    # volume (those hours net -3.77 bps vs -3.10 overall) and lifts kept-hours
+    # to -3.02 bps/t. NOTE: all 24 hours are net-negative — this trims the worst,
+    # it does not create edge. Entry-side directional alpha is the real fix.
+    skip_hours: [4, 12, 21]
+
+  alternate_direction: false
+
+  limit_tp: true
+
+  atr:
+    period: 14
+    relative: true
+    tp_mult: 0.5
+    sl_mult: 1.5
+    tp_bps_min: 5.0
+    sl_bps_min: 8.0
+    min_usd: 120.0
+
+  trend_break:
+    enabled: false
+    min_bars_held: 3
+    adverse_bps: 20.0
+
+risk:
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  consecutive_losses_limit: 10
+  consecutive_losses_cooldown_bars: 12
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 5000000.0
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: true
+    send_daily: true
+    send_errors: true
+    send_milestones: true
+    daily_report_hour: 0
+    rebate_reminder:
+      enabled: true
+      equity_floor_pct: 0.85
+      drawdown_pct: 0.08
+      min_rebate_usd: 5.0
+      cooldown_minutes: 60
+      mention_handles:
+        - "@rowneth"
+        - "@Litchth"
+        - "@ChaanaCM"
+
+reporting:
+  output_dir: data/reports
