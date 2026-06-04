@@ -99,7 +99,19 @@ class VolumeFarmerSession:
 		self._min_leverage = float(sizing_cfg.get("min_leverage", 5))
 		self._tp_bps = float(f["tp_bps"])
 		self._sl_bps = float(f["sl_bps"])
-		self._max_hold = int(f["max_hold_bars"])
+		# Time-stop: closes non-winning trades after N bars at the current bar
+		# close. When farmer.time_stop.enabled, max_hold_bars from that block
+		# wins; otherwise we fall back to the legacy top-level max_hold_bars.
+		ts_cfg = f.get("time_stop", {}) or {}
+		self._time_stop_enabled = bool(ts_cfg.get("enabled", False))
+		if self._time_stop_enabled:
+			self._max_hold = int(ts_cfg.get("max_hold_bars", f.get("max_hold_bars", 2)))
+		else:
+			self._max_hold = int(f.get("max_hold_bars", 999))
+		# Maker-exit: when enabled, the time_stop close path is accounted as a
+		# maker fill (matches the live re-peg loop). Wide-band SL hits are still
+		# taker — those are emergency exits, not the steady-state behavior.
+		self._maker_exit_enabled = bool((f.get("maker_exit", {}) or {}).get("enabled", False))
 		entry_cfg = f.get("entry", {})
 		self._entry_mode = str(entry_cfg.get("mode", "micro_momentum"))
 		self._min_range_bps = float(entry_cfg.get("min_bar_range_bps", 0.0))
@@ -514,8 +526,13 @@ class VolumeFarmerSession:
 			pnl_pct = (p.entry_price - exit_price) / p.entry_price
 		gross_pnl = pnl_pct * p.notional
 		# TP exits: use maker rate when limit_tp is enabled (OKX supports limit TP orders).
-		# All other exits (SL, trend_break, time_stop) are taker market fills.
+		# Time-stop exits use maker rate when maker_exit is enabled (matches the
+		# live re-peg loop). SL / trend_break / sl_ambiguous stay taker — those
+		# are fast/forced exits that cannot be guaranteed maker.
 		if self._limit_tp and reason == "tp":
+			close_fee = p.notional * self._maker_rate
+			close_fee_type = "maker"
+		elif self._maker_exit_enabled and reason == "time_stop":
 			close_fee = p.notional * self._maker_rate
 			close_fee_type = "maker"
 		else:

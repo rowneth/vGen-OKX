@@ -177,6 +177,17 @@ class OKXClient:
         body = {"posMode": mode}
         return await self._request("POST", path, body=body, auth=True)
 
+    async def get_account_config(self) -> Dict[str, Any]:
+        """Current account-mode/level (``acctLv``: 1 spot, 2 spot+futures, 3 multi-ccy, 4 portfolio)."""
+        return await self._request("GET", "/api/v5/account/config", auth=True)
+
+    async def set_account_level(self, acct_lv: str) -> Dict[str, Any]:
+        """Upgrade account mode. ``acct_lv``: '1'..'4'. Perpetual swaps need >= '2'."""
+        body = {"acctLv": str(acct_lv)}
+        return await self._request(
+            "POST", "/api/v5/account/set-account-level", body=body, auth=True,
+        )
+
     async def set_leverage(
         self, symbol: str, leverage: int, *, mgn_mode: str = "isolated",
         pos_side: Optional[str] = None,
@@ -279,6 +290,47 @@ class OKXClient:
             params["instId"] = to_okx_inst_id(symbol)
         return await self._request("GET", "/api/v5/trade/orders-pending", params=params, auth=True)
 
+    async def get_pending_algos(
+        self, symbol: Optional[str] = None, *, algo_type: str = "conditional",
+    ) -> Dict[str, Any]:
+        """List currently-resting algo orders (TP/SL attached or standalone)."""
+        params: Dict[str, Any] = {"ordType": algo_type, "instType": "SWAP"}
+        if symbol is not None:
+            params["instId"] = to_okx_inst_id(symbol)
+        return await self._request("GET", "/api/v5/trade/orders-algo-pending", params=params, auth=True)
+
+    async def cancel_algos(
+        self, symbol: str, algo_ids: List[str],
+    ) -> Dict[str, Any]:
+        """Cancel one or more algo orders (max 10 per call per OKX spec)."""
+        if not algo_ids:
+            return {"code": "0", "data": []}
+        body: List[Dict[str, Any]] = [
+            {"instId": to_okx_inst_id(symbol), "algoId": str(a)} for a in algo_ids[:10]
+        ]
+        return await self._request(
+            "POST", "/api/v5/trade/cancel-algos", body=body, auth=True,
+        )
+
+    async def close_position_market(
+        self, symbol: str, *,
+        mgn_mode: str = "isolated",
+        pos_side: Optional[str] = None,
+        ccy: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Force-close the entire position at market (taker). Last-resort fallback."""
+        body: Dict[str, Any] = {
+            "instId": to_okx_inst_id(symbol),
+            "mgnMode": mgn_mode,
+        }
+        if pos_side is not None:
+            body["posSide"] = pos_side
+        if ccy is not None:
+            body["ccy"] = ccy
+        return await self._request(
+            "POST", "/api/v5/trade/close-position", body=body, auth=True,
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -301,7 +353,7 @@ class OKXClient:
         path: str,
         *,
         params: Optional[Dict[str, Any]] = None,
-        body: Optional[Dict[str, Any]] = None,
+        body: Optional[Any] = None,  # dict for most endpoints; list for batch endpoints
         auth: bool = False,
     ) -> Dict[str, Any]:
         if self._session is None:
