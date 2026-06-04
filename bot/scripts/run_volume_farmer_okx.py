@@ -41,7 +41,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from exchange.okx_client import OKXClient, to_okx_bar  # noqa: E402
-from execution.live_volume_executor_okx import LiveVolumeExecutorOKX  # noqa: E402
+from execution.live_volume_executor_okx import EntryRepegConfig, LiveVolumeExecutorOKX  # noqa: E402
+from execution.maker_exit import MakerExitConfig  # noqa: E402
 from execution.volume_farmer import FarmerEvent, VolumeFarmerSession  # noqa: E402
 from monitoring.telegram_notifier import TelegramNotifier  # noqa: E402
 
@@ -413,6 +414,14 @@ def _make_event_handler(
         if intrabar is not None:
             ikey = f"{round(entry, 4)}"
             intrabar[f"{ikey}_msg_id"] = msg_id
+        # Attach entry msg_id to the executor's open trade so the real-fill
+        # callback can thread its reply under the same entry message.
+        if (
+            live_executor is not None
+            and live_executor._open_trade is not None  # noqa: SLF001
+            and msg_id is not None
+        ):
+            live_executor._open_trade.extras["entry_msg_id"] = msg_id  # noqa: SLF001
 
     async def _send_exit(text: str, reply_to: Optional[int]) -> None:
         await notifier.send_and_get_id(text, reply_to_message_id=reply_to)
@@ -605,6 +614,72 @@ def _make_event_handler(
 
     return on_event
 
+
+
+def _make_real_fill_callback(
+    notifier: Optional[TelegramNotifier],
+    symbol: str,
+    mode_label: str,
+    bot_label: str,
+):
+    """Build the executor's on_real_fill callback.
+
+    Emits a follow-up Telegram message after the OKX position resolves,
+    threaded under the entry message. The numbers here come from real fills
+    (avgPx, exchange-reported fees) and may differ from the paper-side exit
+    message that was sent earlier off the simulated TP/SL touch.
+    """
+    _esc = TelegramNotifier.escape
+    _lbl = f"\n{_SEP}\n\\[{_esc(bot_label)}\\]" if bot_label else ""
+
+    async def _on_real_fill(trade) -> None:  # type: LiveTradeOKX
+        if notifier is None or not notifier.enabled:
+            return
+        reason = trade.close_reason or "closed"
+        emoji = {"tp": "✅", "sl": "❌", "time_stop": "⏱"}.get(reason, "📤")
+        gross = float(trade.real_gross_pnl)
+        open_fee = float(trade.real_open_fee)
+        close_fee = float(trade.real_close_fee)
+        net = gross - open_fee - close_fee
+        g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
+        n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
+        # Per-side bps slip vs the paper TP/SL (positive = we got a worse fill).
+        intended_close = trade.tp_px if reason == "tp" else trade.sl_px
+        if intended_close > 0 and trade.close_px > 0:
+            if trade.side == "long":
+                slip = (intended_close - trade.close_px) / intended_close * 10_000
+            else:
+                slip = (trade.close_px - intended_close) / intended_close * 10_000
+        else:
+            slip = 0.0
+        lines = [
+            f"{emoji} *REAL FILL · {_esc(reason.upper())} · "
+            f"{_esc(trade.side.upper())} · {_esc(mode_label)}*",
+            f"{_esc(symbol)}  `{trade.fill_px:,.2f}` → `{trade.close_px:,.2f}`",
+            _SEP,
+            f"Gross   `{g_str}`",
+            f"Open fee  `${open_fee:.4f}`",
+            f"Close fee `${close_fee:.4f}`",
+            f"Net     `{n_str}`",
+            _SEP,
+            f"Slip vs paper  `{slip:+.1f}bps`",
+        ]
+        if trade.exit_path and trade.exit_path != "native_tp_sl":
+            lines.append(
+                f"Exit    `{_esc(trade.exit_path)}` · "
+                f"repegs `{trade.exit_repegs}` · "
+                f"ttf `{trade.exit_ttf_s:.1f}s`"
+            )
+            if trade.exit_adverse_bps:
+                lines.append(f"Adverse `{trade.exit_adverse_bps:.1f}bps`")
+        body = "\n".join(lines) + _lbl
+        entry_msg_id = trade.extras.get("entry_msg_id") if trade.extras else None
+        try:
+            await notifier.send_and_get_id(body, reply_to_message_id=entry_msg_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("real_fill send failed: %s", exc)
+
+    return _on_real_fill
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -1033,14 +1108,36 @@ async def main_async(args: argparse.Namespace) -> int:
     # --demo we want simulated=True; for --live we want simulated=False.
     client_simulated = args.demo and not args.live
 
+    # OKX demo and live use separate API key tiers. When --demo, prefer the
+    # OKX_DEMO_* env vars; fall back to live keys only if demo keys are absent
+    # (in which case authenticated calls will 401 with code=50120 and entries
+    # will silently fail — visible warning emitted here).
+    if client_simulated:
+        api_key = os.environ.get("OKX_DEMO_API_KEY") or os.environ.get("OKX_API_KEY", "")
+        api_secret = os.environ.get("OKX_DEMO_API_SECRET") or os.environ.get("OKX_API_SECRET", "")
+        passphrase = os.environ.get("OKX_DEMO_API_PASSPHRASE") or os.environ.get("OKX_API_PASSPHRASE", "")
+        if not os.environ.get("OKX_DEMO_API_KEY"):
+            LOGGER.warning(
+                "--demo selected but OKX_DEMO_API_KEY not set in .env; falling back to "
+                "live keys which will 401 on authenticated demo calls. Generate demo keys at "
+                "https://www.okx.com/account/demo-trading and add OKX_DEMO_API_KEY/SECRET/PASSPHRASE.",
+            )
+    else:
+        api_key = os.environ.get("OKX_API_KEY", "")
+        api_secret = os.environ.get("OKX_API_SECRET", "")
+        passphrase = os.environ.get("OKX_API_PASSPHRASE", "")
+
     async with OKXClient(
-        api_key=os.environ.get("OKX_API_KEY", ""),
-        api_secret=os.environ.get("OKX_API_SECRET", ""),
-        passphrase=os.environ.get("OKX_API_PASSPHRASE", ""),
+        api_key=api_key, api_secret=api_secret, passphrase=passphrase,
         simulated=client_simulated,
     ) as client:
         live_executor: Optional[LiveVolumeExecutorOKX] = None
         if is_live_or_demo:
+            farmer_cfg = cfg.get("farmer", {}) or {}
+            ts_cfg = farmer_cfg.get("time_stop", {}) or {}
+            mx_cfg = farmer_cfg.get("maker_exit", {}) or {}
+            er_cfg = farmer_cfg.get("entry_repeg", {}) or {}
+            tf_seconds = _parse_timeframe_seconds(tf)
             live_executor = LiveVolumeExecutorOKX(
                 client=client,
                 symbol=symbol,
@@ -1049,12 +1146,50 @@ async def main_async(args: argparse.Namespace) -> int:
                 max_live_trades=args.max_live_trades,
                 dry_run=args.live_dry_run,
                 log_dir=log_dir,
+                time_stop_enabled=bool(ts_cfg.get("enabled", False)),
+                max_hold_bars=int(ts_cfg.get(
+                    "max_hold_bars", farmer_cfg.get("max_hold_bars", 2),
+                )),
+                bar_seconds=int(ts_cfg.get("bar_seconds", tf_seconds)),
+                maker_exit_enabled=bool(mx_cfg.get("enabled", False)),
+                maker_exit_cfg=MakerExitConfig(
+                    repeg_ms=int(mx_cfg.get("repeg_ms", 750)),
+                    max_repegs=int(mx_cfg.get("max_repegs", 8)),
+                    max_exit_seconds=float(mx_cfg.get("max_exit_seconds", 20.0)),
+                    max_adverse_bps=float(mx_cfg.get("max_adverse_bps", 15.0)),
+                    poll_ms=int(mx_cfg.get("poll_ms", 120)),
+                ),
+                entry_repeg_cfg=EntryRepegConfig(
+                    enabled=bool(er_cfg.get("enabled", True)),
+                    repeg_ms=int(er_cfg.get("repeg_ms", 8_000)),
+                    max_repegs=int(er_cfg.get("max_repegs", 6)),
+                    max_entry_seconds=float(er_cfg.get("max_entry_seconds", 60.0)),
+                    poll_ms=int(er_cfg.get("poll_ms", 150)),
+                    taker_fallback=bool(er_cfg.get("taker_fallback", False)),
+                ),
+            )
+            LOGGER.info(
+                "live executor: time_stop=%s (max_hold=%d bars, %ds each), maker_exit=%s, "
+                "entry_repeg=%s (max_repegs=%d, repeg_ms=%d, max_secs=%.0f, taker_fallback=%s)",
+                live_executor.time_stop_enabled, live_executor.max_hold_bars,
+                live_executor.bar_seconds, live_executor.maker_exit_enabled,
+                live_executor.entry_repeg_cfg.enabled,
+                live_executor.entry_repeg_cfg.max_repegs,
+                live_executor.entry_repeg_cfg.repeg_ms,
+                live_executor.entry_repeg_cfg.max_entry_seconds,
+                live_executor.entry_repeg_cfg.taker_fallback,
             )
             try:
                 await live_executor.initialize(leverage_cap=args.live_leverage)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("live executor init failed: %s", exc)
                 return 2
+            live_executor.on_real_fill = _make_real_fill_callback(
+                notifier,
+                symbol,
+                mode_label=("LIVE" if args.live else "DEMO"),
+                bot_label=args.label or "okx-paper",
+            )
 
         try:
             history = await _seed_history(client, symbol, tf, SEED_CANDLES)
@@ -1111,13 +1246,15 @@ async def main_async(args: argparse.Namespace) -> int:
             limit_tp = cfg.get("farmer", {}).get("limit_tp", False)
             min_lev = cfg.get("farmer", {}).get("sizing", {}).get("min_leverage", 5)
             max_lev = cfg.get("farmer", {}).get("sizing", {}).get("max_leverage", 125)
+            okx_cap = args.live_leverage if is_live_or_demo else None
+            okx_cap_line = f"  ·  OKX cap `{okx_cap}×`" if okx_cap else ""
             vol_target = cfg.get("target", {}).get("volume_usd", 0)
             startup_msg = (
                 f"🚀 *vGen OKX · {_esc(mode_label)}*\n"
                 f"{_esc(symbol)} · {_esc(tf)}\n"
                 f"{_SEP}\n"
                 f"Capital    `${cap:.2f}`\n"
-                f"Lev        `{min_lev}-{max_lev}×` \\(dynamic\\)\n"
+                f"Lev sizing `{min_lev}-{max_lev}×` \\(dynamic\\){okx_cap_line}\n"
                 f"ATR filter `≥${atr_min:.0f}` \\(Wilder\\-14\\)\n"
                 f"TP `{atr_tp_mult}×` ATR  ·  SL `{atr_sl_mult}×` ATR\n"
                 f"Limit TP   `{'✓' if limit_tp else '✗'}` \\(maker fill\\)\n"
