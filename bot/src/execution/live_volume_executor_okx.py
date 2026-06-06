@@ -152,6 +152,12 @@ class LiveVolumeExecutorOKX:
     position_poll_s: float = 3.0
     position_watch_max_s: float = 6 * 3600.0   # 6 hours max
     max_live_trades: int = 1_000_000
+    # When > 0, size each real order off the LIVE OKX wallet balance
+    # (notional = balance × margin_frac × leverage) instead of the simulation's
+    # seeded/drifting equity — so position size always tracks the real account
+    # and never a hardcoded capital_usd. Leverage is equity-independent so the
+    # SIM's leverage is reused. 0 disables (falls back to the SIM's notional).
+    margin_frac: float = 0.0
     dry_run: bool = False
     log_dir: pathlib.Path = field(default_factory=lambda: pathlib.Path("data/logs"))
     # Feature 1 — time-stop (close non-winning trades at touch instead of letting
@@ -168,10 +174,45 @@ class LiveVolumeExecutorOKX:
     # timeout-cancel problem in trending markets where the bar-close reference
     # price goes stale within seconds.
     entry_repeg_cfg: EntryRepegConfig = field(default_factory=EntryRepegConfig)
-    # Fires once per resolved trade with the real OKX fill record. Caller can
-    # use it to emit a Telegram message reflecting actual fills (paper exit
-    # messages quote simulated TP/SL prices, which diverge from reality).
+    # ------------------------------------------------------------------
+    # OKX-confirmed lifecycle callbacks. Each fires ONLY at a real exchange
+    # confirmation point so Telegram never announces a trade the exchange did
+    # not actually make. This is the spine of the "real OKX panel" messaging:
+    #   on_entry_filled    -> a position is CONFIRMED open (get_order filled)
+    #   on_entry_abandoned -> the entry never filled (repeg-exhausted/reject)
+    #   on_close_confirmed -> the position is CONFIRMED flat AND priced
+    #   on_close_unverified-> closed-but-unpriced, or close failed (still open)
+    # ------------------------------------------------------------------
+    on_entry_filled: Optional[Callable[[LiveTradeOKX], Awaitable[None]]] = field(default=None)
+    on_entry_abandoned: Optional[Callable[[LiveTradeOKX], Awaitable[None]]] = field(default=None)
+    on_close_confirmed: Optional[Callable[[LiveTradeOKX], Awaitable[None]]] = field(default=None)
+    on_close_unverified: Optional[Callable[[LiveTradeOKX], Awaitable[None]]] = field(default=None)
+    # Back-compat alias for the close card. When on_close_confirmed is unset the
+    # finalizer falls back to on_real_fill so existing wiring keeps working.
     on_real_fill: Optional[Callable[[LiveTradeOKX], Awaitable[None]]] = field(default=None)
+    # Real-money safety bounds for the confirmation machinery:
+    #   callback_timeout_s — a hung Telegram/account fetch can never wedge the
+    #     close watcher (which must reset _open_trade to unblock new entries).
+    #   fast_poll_window_s — poll faster right after a fill so a fast TP that
+    #     closes within one normal poll is still seen (no missed close card).
+    #   flat_confirm_polls — require N consecutive flat polls before treating a
+    #     never-seen-open position as closed (guards positions-lag after entry).
+    #   flat_giveup_polls  — after this many confirmed-flat-but-unpriceable
+    #     polls, finalize as unverified instead of hanging the gate.
+    callback_timeout_s: float = 15.0
+    fast_poll_window_s: float = 8.0
+    flat_confirm_polls: int = 2
+    flat_giveup_polls: int = 12
+    # Close-confirmation: how long to wait for /positions to read flat after a
+    # close fills (it lags the fill by a second or two — polling until flat,
+    # rather than a couple of quick checks, stops that lag from falsely
+    # tripping the "still open" hold). And how often the recovery watcher
+    # re-checks a held position so the entry gate is NEVER wedged permanently.
+    flat_timeout_s: float = 12.0
+    recover_poll_s: float = 10.0
+    # Backoff base for the last-resort retried market close (_force_market_close);
+    # attempts sleep base, 2×base, 4×base … capped at 4s. Small in tests.
+    force_close_base_delay_s: float = 0.5
 
     # Per-trade entry-repeg metrics (most-recent attempt only — for log line)
     _last_entry_repegs: int = field(default=0, init=False)
@@ -188,6 +229,10 @@ class LiveVolumeExecutorOKX:
     _trade_count: int = field(default=0, init=False)
     _watcher_task: Optional[asyncio.Task] = field(default=None, init=False)
     _initialized: bool = field(default=False, init=False)
+    # Serializes the strategy's own close path (time-stop / maker-exit) against an
+    # operator-triggered manual close from Telegram, so the two can't fire
+    # competing close orders / cancels on the same position concurrently.
+    _close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def initialize(self, leverage_cap: int = 50) -> None:
         """One-time setup: load instrument spec, set leverage."""
@@ -216,6 +261,182 @@ class LiveVolumeExecutorOKX:
         self._initialized = True
 
     # ------------------------------------------------------------------
+    # OKX-confirmation helpers (shared by entry + close paths)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _position_qty(resp: Dict[str, Any]) -> float:
+        """Signed contract qty of the open position in a /positions response (0 if flat)."""
+        for p in resp.get("data") or []:
+            try:
+                q = float(p.get("pos") or 0.0)
+            except (TypeError, ValueError):
+                q = 0.0
+            if q != 0.0:
+                return q
+        return 0.0
+
+    async def _safe_callback(
+        self, cb: Optional[Callable], trade: LiveTradeOKX, name: str,
+    ) -> None:
+        """Fire a user callback bounded by a timeout; never propagate or hang.
+
+        A confirmation callback does Telegram I/O and a real-account fetch. It
+        must never be able to wedge the close watcher — if it hung, the
+        ``_open_trade`` reset that unblocks new entries would never run. So we
+        time-box it and swallow everything.
+        """
+        if cb is None:
+            return
+        try:
+            await asyncio.wait_for(cb(trade), timeout=self.callback_timeout_s)
+        except asyncio.TimeoutError:
+            LOGGER.error("%s callback timed out after %.0fs (cid=%s)",
+                         name, self.callback_timeout_s, trade.cl_ord_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("%s callback failed: %s", name, exc)
+
+    async def _confirm_flat(
+        self, *, timeout_s: Optional[float] = None, poll_s: float = 0.5,
+    ) -> Optional[bool]:
+        """Poll /positions until the position reads flat, or until timeout.
+
+        Returns True as soon as ANY poll reads flat (the position genuinely
+        closed), False only if it never goes flat within the window (a real
+        stuck position), None if every poll errored. Polling-until-flat rather
+        than a couple of quick checks is the fix for the gate-wedge bug: after a
+        maker-exit fills, /positions lags the fill by a second or two, and a
+        single lagging "still open" read used to trip a permanent hold. We now
+        wait the lag out (returning the instant it reads flat, so no slowdown in
+        the normal case).
+        """
+        deadline = time.time() + (self.flat_timeout_s if timeout_s is None else timeout_s)
+        seen = False
+        while time.time() < deadline:
+            try:
+                r = await self.client.get_positions(self.symbol)
+                seen = True
+                if self._position_qty(r) == 0.0:
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("_confirm_flat: positions fetch failed: %s", exc)
+            await asyncio.sleep(poll_s)
+        return False if seen else None
+
+    async def _recover_stuck_position(self, trade: LiveTradeOKX) -> None:
+        """Re-poll a 'still open' position until OKX reads flat, then release the
+        entry gate. The hold is NEVER permanent: a slow/lagging close clears in
+        seconds, a genuinely stuck position clears whenever it actually closes,
+        and either way trading resumes automatically instead of staying dead
+        until a restart.
+
+        Critically, this does not just WAIT — on every cycle that still reads
+        open it RE-ATTEMPTS a market close. The maker-exit's single best-effort
+        taker fallback can be rejected or rate-limited (OKX 50011 isn't retried
+        on POSTs) and give up; this keeps slamming a reduceOnly market close
+        until the exchange actually reports flat, so a real-money position can't
+        sit open just because one close request bounced.
+        """
+        LOGGER.warning("recovery watcher armed for cid=%s — retrying market close until flat",
+                       trade.cl_ord_id)
+        pos_side_param = trade.side if self.pos_mode == "hedge" else None
+        while self._open_trade is trade:
+            await asyncio.sleep(self.recover_poll_s)
+            try:
+                r = await self.client.get_positions(self.symbol)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("recovery poll failed: %s", exc)
+                continue
+            if self._position_qty(r) == 0.0:
+                LOGGER.info("cid=%s now flat on OKX — releasing entry gate, resuming trading",
+                            trade.cl_ord_id)
+                if self._open_trade is trade:
+                    self._open_trade = None
+                return
+            # Still open — actively re-attempt a market close instead of waiting.
+            if self.dry_run:
+                continue
+            try:
+                resp = await self.client.close_position_market(
+                    self.symbol, mgn_mode=self.mgn_mode,
+                    pos_side=pos_side_param, auto_cxl=True,
+                )
+                cdata = (resp.get("data") or [{}])[0]
+                LOGGER.warning("recovery: re-attempted market close cid=%s sCode=%s sMsg=%r",
+                               trade.cl_ord_id, cdata.get("sCode"), cdata.get("sMsg"))
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("recovery close attempt failed: %s", exc)
+
+    async def _force_market_close(self, trade: LiveTradeOKX, *, attempts: int = 4) -> bool:
+        """Last-resort backstop: hammer a market close until /positions reads flat.
+
+        The maker-exit's single best-effort taker fallback can be rejected or
+        rate-limited and then silently give up, stranding a real-money position.
+        This retries close_position_market with exponential backoff, re-checking
+        flat between attempts. Returns True once OKX confirms flat, False if it
+        still shows open after all attempts (caller then routes to the alert +
+        recovery watcher, which keeps retrying).
+        """
+        if self.dry_run:
+            return False
+        pos_side_param = trade.side if self.pos_mode == "hedge" else None
+        delay = self.force_close_base_delay_s
+        for i in range(max(1, attempts)):
+            try:
+                r = await self.client.get_positions(self.symbol)
+                if self._position_qty(r) == 0.0:
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("force_close: positions check failed: %s", exc)
+            try:
+                resp = await self.client.close_position_market(
+                    self.symbol, mgn_mode=self.mgn_mode,
+                    pos_side=pos_side_param, auto_cxl=True,
+                )
+                cdata = (resp.get("data") or [{}])[0]
+                cscode = str(cdata.get("sCode", "0"))
+                if cscode != "0":
+                    LOGGER.warning(
+                        "force_close attempt %d/%d rejected sCode=%s sMsg=%r (cid=%s)",
+                        i + 1, attempts, cscode, cdata.get("sMsg"), trade.cl_ord_id,
+                    )
+                else:
+                    trade.extras["forced_market_close"] = True
+                    LOGGER.warning("force_close attempt %d/%d sent market close (cid=%s)",
+                                   i + 1, attempts, trade.cl_ord_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("force_close attempt %d/%d failed: %s", i + 1, attempts, exc)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 4.0)
+        try:
+            r = await self.client.get_positions(self.symbol)
+            return self._position_qty(r) == 0.0
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _fire_entry_filled(self, trade: LiveTradeOKX) -> None:
+        """Announce a CONFIRMED entry fill exactly once."""
+        # Set the guard synchronously (before any await) so concurrent fill
+        # sites / retries can never double-send the entry card.
+        if trade.extras.get("entry_card_sent"):
+            return
+        trade.extras["entry_card_sent"] = True
+        await self._safe_callback(self.on_entry_filled, trade, "on_entry_filled")
+
+    async def _fire_entry_abandoned(self, trade: LiveTradeOKX, reason: str) -> None:
+        """Signal an entry that never filled (abandoned/rejected). Idempotent.
+
+        By default the runner leaves ``on_entry_abandoned`` unset, so this is
+        silent (log only) — the chosen behaviour for no-fills. It remains a
+        clean hook if visibility into miss rate is wanted later.
+        """
+        if trade.extras.get("abandon_fired"):
+            return
+        trade.extras["abandon_fired"] = True
+        if not trade.cancel_reason:
+            trade.cancel_reason = reason
+        await self._safe_callback(self.on_entry_abandoned, trade, "on_entry_abandoned")
+
+    # ------------------------------------------------------------------
     # Hook called by the session's event_callback.
     # ------------------------------------------------------------------
     def consume_session_event(self, evt) -> None:  # type: FarmerEvent
@@ -233,6 +454,50 @@ class LiveVolumeExecutorOKX:
         asyncio.create_task(self._handle_entry(evt.payload))
 
     # ------------------------------------------------------------------
+    async def _fetch_wallet_usdt(self) -> Optional[float]:
+        """Live USDT equity from /account/balance (None on failure)."""
+        try:
+            bal = await self.client.get_balance("USDT")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("balance fetch failed: %s", exc)
+            return None
+        bd = (bal.get("data") or [{}])[0]
+        for det in (bd.get("details") or []):
+            if det.get("ccy") == "USDT":
+                try:
+                    return float(det.get("eq") or 0.0)
+                except (TypeError, ValueError):
+                    return None
+        try:
+            return float(bd.get("totalEq")) if bd.get("totalEq") else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _resize_on_real_balance(self, payload: Dict[str, Any], sim_notional: float) -> float:
+        """Re-base the trade notional on the LIVE OKX wallet balance.
+
+        notional = real_balance × margin_frac × leverage. Leverage is
+        equity-independent (risk%/(margin_frac×SL)), so the SIM's leverage is
+        reused verbatim. Falls back to the SIM's notional if sizing is disabled
+        (margin_frac == 0), in dry-run, or if the balance fetch fails — never a
+        hardcoded capital figure.
+        """
+        if self.margin_frac <= 0 or self.dry_run:
+            return sim_notional
+        lev = float(payload.get("leverage") or 0.0)
+        if lev <= 0:
+            return sim_notional
+        real_bal = await self._fetch_wallet_usdt()
+        if not real_bal or real_bal <= 0:
+            LOGGER.warning("real balance unavailable; falling back to SIM notional $%.2f", sim_notional)
+            return sim_notional
+        notional = real_bal * self.margin_frac * lev
+        LOGGER.info(
+            "sizing on REAL wallet: $%.4f × margin_frac %.3f × lev %.1f = notional $%.2f (sim was $%.2f)",
+            real_bal, self.margin_frac, lev, notional, sim_notional,
+        )
+        return notional
+
     async def _handle_entry(self, payload: Dict[str, Any]) -> None:
         """Place a real OKX order matching the session's entry decision."""
         side = str(payload["side"]).lower()                 # long | short
@@ -242,6 +507,9 @@ class LiveVolumeExecutorOKX:
         sl_px = float(payload["sl"])
         tp_bps = float(payload["tp_bps"])
         sl_bps = float(payload["sl_bps"])
+
+        # Re-base the size on the REAL OKX wallet (not the simulation's equity).
+        notional = await self._resize_on_real_balance(payload, notional)
 
         # Notional USD -> BTC -> contracts (BTC-USDT-SWAP: 1 ct = 0.01 BTC)
         # btc_qty = notional / entry_req
@@ -287,7 +555,15 @@ class LiveVolumeExecutorOKX:
 
         cl_ord_id = "vfox" + uuid.uuid4().hex[:14]
         ok_side = "buy" if side == "long" else "sell"
-        pos_side = "long" if side == "long" else "short" if self.pos_mode == "hedge" else None
+        # posSide is ONLY valid in hedge ("long_short") mode. In net (one-way)
+        # mode OKX rejects any posSide with sCode=51000 "Parameter posSide error",
+        # so it must be omitted entirely (None) for BOTH directions. The previous
+        # one-liner mis-parsed by precedence and always sent "long" for longs.
+        pos_side = (
+            ("long" if side == "long" else "short")
+            if self.pos_mode == "hedge"
+            else None
+        )
 
         trade = LiveTradeOKX(
             cl_ord_id=cl_ord_id, side=side,
@@ -320,7 +596,9 @@ class LiveVolumeExecutorOKX:
                 tp_px_r=tp_px_r, sl_px_r=sl_px_r,
             )
             if not ok:
-                # entry abandoned (re-pegs exhausted) — clean up and skip
+                # entry abandoned (re-pegs exhausted) — no position exists, so
+                # no entry card is sent (silent no-fill); log + release the gate.
+                await self._fire_entry_abandoned(trade, "repeg_exhausted")
                 self._log_trade(trade)
                 self._open_trade = None
                 return
@@ -340,6 +618,7 @@ class LiveVolumeExecutorOKX:
                 LOGGER.exception("place_order failed: %s", exc)
                 trade.canceled = True
                 trade.cancel_reason = f"submit_error: {exc}"
+                await self._fire_entry_abandoned(trade, trade.cancel_reason)
                 self._log_trade(trade)
                 self._open_trade = None
                 return
@@ -349,6 +628,7 @@ class LiveVolumeExecutorOKX:
                              data.get("sCode"), data.get("sMsg"))
                 trade.canceled = True
                 trade.cancel_reason = f"sCode={data.get('sCode')}:{data.get('sMsg')}"
+                await self._fire_entry_abandoned(trade, trade.cancel_reason)
                 self._log_trade(trade)
                 self._open_trade = None
                 return
@@ -356,10 +636,16 @@ class LiveVolumeExecutorOKX:
             LOGGER.info("submitted ordId=%s (cid=%s)", trade.ord_id, trade.cl_ord_id)
             filled = await self._wait_for_entry_fill_or_timeout(trade)
             if not filled:
+                await self._fire_entry_abandoned(trade, trade.cancel_reason or "post_only_timeout")
                 self._log_trade(trade)
                 self._open_trade = None
                 return
 
+        # Entry is CONFIRMED filled on OKX (only reachable when a real position
+        # exists). Fire the entry card here — the single point where a real fill
+        # is known. Bounded inside _safe_callback so a slow Telegram/account
+        # fetch can never delay the close watcher below.
+        await self._fire_entry_filled(trade)
         # Position is open — start the position + time-stop watch.
         await self._watch_open_position(trade)
 
@@ -517,13 +803,12 @@ class LiveVolumeExecutorOKX:
         )
         cl_ord = "vfoxk" + uuid.uuid4().hex[:13]
         trade.cl_ord_id = cl_ord
-        # OKX V5 quirk: market orders in net_mode want posSide explicitly set
-        # to "net" (post_only orders tolerate it being omitted). Without this,
-        # OKX returns sCode=51000 "Parameter posSide error" and the fallback
-        # never lands.
-        pos_side_for_market = pos_side if pos_side is not None else (
-            "net" if self.pos_mode == "net" else None
-        )
+        # posSide must match the account position mode: long/short in hedge mode,
+        # omitted in net (one-way) mode. Sending "net" (or any posSide) on a
+        # net-mode account makes OKX reject the market fallback with sCode=51000
+        # "Parameter posSide error", so just pass the same posSide we computed for
+        # the maker entry (None in net mode).
+        pos_side_for_market = pos_side
         try:
             resp = await self.client.place_order(
                 symbol=self.symbol,
@@ -610,29 +895,157 @@ class LiveVolumeExecutorOKX:
         return trade.filled
 
     async def _watch_open_position(self, trade: LiveTradeOKX) -> None:
-        """Race native TP/SL watcher vs time-stop watcher until position closes."""
-        tasks: List[asyncio.Task] = [
-            asyncio.create_task(self._watch_position(trade), name="watch_position"),
-        ]
-        if self.time_stop_enabled:
-            tasks.append(asyncio.create_task(
-                self._watch_time_stop(trade), name="watch_time_stop",
-            ))
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-        for t in pending:
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+        """Race native TP/SL watcher vs time-stop watcher, then finalize + announce.
+
+        The close card is gated on a VERIFIED close (OKX shows flat AND we have
+        a real close price/PnL) so we never announce a close that did not happen
+        or print fabricated zeros. The _open_trade reset runs in ``finally`` so a
+        hung callback cannot wedge the new-entry gate — EXCEPT when the exchange
+        still shows the position open (a failed close), where we deliberately
+        hold the gate so a second position can never be stacked on top.
+        """
+        try:
+            tasks: List[asyncio.Task] = [
+                asyncio.create_task(self._watch_position(trade), name="watch_position"),
+            ]
+            if self.time_stop_enabled:
+                tasks.append(asyncio.create_task(
+                    self._watch_time_stop(trade), name="watch_time_stop",
+                ))
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+            await self._finalize_and_announce(trade)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("watch_open_position error (cid=%s): %s", trade.cl_ord_id, exc)
+        finally:
+            # Release the gate, but ONLY if it still points at THIS trade — never
+            # clobber a different trade's gate. Hold it when OKX still shows this
+            # position open (never stack a second position; the unverified alert
+            # already prompted the operator). If a manual close already released
+            # and a new trade took the slot, `_open_trade is trade` is False so we
+            # correctly leave the new trade's gate intact.
+            if self._open_trade is trade and not trade.extras.get("still_open"):
+                self._open_trade = None
+
+    async def _finalize_and_announce(self, trade: LiveTradeOKX) -> None:
+        """Decide verified-close vs unverified, log once, and fire one card.
+
+        Runs exactly once per trade. A close is VERIFIED only when OKX confirms
+        the position is flat (re-poll) AND we have a real close price. Verified
+        closes prefer OKX's authoritative realized pnl. Everything else routes
+        to the unverified-close alert with the reason — never a fake fill card.
+        """
+        if trade.extras.get("close_finalized"):
+            return
+        trade.extras["close_finalized"] = True
+
+        flat = await self._confirm_flat()
+        have_price = bool(trade.closed and trade.close_px > 0)
+        # Confirmed flat but never priced (e.g. time-stop saw it already flat and
+        # cancelled the price watcher) — make one final attempt to price it.
+        if flat is True and not have_price:
+            if await self._resolve_close(trade):
+                have_price = bool(trade.closed and trade.close_px > 0)
+
+        if flat is True and have_price:
+            await self._reconcile_okx_pnl(trade)
+            trade.extras["close_verified"] = True
+            self._log_trade(trade)
+            await self._safe_callback(
+                self.on_close_confirmed or self.on_real_fill, trade, "on_close_confirmed",
+            )
+            return
+
+        # ---- Close not verified flat. Before declaring it stuck, FORCE it.
+        if flat is False:
+            # The maker-exit's lone taker fallback may have been rejected/throttled
+            # and silently given up. Hammer a retried market close — the guaranteed
+            # flatten the operator would otherwise have to do by hand.
+            if await self._force_market_close(trade):
+                LOGGER.info("force_close flattened the position (cid=%s) — finalizing",
+                            trade.cl_ord_id)
+                if not (trade.closed and trade.close_px > 0):
+                    await self._resolve_close(trade)
+                if trade.closed and trade.close_px > 0:
+                    await self._reconcile_okx_pnl(trade)
+                    trade.extras["close_verified"] = True
+                    self._log_trade(trade)
+                    await self._safe_callback(
+                        self.on_close_confirmed or self.on_real_fill,
+                        trade, "on_close_confirmed",
+                    )
+                    return
+                # Flat now but couldn't price it → flat-but-unpriced unverified.
+                flat = True
+            else:
+                trade.extras["still_open"] = True
+                trade.closed = False
+                trade.close_reason = "close_failed_still_open"
+                LOGGER.error(
+                    "CLOSE UNVERIFIED — OKX still shows a position open after force-close "
+                    "attempts (cid=%s); pausing entries until flat (recovery keeps retrying)",
+                    trade.cl_ord_id,
+                )
+                # Self-healing hold: the recovery watcher keeps re-attempting the
+                # close AND releases the gate the moment OKX reports flat.
+                asyncio.create_task(self._recover_stuck_position(trade))
+
+        if flat is not False:
+            # flat is True (incl. forced-flat-but-unpriced) or None (all polls errored)
+            trade.close_reason = trade.close_reason or "unverified_close"
+            LOGGER.warning(
+                "CLOSE UNVERIFIED — flat=%s close_px=%.2f (cid=%s reason=%s)",
+                flat, trade.close_px, trade.cl_ord_id, trade.close_reason,
+            )
         self._log_trade(trade)
-        if self.on_real_fill is not None and trade.filled and trade.closed:
+        await self._safe_callback(self.on_close_unverified, trade, "on_close_unverified")
+
+    async def _reconcile_okx_pnl(self, trade: LiveTradeOKX) -> None:
+        """Best-effort: replace gross PnL with OKX's authoritative realized pnl.
+
+        Sums ``pnl`` over all filled closing orders (opposite side, fillTime >=
+        entry) — for a multi-peg maker exit that is the sum across the close
+        ordIds. Leaves the existing (recomputed) gross untouched if history is
+        unavailable. Because the executor holds one position at a time and this
+        runs immediately after the close, the only opposite-side fills after the
+        entry timestamp belong to THIS trade.
+        """
+        exp_close_side = "sell" if trade.side == "long" else "buy"
+        try:
+            r = await self.client.get_orders_history(self.symbol, limit=50)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("_reconcile_okx_pnl: history fetch failed: %s", exc)
+            trade.extras.setdefault("pnl_source", "recomputed")
+            return
+        pnl_sum = 0.0
+        fee_sum = 0.0
+        matched = 0
+        for o in r.get("data") or []:
+            if str(o.get("state", "")) != "filled":
+                continue
+            if str(o.get("side", "")) != exp_close_side:
+                continue
+            if int(o.get("fillTime") or 0) < trade.fill_ts:
+                continue
             try:
-                await self.on_real_fill(trade)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("on_real_fill callback failed: %s", exc)
-        self._open_trade = None
+                pnl_sum += float(o.get("pnl") or 0.0)
+                fee_sum += abs(float(o.get("fee") or 0.0))
+                matched += 1
+            except (TypeError, ValueError):
+                continue
+        if matched:
+            trade.real_gross_pnl = pnl_sum
+            if fee_sum > 0:
+                trade.real_close_fee = fee_sum
+            trade.extras["pnl_source"] = "okx"
+        else:
+            trade.extras.setdefault("pnl_source", "recomputed")
 
     async def _watch_time_stop(self, trade: LiveTradeOKX) -> None:
         """Fire a maker-first close once ``max_hold_bars`` have elapsed since fill.
@@ -678,25 +1091,52 @@ class LiveVolumeExecutorOKX:
             "TIME-STOP firing: cid=%s held >= %d bars (%ds each); closing via maker exit",
             trade.cl_ord_id, self.max_hold_bars, self.bar_seconds,
         )
-        await cancel_attached_algos(self.client, self.symbol)
-        await self._maker_close(trade, reason="time_stop", abs_qty=abs(qty))
+        # Serialize against an operator manual close. Re-check flat INSIDE the
+        # lock: the operator may have flattened it (or tagged it "manual") in the
+        # window between the qty read above and acquiring the lock.
+        async with self._close_lock:
+            if trade.close_reason == "manual" or trade.closed:
+                LOGGER.info("time_stop: superseded by manual close (cid=%s)", trade.cl_ord_id)
+                return
+            try:
+                r2 = await self.client.get_positions(self.symbol)
+                if self._position_qty(r2) == 0.0:
+                    LOGGER.info("time_stop: flat after lock (manual close?) cid=%s",
+                                trade.cl_ord_id)
+                    return
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("time_stop: re-check positions failed: %s", exc)
+            await cancel_attached_algos(self.client, self.symbol)
+            await self._maker_close(trade, reason="time_stop", abs_qty=abs(qty))
 
     async def _maker_close(
         self, trade: LiveTradeOKX, *, reason: str, abs_qty: float,
     ) -> None:
-        """Run the maker-exit re-peg loop and reconcile the trade record."""
+        """Close the position. With maker_exit disabled this is a straight market
+        (taker) close — chosen for reliability; with it enabled, the maker-first
+        re-peg loop runs.
+        """
         if not self.maker_exit_enabled:
-            # Fallback: native market close (taker). Still records the path.
-            LOGGER.info("maker_exit disabled — falling back to market close cid=%s",
+            # Direct market (taker) close — the configured exit policy. autoCxl
+            # sweeps any lingering close order so the market close can't be
+            # rejected by a conflict. A bounced order is caught by the finalizer's
+            # retried force-close backstop, so this can't strand the position.
+            LOGGER.info("maker_exit disabled — closing at market (taker) cid=%s",
                         trade.cl_ord_id)
             try:
                 pos_side_param = (
                     trade.side if self.pos_mode == "hedge" else None
                 )
-                await self.client.close_position_market(
+                resp = await self.client.close_position_market(
                     self.symbol, mgn_mode=self.mgn_mode, pos_side=pos_side_param,
+                    auto_cxl=True,
                 )
-                trade.exit_path = "taker_fallback"
+                cdata = (resp.get("data") or [{}])[0]
+                cscode = str(cdata.get("sCode", "0"))
+                if cscode != "0":
+                    LOGGER.error("close_position_market rejected sCode=%s sMsg=%r (cid=%s)",
+                                 cscode, cdata.get("sMsg"), trade.cl_ord_id)
+                trade.exit_path = "taker_market"
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("close_position_market failed: %s", exc)
             await self._resolve_close(trade)
@@ -713,6 +1153,7 @@ class LiveVolumeExecutorOKX:
             sz_contracts=abs_qty,
             tick_sz=self._tick_sz,
             lot_sz=self._lot_sz,
+            ct_val=self._ct_val,
             intended_exit_px=intended_px,
             pos_side_param=pos_side_param,
             td_mode=self.mgn_mode,
@@ -755,95 +1196,144 @@ class LiveVolumeExecutorOKX:
             )
 
     async def _watch_position(self, trade: LiveTradeOKX) -> None:
+        """Poll /positions until the position closes, then resolve its price/PnL.
+
+        Two hardenings over the naive open->flat edge watcher:
+          * Fast poll for the first ``fast_poll_window_s`` after the fill so a
+            quick TP that closes inside one normal poll is still seen — without
+            this a fast fill produced ZERO close cards and pinned the gate.
+          * A never-seen-open position is treated as closed only after
+            ``flat_confirm_polls`` consecutive flat reads (guards positions-lag
+            right after entry). If a close can't be priced after
+            ``flat_giveup_polls`` confirmed-flat polls we stop so the finalizer
+            can route it to the unverified path instead of hanging for hours.
+        """
         start = time.time()
         last_seen_open = False
+        consecutive_flat = 0
         while time.time() - start < self.position_watch_max_s:
-            await asyncio.sleep(self.position_poll_s)
+            elapsed = time.time() - start
+            sleep_s = 0.5 if elapsed < self.fast_poll_window_s else self.position_poll_s
+            await asyncio.sleep(sleep_s)
             try:
                 r = await self.client.get_positions(self.symbol)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("get_positions failed: %s", exc)
                 continue
-            positions = r.get("data") or []
-            qty = 0.0
-            for p in positions:
-                pos_str = p.get("pos") or "0"
-                try:
-                    qty = float(pos_str)
-                except ValueError:
-                    qty = 0.0
-                if qty != 0.0:
-                    break
+            qty = self._position_qty(r)
             if qty != 0.0:
                 last_seen_open = True
+                consecutive_flat = 0
                 continue
-            if last_seen_open:
-                # Was open, now flat → position closed.
-                await self._resolve_close(trade)
+            # qty == 0
+            consecutive_flat += 1
+            # Don't act on a single flat read before we've ever seen the position
+            # open — that is usually positions-lag right after entry, not a close.
+            if not last_seen_open and consecutive_flat < self.flat_confirm_polls:
+                continue
+            # Looks closed — try to price the close from order history.
+            if await self._resolve_close(trade):
                 return
-        LOGGER.warning("position watch timed out for cid=%s", trade.cl_ord_id)
-        trade.close_reason = "watch_timeout"
+            # Couldn't price it. If flat has persisted long enough, give up so
+            # the finalizer routes to the unverified-close alert (no hang).
+            if consecutive_flat >= self.flat_giveup_polls:
+                trade.close_reason = trade.close_reason or "unmatched_close"
+                return
+            # else: history lag or a false flat — keep watching.
+        LOGGER.warning("position watch timed out for cid=%s — final resolve attempt",
+                       trade.cl_ord_id)
+        trade.close_reason = trade.close_reason or "watch_timeout"
+        await self._resolve_close(trade)
 
-    async def _resolve_close(self, trade: LiveTradeOKX) -> None:
-        """Look up the last reduceOnly fill to identify exit price and reason."""
-        try:
-            # The attached algo's fill appears in order history as a reduceOnly
-            # order. Pull the most recent one matching our side.
-            r = await self.client._request(  # noqa: SLF001 — fallback to raw
-                "GET", "/api/v5/trade/orders-history",
-                params={"instType": "SWAP",
-                        "instId": to_okx_inst_id(self.symbol),
-                        "limit": "10"},
-                auth=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("orders-history fetch failed: %s", exc)
-            trade.closed = True
-            trade.close_reason = "history_fetch_failed"
-            return
+    async def _resolve_close(self, trade: LiveTradeOKX) -> bool:
+        """Match the closing fill in order history for exit price/fee/pnl.
 
-        for o in r.get("data") or []:
-            if str(o.get("reduceOnly", "false")).lower() != "true":
+        Returns True ONLY when a real closing fill is matched (a priced close).
+        On no-match or a fetch error it returns False WITHOUT marking the trade
+        closed — the caller decides whether to keep watching or route to the
+        unverified-close path. (Previously this set ``closed=True`` with a zero
+        price on failure, which surfaced as a fabricated "$0.00 REAL FILL".)
+
+        OKX net (one-way) mode does NOT flag the maker-exit / TP / time-stop
+        close as reduceOnly, so we match purely on: filled, opposite side, on or
+        after our entry fill. The executor holds one position at a time and
+        gates new entries until this trade is finalized, so the newest such
+        order IS our close. order-history can lag /positions by a few hundred ms,
+        hence the bounded retries.
+        """
+        okx_pnl_str = None
+        for attempt in range(3):
+            try:
+                r = await self.client.get_orders_history(self.symbol, limit=30)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("orders-history fetch failed: %s", exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
                 continue
-            if str(o.get("state", "")) != "filled":
-                continue
-            # Match: opposite side, after our fill_ts
-            exp_close_side = "sell" if trade.side == "long" else "buy"
-            if str(o.get("side", "")) != exp_close_side:
-                continue
-            close_ts = int(o.get("fillTime") or 0)
-            if close_ts < trade.fill_ts:
-                continue
-            trade.close_px = float(o.get("avgPx") or 0.0)
-            trade.close_ts = close_ts
-            trade.real_close_fee = abs(float(o.get("fee") or 0.0))
-            # Identify TP vs SL by proximity (tolerant of slippage)
-            d_tp = abs(trade.close_px - trade.tp_px)
-            d_sl = abs(trade.close_px - trade.sl_px)
-            trade.close_reason = "tp" if d_tp < d_sl else "sl"
-            break
+
+            for o in r.get("data") or []:
+                if str(o.get("state", "")) != "filled":
+                    continue
+                exp_close_side = "sell" if trade.side == "long" else "buy"
+                if str(o.get("side", "")) != exp_close_side:
+                    continue
+                close_ts = int(o.get("fillTime") or 0)
+                if close_ts < trade.fill_ts:
+                    continue
+                trade.close_px = float(o.get("avgPx") or 0.0)
+                trade.close_ts = close_ts
+                trade.real_close_fee = abs(float(o.get("fee") or 0.0))
+                okx_pnl_str = o.get("pnl")
+                # Identify TP vs SL by proximity (tolerant of slippage) — UNLESS
+                # the operator already tagged this as a manual close from
+                # Telegram, in which case keep "manual" so the card/stats don't
+                # mislabel an operator flatten as a strategy TP/SL exit.
+                if trade.close_reason != "manual":
+                    d_tp = abs(trade.close_px - trade.tp_px)
+                    d_sl = abs(trade.close_px - trade.sl_px)
+                    trade.close_reason = "tp" if d_tp < d_sl else "sl"
+                break
+
+            if trade.close_px != 0.0:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.5)   # let order-history catch up, then refetch
 
         if trade.close_px == 0.0:
-            LOGGER.warning("could not match close fill for cid=%s", trade.cl_ord_id)
-            trade.closed = True
-            trade.close_reason = "unmatched_close"
-            return
+            LOGGER.warning("could not match close fill for cid=%s (will retry/verify)",
+                           trade.cl_ord_id)
+            return False
 
-        # Realized gross PnL
-        if trade.side == "long":
-            trade.real_gross_pnl = (trade.close_px - trade.fill_px) * trade.sz_contracts * self._ct_val
-        else:
-            trade.real_gross_pnl = (trade.fill_px - trade.close_px) * trade.sz_contracts * self._ct_val
+        # Realized gross PnL — prefer OKX's own authoritative `pnl`; recompute
+        # from fill/close prices if it's absent OR the literal "0"/"" string
+        # (don't silently log $0 on a real close).
+        gross = None
+        if okx_pnl_str not in (None, "", "0"):
+            try:
+                gross = float(okx_pnl_str)
+            except (TypeError, ValueError):
+                gross = None
+        if gross is None:
+            if trade.side == "long":
+                gross = (trade.close_px - trade.fill_px) * trade.sz_contracts * self._ct_val
+            else:
+                gross = (trade.fill_px - trade.close_px) * trade.sz_contracts * self._ct_val
+        trade.real_gross_pnl = gross
         trade.closed = True
         LOGGER.info(
             "CLOSE cid=%s reason=%s  fill_px=%.2f -> close_px=%.2f  gross=%+.4f  fees=%.6f+%.6f",
             trade.cl_ord_id, trade.close_reason, trade.fill_px, trade.close_px,
             trade.real_gross_pnl, trade.real_open_fee, trade.real_close_fee,
         )
+        return True
 
     def _log_trade(self, trade: LiveTradeOKX) -> None:
         rec = {
             "ts": datetime.now(tz=timezone.utc).isoformat(),
+            # Real money vs OKX demo (x-simulated-trading). Demo fills land in
+            # the same live_trades/ log, so tag each record and let readers
+            # (Telegram /status /fees /trades) count only real-money trades.
+            "live": (not getattr(self.client, "_simulated", False)) and not self.dry_run,  # noqa: SLF001
             "symbol": to_okx_inst_id(self.symbol),
             "cl_ord_id": trade.cl_ord_id,
             "ord_id": trade.ord_id,

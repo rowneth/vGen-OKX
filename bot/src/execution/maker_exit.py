@@ -105,6 +105,7 @@ async def close_position_maker(
     tick_sz: float,
     intended_exit_px: float,
     lot_sz: float = 0.0,               # format sz to this grid; 0 = no formatting
+    ct_val: float = 1.0,               # USD notional per contract (BTC-USDT-SWAP: 0.01 BTC × price)
     pos_side_param: Optional[str] = None,  # "long"/"short" in hedge mode, else None
     td_mode: str = "isolated",
     cfg: MakerExitConfig = MakerExitConfig(),
@@ -333,9 +334,13 @@ async def close_position_maker(
     if result.filled_qty > 0:
         result.avg_fill_px = cumulative_notional / result.filled_qty
         total_fee = sum(f.fee for f in result.fills)
-        notional_filled = cumulative_notional
-        if notional_filled > 0:
-            result.realized_fee_bps = total_fee / notional_filled * 10_000.0
+        # cumulative_notional is in (contracts × price) units; for instruments
+        # with ctVal != 1 (e.g. BTC-USDT-SWAP where ctVal=0.01 BTC), multiply
+        # by ct_val to get USD notional. Without this the bps calc reads
+        # ~100x too small.
+        notional_filled_usd = cumulative_notional * ct_val
+        if notional_filled_usd > 0:
+            result.realized_fee_bps = total_fee / notional_filled_usd * 10_000.0
     if remaining > 0 and not result.error:
         result.error = "residual_unfilled"
     return result

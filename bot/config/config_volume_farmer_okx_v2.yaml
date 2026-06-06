@@ -57,16 +57,22 @@ farmer:
     max_hold_bars: 1               # close non-winners after 1 bar (5m on 5m TF)
     bar_seconds: 300
 
-  # Feature 2 — maker-only exit re-peg loop on the time-stop path.
-  # Existing TP is already post_only/maker; this routes the time-stop close
-  # through the same maker discipline.
+  # Feature 2 — exit policy on the time-stop path.
+  # enabled=false → the time-stop close goes STRAIGHT to a market (taker) order
+  # for reliability: it always fills immediately, no re-peg loop that can fail to
+  # fill and strand the position. Chosen deliberately over maker exits — the
+  # extra taker fee (~+3bps gross on the time-stopped exit leg only; TP winners
+  # still fill as maker via limit_tp) is the price of a guaranteed, instant
+  # flatten. The retried force-close backstop in the executor covers the rare
+  # case where even that market order bounces. Flip back to true to re-enable the
+  # maker-first re-peg loop (cheaper fees, but can leave a position open).
   maker_exit:
-    enabled: true
-    repeg_ms: 750                  # how long we wait for a fill before re-pegging
-    max_repegs: 8                  # max passive re-pins before taker fallback
-    max_exit_seconds: 20.0         # hard ceiling on time-to-fill
-    max_adverse_bps: 15.0          # cross spread to market if touch drifts >15bps
-    poll_ms: 120                   # order-state polling cadence inside one re-peg
+    enabled: false
+    repeg_ms: 750                  # (unused while disabled) wait before re-pegging
+    max_repegs: 8                  # (unused while disabled) re-pins before taker
+    max_exit_seconds: 20.0         # (unused while disabled) hard ceiling
+    max_adverse_bps: 15.0          # (unused while disabled) cross-spread trigger
+    poll_ms: 120                   # (unused while disabled) order-state poll
 
   # Entry re-peg loop (B). Follows the touch so post_only entries actually
   # fill in trending markets. The single-shot timeout approach left too many

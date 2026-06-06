@@ -373,8 +373,14 @@ class TelegramNotifier:
 		self,
 		markdown_v2_text: str,
 		buttons: list,
+		reply_to_message_id: Optional[int] = None,
 	) -> Optional[int]:
-		"""Send a MarkdownV2 message with an inline keyboard. Returns message_id."""
+		"""Send a MarkdownV2 message with an inline keyboard. Returns message_id.
+
+		Pass ``reply_to_message_id`` to thread the message (and its buttons) as a
+		reply under an existing message — used so the EXIT-FAILED alert's action
+		buttons hang under the same entry card.
+		"""
 		if not self._enabled or not self._bot_token:
 			return None
 		if self._session is None:
@@ -388,6 +394,8 @@ class TelegramNotifier:
 			"disable_web_page_preview": True,
 			"reply_markup": {"inline_keyboard": buttons},
 		}
+		if reply_to_message_id is not None:
+			payload["reply_to_message_id"] = reply_to_message_id
 		try:
 			async with self._session.post(url, json=payload) as resp:
 				if resp.status != 200:
