@@ -225,7 +225,11 @@ class LiveVolumeExecutorOKX:
     # simulation's equity diverges from the wallet.
     # ------------------------------------------------------------------
     breaker_consec_loss_limit: int = 3
-    breaker_cooldown_s: float = 6 * 3600.0
+    # Only these close reasons advance the consecutive-loss streak. A stop-loss
+    # hit is a real adverse move and counts; a time-stop scratch, manual flatten
+    # or trend-break exit is small/intentional and must NOT trip the breaker.
+    breaker_loss_streak_reasons: frozenset = frozenset({"sl"})
+    breaker_cooldown_s: float = 1 * 3600.0
     breaker_daily_loss_pct: float = 0.02
     breaker_max_drawdown_pct: float = 0.10
     on_breaker: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = field(default=None)
@@ -501,10 +505,22 @@ class LiveVolumeExecutorOKX:
         trade.extras["breaker_counted"] = True
         try:
             net = trade.real_gross_pnl - trade.real_open_fee - trade.real_close_fee
-            if net < 0:
+            reason = (trade.close_reason or "").lower()
+            if net >= 0:
+                # any profitable / break-even close clears the streak
+                self._consec_real_losses = 0
+            elif reason in self.breaker_loss_streak_reasons:
+                # a "real" loss (default: a stop-loss hit) advances the streak
                 self._consec_real_losses += 1
             else:
-                self._consec_real_losses = 0
+                # losing close that isn't a streak reason (time_stop scratch,
+                # manual flatten, trend_break) — noise; leave the streak as-is so
+                # it neither trips nor resets the breaker.
+                LOGGER.info(
+                    "breaker: not counting %s loss toward streak "
+                    "(net=%+.4f, streak stays at %d)",
+                    reason or "unknown", net, self._consec_real_losses,
+                )
             if (self._consec_real_losses >= self.breaker_consec_loss_limit
                     and time.time() >= self._entry_paused_until):
                 n = self._consec_real_losses

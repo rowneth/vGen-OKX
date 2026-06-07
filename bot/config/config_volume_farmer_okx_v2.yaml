@@ -155,8 +155,12 @@ risk:
   # REAL-wallet breaker (executor) — the limits that actually protect capital:
   live_breaker_daily_loss_pct: 0.05    # -5% of the day's real wallet -> pause entries for the day
   live_breaker_max_drawdown_pct: 0.10  # -10% of real wallet from peak -> hard halt (manual restart)
-  consecutive_losses_limit: 3      # 3 consecutive REAL losing closes -> 6h entry pause
-  consecutive_losses_cooldown_bars: 72   # 72 x 5m = 6h
+  consecutive_losses_limit: 3      # 3 consecutive REAL losing closes -> 1h entry pause
+  consecutive_losses_cooldown_bars: 12   # 12 x 5m = 1h
+  # Only these close reasons advance the streak. Stop-loss hits are real adverse
+  # moves and count; time_stop scratches / manual flattens / trend_break exits are
+  # small or intentional and are ignored, so they no longer trip the breaker.
+  consecutive_losses_count_reasons: ["sl"]
   stop_on_volume_target: true
 
 target:

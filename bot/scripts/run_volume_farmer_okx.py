@@ -887,6 +887,12 @@ def _real_trade_stats(records: list) -> Dict[str, Any]:
     n = len(closed)
     wins = losses = 0
     net_total = gross = open_fees = close_fees = volume = 0.0
+    # Exit-reason composition (TP / SL / TimeStop / …). Keyed by the REAL
+    # close_reason logged at exit — independent of win/lose, so a fee-eroded TP
+    # still counts as a TP. Skipped for OKX-history-sourced records, whose reason
+    # is only synthesized from the PnL sign (reason_synthetic) and would just
+    # mirror W/L. Each bucket tracks count, net P&L and how many were net-wins.
+    by_reason: Dict[str, Dict[str, Any]] = {}
     for r in records:
         notional = float(r.get("notional_usd") or 0.0)
         volume += notional  # entry leg
@@ -907,14 +913,53 @@ def _real_trade_stats(records: list) -> Dict[str, Any]:
                 wins += 1
             else:
                 losses += 1
+            if not r.get("reason_synthetic"):
+                reason = str(r.get("close_reason") or "other").lower()
+                br = by_reason.setdefault(reason, {"n": 0, "net": 0.0, "wins": 0})
+                br["n"] += 1
+                br["net"] += net
+                if net > 0:
+                    br["wins"] += 1
     wr = wins / n * 100.0 if n else 0.0
     return {
         "n": n, "wins": wins, "losses": losses, "wr": wr,
         "net": net_total, "gross": gross,
         "open_fees": open_fees, "close_fees": close_fees,
         "fees": open_fees + close_fees, "volume": volume,
-        "closed": closed,
+        "closed": closed, "by_reason": by_reason,
     }
+
+
+# Display order + short labels for the exit-reason breakdown. Anything not
+# listed here is grouped under "OTH" so new reasons never silently vanish.
+_REASON_LABELS = [
+    ("tp", "TP"), ("sl", "SL"), ("time_stop", "TS"),
+    ("trend_break", "TB"), ("manual", "MAN"),
+]
+
+
+def _format_exit_breakdown(by_reason: Dict[str, Any]) -> str:
+    """One-line exit-reason composition: ``TP 12 (40%) · SL 9 (30%) · TS 9 (30%)``.
+
+    Ratios are share-of-closed-trades, by REAL exit reason — not win/lose. Returns
+    "" when there's nothing to show (no real-reason trades yet).
+    """
+    if not by_reason:
+        return ""
+    total = sum(v.get("n", 0) for v in by_reason.values())
+    if total <= 0:
+        return ""
+    parts, seen = [], set()
+    for key, lab in _REASON_LABELS:
+        v = by_reason.get(key)
+        if not v or not v.get("n"):
+            continue
+        seen.add(key)
+        parts.append(f"{lab} {v['n']} ({v['n'] / total * 100:.0f}%)")
+    other = sum(v.get("n", 0) for k, v in by_reason.items() if k not in seen)
+    if other:
+        parts.append(f"OTH {other} ({other / total * 100:.0f}%)")
+    return "  ·  ".join(parts)
 
 
 async def _fetch_okx_trade_stats(
@@ -990,6 +1035,9 @@ async def _fetch_okx_trade_stats(
             "filled": True, "closed": True, "live": True, "close_px": px,
             "side": "LONG" if op.get("side") == "buy" else "SHORT",
             "close_reason": "tp" if net > 0 else "sl",   # icon reflects NET win/loss
+            # OKX history has no exit reason — this is a W/L guess, not a real
+            # TP/SL/TimeStop label, so keep it out of the exit-reason breakdown.
+            "reason_synthetic": True,
             # _real_trade_stats counts notional×2 (entry+exit); use the mean of the
             # two legs so the doubled total equals open+close notional exactly.
             "notional_usd": ((op.get("notional") or close_notional) + close_notional) / 2.0,
@@ -1173,7 +1221,14 @@ def _make_real_fill_callback(
         reason = trade.close_reason or "closed"
         is_manual = reason == "manual"
         emoji = {"tp": "✅", "sl": "❌", "time_stop": "⏱", "manual": "📤"}.get(reason, "📤")
-        title = "MANUAL CLOSE" if is_manual else f"REAL FILL · {_esc(reason.upper())}"
+        # Spell the exit out so TP vs SL is unmistakable at a glance — OKX's own
+        # email just says "stop order triggered" for every attached TP/SL leg.
+        _REASON_TITLE = {
+            "tp": "TP HIT", "sl": "SL HIT", "time_stop": "TIME STOP",
+            "trend_break": "TREND EXIT", "manual": "MANUAL CLOSE",
+        }
+        label = _REASON_TITLE.get(reason, reason.upper())
+        title = label if is_manual else f"REAL FILL · {_esc(label)}"
         gross = float(trade.real_gross_pnl)
         open_fee = float(trade.real_open_fee)
         close_fee = float(trade.real_close_fee)
@@ -1262,6 +1317,8 @@ def _build_status_text(
             )
         else:
             pos_line = "`flat`"
+        exit_brk = _format_exit_breakdown(rs.get("by_reason") or {})
+        exit_line = f"Exits     `{_esc(exit_brk)}`\n" if exit_brk else ""
         return (
             f"📊 *Status · {_esc(mode_label)}*\n"
             f"{_SEP}\n"
@@ -1274,6 +1331,7 @@ def _build_status_text(
             f"Realized  `{r_sign}${abs(realized):.4f}`  \\(real fills\\)\n"
             f"Trades    `{rs['n']}`  ·  WR `{rs['wr']:.1f}%`\n"
             f"W / L     `{rs['wins']}` / `{rs['losses']}`\n"
+            f"{exit_line}"
             f"{_SEP}\n"
             f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`\n"
             f"{_SEP}\n"
@@ -2183,6 +2241,13 @@ async def _dispatch_cmd(
         real_stats = await _fetch_okx_trade_stats(client, symbol)
         if real_stats is None and log_dir is not None:
             real_stats = _real_trade_stats(_read_live_trades(log_dir))
+        # The exit-reason breakdown (TP/SL/TimeStop) lives only in our local log —
+        # OKX history can't distinguish a time-stop from a market exit. Source it
+        # locally and attach, so it's correct even when OKX fed the headline WR.
+        if real_stats is not None and log_dir is not None:
+            real_stats["by_reason"] = _real_trade_stats(
+                _read_live_trades(log_dir)
+            ).get("by_reason", {})
     if data == "cmd_status":
         return _build_status_text(
             session, cfg, mode_label, bot_label, start_time, real_acct, real_stats,
@@ -2608,7 +2673,14 @@ async def main_async(args: argparse.Namespace) -> int:
                 # and re-baselines its peak each restart, so no stale-drawdown
                 # treadmill). Falls back to the legacy keys if not set.
                 breaker_consec_loss_limit=int(risk_cfg.get("consecutive_losses_limit", 3)),
-                breaker_cooldown_s=float(risk_cfg.get("consecutive_losses_cooldown_bars", 72)) * tf_seconds,
+                # Which close reasons count toward the loss streak. Default: only
+                # real stop-loss hits — time_stop scratches / manual / trend_break
+                # losses are ignored so small non-SL exits don't pause entries.
+                breaker_loss_streak_reasons=frozenset(
+                    str(r).lower()
+                    for r in (risk_cfg.get("consecutive_losses_count_reasons") or ["sl"])
+                ),
+                breaker_cooldown_s=float(risk_cfg.get("consecutive_losses_cooldown_bars", 12)) * tf_seconds,
                 breaker_daily_loss_pct=float(risk_cfg.get(
                     "live_breaker_daily_loss_pct", risk_cfg.get("daily_loss_limit_pct", 0.05))),
                 breaker_max_drawdown_pct=float(risk_cfg.get(
@@ -2842,11 +2914,16 @@ async def main_async(args: argparse.Namespace) -> int:
                 rs = _real_trade_stats(_read_live_trades(log_dir))
                 net = float(rs.get("net", 0.0))
                 pnl_str = f"+${net:.4f}" if net >= 0 else f"-${abs(net):.4f}"
+                exit_brk = _format_exit_breakdown(rs.get("by_reason") or {})
+                exit_line = (
+                    f"Exits  `{TelegramNotifier.escape(exit_brk)}`\n{_SEP}\n"
+                    if exit_brk else f"{_SEP}\n"
+                )
                 await notifier.send_raw(
                     f"⏹ *vGen OKX stopped · {TelegramNotifier.escape(mode_label)}*\n"
                     f"{_SEP}\n"
                     f"Real trades  `{rs.get('n', 0)}`  ·  WR `{rs.get('wr', 0.0):.1f}%`\n"
-                    f"{_SEP}\n"
+                    f"{exit_line}"
                     f"Net PnL  `{pnl_str}`  ·  fees `${rs.get('fees', 0.0):.4f}`\n"
                     f"Volume   `${rs.get('volume', 0.0):,.0f}`\n"
                     f"{_SEP}\n"
