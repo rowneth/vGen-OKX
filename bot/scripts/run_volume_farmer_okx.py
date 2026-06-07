@@ -2602,11 +2602,17 @@ async def main_async(args: argparse.Namespace) -> int:
                     taker_fallback=bool(er_cfg.get("taker_fallback", False)),
                 ),
                 # REAL-wallet circuit breaker — gates live entries on the actual
-                # OKX balance (not the simulation's paper equity).
+                # OKX balance (not the simulation's paper equity). Reads its OWN
+                # keys (live_breaker_*) so the session's paper halts can be left
+                # loose (they exit the process; the breaker only pauses entries
+                # and re-baselines its peak each restart, so no stale-drawdown
+                # treadmill). Falls back to the legacy keys if not set.
                 breaker_consec_loss_limit=int(risk_cfg.get("consecutive_losses_limit", 3)),
                 breaker_cooldown_s=float(risk_cfg.get("consecutive_losses_cooldown_bars", 72)) * tf_seconds,
-                breaker_daily_loss_pct=float(risk_cfg.get("daily_loss_limit_pct", 0.02)),
-                breaker_max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.10)),
+                breaker_daily_loss_pct=float(risk_cfg.get(
+                    "live_breaker_daily_loss_pct", risk_cfg.get("daily_loss_limit_pct", 0.05))),
+                breaker_max_drawdown_pct=float(risk_cfg.get(
+                    "live_breaker_max_drawdown_pct", risk_cfg.get("max_drawdown_pct", 0.10))),
             )
             LOGGER.info(
                 "live executor: time_stop=%s (max_hold=%d bars, %ds each), maker_exit=%s, "
