@@ -146,7 +146,7 @@ farmer:
 risk:
   # Tight, capital-preserving guards (this is a controlled COST, not a profit
   # strategy — the goal is to bleed slowly and never blow up).
-  daily_loss_limit_pct: 0.02       # halt entries for the UTC day at -2%
+  daily_loss_limit_pct: 0.05       # halt entries for the UTC day at -5%
   max_drawdown_pct: 0.10           # HARD halt (manual restart) at -10% from peak
   consecutive_losses_limit: 3      # 3 consecutive losing closes (incl. SL hits)
   consecutive_losses_cooldown_bars: 72   # then pause entries 6h (72 x 5m), auto-resume
