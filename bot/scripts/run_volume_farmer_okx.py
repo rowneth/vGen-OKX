@@ -536,20 +536,29 @@ def _make_event_handler(
                 f"Real volume  `{vol_str}` / `${vol_target:,.0f}`{pct_line}"
             )
         elif kind == "rebate_reminder":
-            handles = payload.get("mention_handles", []) or []
-            mention = " ".join(_esc(h) for h in handles) if handles else ""
+            handles = list(payload.get("mention_handles", []) or [])
+            # @rowneth holds the rebate wallet — always pinged first, even if the
+            # config's mention list is empty or omits them.
+            if "@rowneth" not in handles:
+                handles.insert(0, "@rowneth")
+            mention = " ".join(_esc(h) for h in handles)
             head = mention + "\n" if mention else ""
+            # Amount to transfer: prefer the real-fee-derived rebate estimate;
+            # fall back to the session's suggested amount so the ask is concrete.
+            transfer = rebate_est if (rebate_est is not None and rebate_est > 0) \
+                else float(payload.get("suggested_amount", 0.0) or 0.0)
             reb_str = f"${rebate_est:.4f}" if rebate_est is not None else "unavailable"
             fees_str = f"${real_fees:.4f}" if real_fees is not None else "unavailable"
             text = (
                 f"{head}"
-                f"⚠️ *Rebate top\\-up reminder · {_esc(mode_label)}*\n"
+                f"⚠️ *Rebate top\\-up needed · {_esc(mode_label)}*\n"
                 f"{_SEP}\n"
                 f"Wallet            `{eq_str}`\n"
                 f"Real fees paid    `{fees_str}`\n"
                 f"Est rebate {int(rebate_pct*100)}%   `{reb_str}`\n"
                 f"{_SEP}\n"
-                f"Top up the main wallet from your OKX rebate when convenient\\."
+                f"*Please transfer* `${transfer:.2f}` *back to the main wallet*\n"
+                f"Run: `/rebate {transfer:.2f}`"
             )
         else:
             return
@@ -2557,6 +2566,7 @@ async def main_async(args: argparse.Namespace) -> int:
             ts_cfg = farmer_cfg.get("time_stop", {}) or {}
             mx_cfg = farmer_cfg.get("maker_exit", {}) or {}
             er_cfg = farmer_cfg.get("entry_repeg", {}) or {}
+            risk_cfg = cfg.get("risk", {}) or {}
             tf_seconds = _parse_timeframe_seconds(tf)
             live_executor = LiveVolumeExecutorOKX(
                 client=client,
@@ -2591,6 +2601,12 @@ async def main_async(args: argparse.Namespace) -> int:
                     poll_ms=int(er_cfg.get("poll_ms", 150)),
                     taker_fallback=bool(er_cfg.get("taker_fallback", False)),
                 ),
+                # REAL-wallet circuit breaker — gates live entries on the actual
+                # OKX balance (not the simulation's paper equity).
+                breaker_consec_loss_limit=int(risk_cfg.get("consecutive_losses_limit", 3)),
+                breaker_cooldown_s=float(risk_cfg.get("consecutive_losses_cooldown_bars", 72)) * tf_seconds,
+                breaker_daily_loss_pct=float(risk_cfg.get("daily_loss_limit_pct", 0.02)),
+                breaker_max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.10)),
             )
             LOGGER.info(
                 "live executor: time_stop=%s (max_hold=%d bars, %ds each), maker_exit=%s, "
@@ -2627,6 +2643,29 @@ async def main_async(args: argparse.Namespace) -> int:
                 notifier, symbol, mode_label=_exec_mode, bot_label=_exec_lbl,
                 client=client,
             )
+            # REAL-wallet circuit-breaker alerts: loss-streak pause, daily-loss
+            # halt, and max-drawdown HARD halt — all fired off the actual OKX
+            # balance, not the simulation's paper equity.
+            if notifier is not None and notifier.enabled:
+                _esc_brk = TelegramNotifier.escape
+
+                async def _on_breaker(info) -> None:
+                    kind = str(info.get("kind", "?"))
+                    detail = str(info.get("detail", ""))
+                    icon = {"loss_streak": "⏸️", "daily_loss": "🛑",
+                            "max_drawdown": "⛔"}.get(kind, "⚠️")
+                    try:
+                        await notifier.send_raw(
+                            f"{icon} *RISK BREAKER · {_esc_brk(_exec_mode)}*\n"
+                            f"{_SEP}\n"
+                            f"`{_esc_brk(kind)}`\n"
+                            f"{_esc_brk(detail)}\n"
+                            f"\\[{_esc_brk(_exec_lbl)}\\]"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.warning("breaker telegram send failed: %s", exc)
+
+                live_executor.on_breaker = _on_breaker
             # on_entry_abandoned is left unset on purpose: no-fill entries are
             # silent (log only) per the chosen behaviour.
 

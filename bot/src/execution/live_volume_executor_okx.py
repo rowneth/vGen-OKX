@@ -214,6 +214,30 @@ class LiveVolumeExecutorOKX:
     # attempts sleep base, 2×base, 4×base … capped at 4s. Small in tests.
     force_close_base_delay_s: float = 0.5
 
+    # ------------------------------------------------------------------
+    # REAL-WALLET circuit breaker. Unlike the session's paper-equity guards,
+    # these gate live entries on the ACTUAL OKX balance and real per-trade P&L:
+    #   * loss-streak  — N consecutive real losing closes -> pause entries cooldown_s
+    #   * daily-loss   — real wallet down daily_loss_pct from the UTC-day open -> halt for the day
+    #   * max-drawdown — real wallet down max_dd_pct from peak -> HARD halt (manual restart)
+    # on_breaker fires a Telegram card on each trip. All checks read the live
+    # balance via _fetch_wallet_usdt so a real blow-up is caught even if the
+    # simulation's equity diverges from the wallet.
+    # ------------------------------------------------------------------
+    breaker_consec_loss_limit: int = 3
+    breaker_cooldown_s: float = 6 * 3600.0
+    breaker_daily_loss_pct: float = 0.02
+    breaker_max_drawdown_pct: float = 0.10
+    on_breaker: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = field(default=None)
+    _consec_real_losses: int = field(default=0, init=False)
+    _entry_paused_until: float = field(default=0.0, init=False)   # wall time
+    _daily_halt_date: str = field(default="", init=False)        # UTC date entries halted
+    _daily_anchor_eq: float = field(default=0.0, init=False)
+    _daily_anchor_date: str = field(default="", init=False)
+    _peak_real_eq: float = field(default=0.0, init=False)
+    _hard_halted: bool = field(default=False, init=False)
+    _halt_reason: str = field(default="", init=False)
+
     # Per-trade entry-repeg metrics (most-recent attempt only — for log line)
     _last_entry_repegs: int = field(default=0, init=False)
 
@@ -437,11 +461,106 @@ class LiveVolumeExecutorOKX:
         await self._safe_callback(self.on_entry_abandoned, trade, "on_entry_abandoned")
 
     # ------------------------------------------------------------------
+    # REAL-WALLET circuit breaker
+    # ------------------------------------------------------------------
+    def _entry_blocked_reason(self) -> Optional[str]:
+        """Reason new entries are blocked right now, or None if clear.
+
+        Sync (called from the sync entry hook). Reads only local breaker state;
+        the state itself is refreshed from the live wallet on each close.
+        """
+        if self._hard_halted:
+            return f"hard_halt:{self._halt_reason}"
+        now = time.time()
+        if now < self._entry_paused_until:
+            return f"loss_streak_cooldown:{(self._entry_paused_until - now) / 60:.0f}m_left"
+        today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_halt_date == today:
+            return "daily_loss_halt"
+        return None
+
+    async def _fire_breaker(self, kind: str, detail: str, **extra: Any) -> None:
+        LOGGER.warning("REAL-WALLET BREAKER [%s] %s", kind, detail)
+        if self.on_breaker is None:
+            return
+        payload = {"kind": kind, "detail": detail, **extra}
+        try:
+            await asyncio.wait_for(self.on_breaker(payload), timeout=self.callback_timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("on_breaker callback failed: %s", exc)
+
+    async def _update_breaker_on_close(self, trade: LiveTradeOKX) -> None:
+        """Update the real-wallet breaker after a VERIFIED, priced close.
+
+        Counts consecutive real losing closes (loss-streak cooldown), and reads
+        the live wallet to enforce the daily-loss and max-drawdown halts. Runs at
+        most once per trade. Never raises — risk gating must not wedge the close.
+        """
+        if trade.extras.get("breaker_counted"):
+            return
+        trade.extras["breaker_counted"] = True
+        try:
+            net = trade.real_gross_pnl - trade.real_open_fee - trade.real_close_fee
+            if net < 0:
+                self._consec_real_losses += 1
+            else:
+                self._consec_real_losses = 0
+            if (self._consec_real_losses >= self.breaker_consec_loss_limit
+                    and time.time() >= self._entry_paused_until):
+                n = self._consec_real_losses
+                self._entry_paused_until = time.time() + self.breaker_cooldown_s
+                self._consec_real_losses = 0
+                await self._fire_breaker(
+                    "loss_streak",
+                    f"{n} consecutive REAL losing closes — pausing entries "
+                    f"{self.breaker_cooldown_s / 3600:.1f}h",
+                    consec=n, cooldown_s=self.breaker_cooldown_s,
+                )
+
+            eq = await self._fetch_wallet_usdt()
+            if not eq or eq <= 0:
+                return
+            today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+            if self._daily_anchor_date != today:
+                self._daily_anchor_date = today
+                self._daily_anchor_eq = eq
+            self._peak_real_eq = max(self._peak_real_eq, eq) if self._peak_real_eq > 0 else eq
+
+            if self._daily_anchor_eq > 0:
+                day_loss = (self._daily_anchor_eq - eq) / self._daily_anchor_eq
+                if day_loss >= self.breaker_daily_loss_pct and self._daily_halt_date != today:
+                    self._daily_halt_date = today
+                    await self._fire_breaker(
+                        "daily_loss",
+                        f"real wallet down {day_loss * 100:.1f}% today "
+                        f"(${eq:.2f} from ${self._daily_anchor_eq:.2f}) — entries halted until UTC tomorrow",
+                        equity=eq, day_loss_pct=day_loss,
+                    )
+
+            if self._peak_real_eq > 0:
+                dd = (self._peak_real_eq - eq) / self._peak_real_eq
+                if dd >= self.breaker_max_drawdown_pct and not self._hard_halted:
+                    self._hard_halted = True
+                    self._halt_reason = f"drawdown_{dd * 100:.1f}pct"
+                    await self._fire_breaker(
+                        "max_drawdown",
+                        f"real wallet down {dd * 100:.1f}% from peak "
+                        f"(${eq:.2f} from ${self._peak_real_eq:.2f}) — HARD HALT, manual restart required",
+                        equity=eq, drawdown_pct=dd,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("breaker update failed (non-fatal): %s", exc)
+
+    # ------------------------------------------------------------------
     # Hook called by the session's event_callback.
     # ------------------------------------------------------------------
     def consume_session_event(self, evt) -> None:  # type: FarmerEvent
         """Sync hook — schedules async work on the running loop."""
         if evt.kind != "entry":
+            return
+        blocked = self._entry_blocked_reason()
+        if blocked is not None:
+            LOGGER.warning("entry blocked by REAL-wallet breaker: %s", blocked)
             return
         if self._trade_count >= self.max_live_trades:
             LOGGER.warning("max_live_trades=%d reached; ignoring entry",
@@ -955,6 +1074,7 @@ class LiveVolumeExecutorOKX:
 
         if flat is True and have_price:
             await self._reconcile_okx_pnl(trade)
+            await self._update_breaker_on_close(trade)
             trade.extras["close_verified"] = True
             self._log_trade(trade)
             await self._safe_callback(
@@ -974,6 +1094,7 @@ class LiveVolumeExecutorOKX:
                     await self._resolve_close(trade)
                 if trade.closed and trade.close_px > 0:
                     await self._reconcile_okx_pnl(trade)
+                    await self._update_breaker_on_close(trade)
                     trade.extras["close_verified"] = True
                     self._log_trade(trade)
                     await self._safe_callback(
@@ -1139,9 +1260,13 @@ class LiveVolumeExecutorOKX:
                 trade.exit_path = "taker_market"
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("close_position_market failed: %s", exc)
-            await self._resolve_close(trade)
+            # Stamp the real exit reason (e.g. "time_stop") BEFORE resolving, so
+            # the tp/sl proximity matcher in _resolve_close doesn't relabel a
+            # time-stop taker loss as "tp" just because the drifted exit price
+            # landed nearer tp_px than the (much wider) sl_px.
             if not trade.close_reason:
                 trade.close_reason = reason
+            await self._resolve_close(trade)
             return
 
         intended_px = trade.tp_px if reason == "tp" else trade.fill_px
@@ -1284,11 +1409,13 @@ class LiveVolumeExecutorOKX:
                 trade.close_ts = close_ts
                 trade.real_close_fee = abs(float(o.get("fee") or 0.0))
                 okx_pnl_str = o.get("pnl")
-                # Identify TP vs SL by proximity (tolerant of slippage) — UNLESS
-                # the operator already tagged this as a manual close from
-                # Telegram, in which case keep "manual" so the card/stats don't
-                # mislabel an operator flatten as a strategy TP/SL exit.
-                if trade.close_reason != "manual":
+                # Identify TP vs SL by proximity (tolerant of slippage) — but
+                # only when no explicit exit reason is already set. An operator
+                # "manual" flatten, or a strategy-driven "time_stop"/"trend_break"
+                # close, carries the true reason; preserve it so the card/stats
+                # don't mislabel it as a TP/SL price exit. Proximity only guesses
+                # for genuine native TP/SL fills, which arrive with no reason.
+                if trade.close_reason not in ("manual", "time_stop", "trend_break"):
                     d_tp = abs(trade.close_px - trade.tp_px)
                     d_sl = abs(trade.close_px - trade.sl_px)
                     trade.close_reason = "tp" if d_tp < d_sl else "sl"

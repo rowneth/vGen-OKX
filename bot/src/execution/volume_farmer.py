@@ -184,6 +184,15 @@ class VolumeFarmerSession:
 		self._atr_tp_bps_min = float(atr_cfg.get("tp_bps_min", 5.0))
 		self._atr_sl_bps_min = float(atr_cfg.get("sl_bps_min", 8.0))
 		self._atr_min_usd = float(atr_cfg.get("min_usd", 0.0))
+		# Fee-aware, achievability-capped TP. The TP target is raised so a filled
+		# TP always clears a full round-trip of fees with a profit buffer, then
+		# clamped so a high-ATR bar can't push the TP past where price actually
+		# travels within the hold (which would turn a would-be TP win into a
+		# time-stop taker loss). All three default to no-ops, so configs that
+		# don't set them are byte-identical to the old behaviour.
+		self._tp_fee_cover_mult = float(atr_cfg.get("tp_fee_cover_mult", 0.0))
+		self._tp_profit_buffer_bps = float(atr_cfg.get("tp_profit_buffer_bps", 0.0))
+		self._tp_bps_max = float(atr_cfg.get("tp_bps_max", 0.0))  # <=0 disables cap
 		self._limit_tp = bool(f.get("limit_tp", False))
 		self._pending_tp_bps: float = self._tp_bps
 		self._pending_sl_bps: float = self._sl_bps
@@ -211,6 +220,10 @@ class VolumeFarmerSession:
 		self._rr_min_rebate_usd = float(rr_cfg.get("min_rebate_usd", 5.0))
 		self._rr_cooldown_minutes = int(rr_cfg.get("cooldown_minutes", 60))
 		self._rr_mention_handles = list(rr_cfg.get("mention_handles", []))
+		# Daily cadence: ping the group once per UTC day to reclaim rebate even
+		# when the wallet is healthy, so it never sits idle off-wallet.
+		self._rr_daily_enabled = bool(rr_cfg.get("daily", True))
+		self._rr_last_daily_date = ""
 
 	# ------------------------------------------------------------------
 	def _emit(self, evt: FarmerEvent) -> None:
@@ -323,10 +336,12 @@ class VolumeFarmerSession:
 			return None  # skip: ATR below high-vol threshold
 		if self._atr_relative and not np.isnan(atr_val):
 			atr_bps = atr_val / open_p * 10_000
-			self._pending_tp_bps = max(self._atr_tp_bps_min, self._atr_tp_mult * atr_bps)
+			self._pending_tp_bps = self._apply_tp_floor_cap(
+				max(self._atr_tp_bps_min, self._atr_tp_mult * atr_bps)
+			)
 			self._pending_sl_bps = max(self._atr_sl_bps_min, self._atr_sl_mult * atr_bps)
 		else:
-			self._pending_tp_bps = self._tp_bps
+			self._pending_tp_bps = self._apply_tp_floor_cap(self._tp_bps)
 			self._pending_sl_bps = self._sl_bps
 
 		if self._entry_mode == "micro_momentum":
@@ -472,6 +487,39 @@ class VolumeFarmerSession:
 			return self._max_leverage
 		lev = risk_usd / (margin * sl_frac)
 		return max(self._min_leverage, min(lev, self._max_leverage))
+
+	# ------------------------------------------------------------------
+	def _round_trip_fee_bps(self) -> float:
+		"""Round-trip fee (bps) for one TP round trip.
+
+		The open leg is always maker (post_only limit entry). The close leg is
+		maker when limit_tp is on (OKX limit TP fills maker), else taker. The
+		rebate reduces the maker legs only (this account rebates maker fees).
+		"""
+		maker_eff = self._maker_rate * (1.0 - self._rebate_pct)
+		open_leg = maker_eff
+		close_leg = maker_eff if self._limit_tp else self._taker_rate
+		return (open_leg + close_leg) * 10_000.0
+
+	def _apply_tp_floor_cap(self, tp_bps: float) -> float:
+		"""Raise tp_bps to the fee-aware floor, then clamp to the achievability
+		cap.
+
+		floor = tp_fee_cover_mult * round_trip_fee_bps + tp_profit_buffer_bps.
+		Order matters: the floor is applied first (guarantees a filled TP clears
+		fees), the cap last (guarantees the TP stays reachable). Backward
+		compatible: mult/buffer 0 => floor is 0; tp_bps_max <= 0 => no cap.
+		Operators must keep tp_bps_max >= the fee floor, else the cap silently
+		re-creates an unprofitable TP.
+		"""
+		fee_floor_bps = (
+			self._tp_fee_cover_mult * self._round_trip_fee_bps()
+			+ self._tp_profit_buffer_bps
+		)
+		tp_bps = max(tp_bps, fee_floor_bps)
+		if self._tp_bps_max > 0:
+			tp_bps = min(tp_bps, self._tp_bps_max)
+		return tp_bps
 
 	# ------------------------------------------------------------------
 	def _open_position(self, side: str, price: float, bar_time: pd.Timestamp) -> None:
@@ -742,10 +790,16 @@ class VolumeFarmerSession:
 		dd = (self.peak_equity - self.equity) / max(self.peak_equity, 1e-9)
 		below_floor = self.equity < self.start_equity * self._rr_equity_floor_pct
 		over_dd = dd >= self._rr_drawdown_pct
-		if not (below_floor or over_dd):
+		# Daily cadence: fire once per UTC day regardless of wallet health, so the
+		# group is reminded to move the 40% rebate back into the wallet routinely
+		# (not only in a drawdown). Naturally rate-limited to once/day, so it
+		# bypasses the minute-cooldown that guards the shaky-wallet triggers.
+		today = bar_time.strftime("%Y-%m-%d")
+		daily_due = self._rr_daily_enabled and (today != self._rr_last_daily_date)
+		if not (below_floor or over_dd or daily_due):
 			return
-		# Cooldown
-		if self.last_rebate_reminder_at:
+		# Cooldown (applies only to the shaky-wallet triggers, not the daily ping)
+		if not daily_due and self.last_rebate_reminder_at:
 			try:
 				last = pd.Timestamp(self.last_rebate_reminder_at)
 				if (bar_time - last) < pd.Timedelta(minutes=self._rr_cooldown_minutes):
@@ -756,6 +810,10 @@ class VolumeFarmerSession:
 		suggested = min(available, gap_to_start) if gap_to_start > 0 else available
 		if suggested < self._rr_min_rebate_usd:
 			suggested = available
+		# Daily ping suggests reclaiming the WHOLE available pool (nothing to
+		# rescue — just keep it flowing back to the wallet).
+		if daily_due and not (below_floor or over_dd):
+			suggested = available
 		reasons: List[str] = []
 		if below_floor:
 			reasons.append(
@@ -764,6 +822,9 @@ class VolumeFarmerSession:
 			)
 		if over_dd:
 			reasons.append(f"drawdown {dd*100:.1f}% from peak")
+		if daily_due:
+			reasons.append("daily rebate top-up")
+			self._rr_last_daily_date = today
 		self.last_rebate_reminder_at = bar_time.isoformat()
 		self._emit(FarmerEvent(
 			kind="rebate_reminder", time=bar_time,

@@ -36,6 +36,18 @@ class MakerExitConfig:
     max_exit_seconds: float = 20.0
     max_adverse_bps: float = 15.0
     poll_ms: int = 120  # how often to check order state inside one re-peg window
+    # Progressive maker aggression. The first peg rests at the passive touch
+    # (best ask when closing long) to capture the spread; with each subsequent
+    # re-peg the price walks toward the AGGRESSIVE maker price (one tick inside
+    # the opposite touch) so a stale close keeps climbing the queue and fills as
+    # maker before we ever cross to taker. It never crosses the book — the
+    # aggressive bound is always one tick on the maker side of the spread, so
+    # every peg stays post_only-valid. Set ladder=False to pin at the touch.
+    ladder: bool = True
+    # Fraction of the spread the FINAL peg gives up (1.0 = all the way to one
+    # tick inside the opposite touch; 0.5 = halfway). Lower keeps more spread but
+    # fills less reliably.
+    ladder_max_frac: float = 1.0
 
 
 @dataclass
@@ -170,14 +182,34 @@ async def close_position_maker(
         if best_ask <= 0 or best_bid <= 0:
             await asyncio.sleep(cfg.poll_ms / 1000.0)
             continue
-        touch = best_ask if side_to_close == "long" else best_bid
-        touch = _round_to_tick(touch, tick_sz)
 
-        adverse = _adverse_bps_from(touch)
+        # Adverse is judged off the genuine MARKET touch (passive side), so our
+        # own laddering toward the spread never looks like the market moving
+        # against us and never trips the taker fallback prematurely.
+        market_touch = best_ask if side_to_close == "long" else best_bid
+        adverse = _adverse_bps_from(_round_to_tick(market_touch, tick_sz))
         result.adverse_bps = max(result.adverse_bps, adverse)
         if adverse > cfg.max_adverse_bps:
             result.fallback_reason = f"adverse_{adverse:.1f}bps"
             break
+
+        # ---- laddered peg price: passive touch -> aggressive (fill-certain)
+        # maker price as re-pegs accumulate. Always stays one tick inside the
+        # opposite touch, so it can never cross (post_only-valid every time).
+        if cfg.ladder and cfg.max_repegs > 1:
+            progress = min(1.0, result.repegs / float(cfg.max_repegs - 1)) * cfg.ladder_max_frac
+        else:
+            progress = 0.0
+        if side_to_close == "long":          # SELL to close
+            passive_px = best_ask
+            aggressive_px = best_bid + tick_sz       # most aggressive maker sell
+            peg_px = passive_px - progress * (passive_px - aggressive_px)
+            touch = max(_round_to_tick(peg_px, tick_sz), best_bid + tick_sz)
+        else:                                # BUY to close
+            passive_px = best_bid
+            aggressive_px = best_ask - tick_sz       # most aggressive maker buy
+            peg_px = passive_px + progress * (aggressive_px - passive_px)
+            touch = min(_round_to_tick(peg_px, tick_sz), best_ask - tick_sz)
 
         cl_ord = cl_ord_prefix + uuid.uuid4().hex[:14]
         sz_str = _fmt_size(remaining, lot_sz) if lot_sz > 0 else str(remaining)
@@ -279,56 +311,76 @@ async def close_position_maker(
             ))
         result.repegs += 1
 
-    # ---- taker fallback for residual
+    # ---- taker fallback for residual (RETRIED). A single market order can be
+    # rejected/throttled (OKX 50011 isn't auto-retried on POSTs); retry with
+    # backoff so maker_exit's own fallback reliably flattens before deferring to
+    # the executor's force-close backstop. Re-checks remaining each attempt.
     if remaining > 0 and result.fallback_reason:
         LOGGER.warning(
             "maker_exit: falling back to taker for residual=%s reason=%s",
             remaining, result.fallback_reason,
         )
-        cl_ord = cl_ord_prefix + "_tk_" + uuid.uuid4().hex[:10]
-        sz_str = _fmt_size(remaining, lot_sz) if lot_sz > 0 else str(remaining)
-        try:
-            resp = await client.place_order(
-                symbol=symbol,
-                side=close_side,
-                pos_side=pos_side_param,
-                td_mode=td_mode,
-                ord_type="market",
-                sz=sz_str,
-                client_oid=cl_ord,
-                reduce_only=True,
-            )
-            data = (resp.get("data") or [{}])[0]
-            ord_id = data.get("ordId")
-            # Brief poll for fill details (market should fill near-instantly)
-            fill_avg = 0.0
-            fee_total = 0.0
-            filled_sz = 0.0
-            for _ in range(20):
-                await asyncio.sleep(0.1)
-                try:
-                    r = await client.get_order(
-                        symbol, ord_id=ord_id, client_oid=cl_ord,
+        taker_attempts = 3
+        taker_delay = 0.3
+        for attempt in range(taker_attempts):
+            if remaining <= 0:
+                break
+            cl_ord = cl_ord_prefix + "_tk_" + uuid.uuid4().hex[:10]
+            sz_str = _fmt_size(remaining, lot_sz) if lot_sz > 0 else str(remaining)
+            try:
+                resp = await client.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    pos_side=pos_side_param,
+                    td_mode=td_mode,
+                    ord_type="market",
+                    sz=sz_str,
+                    client_oid=cl_ord,
+                    reduce_only=True,
+                )
+                data = (resp.get("data") or [{}])[0]
+                scode = str(data.get("sCode", "0"))
+                ord_id = data.get("ordId")
+                if scode != "0":
+                    LOGGER.warning(
+                        "maker_exit: taker fallback attempt %d/%d rejected sCode=%s sMsg=%r",
+                        attempt + 1, taker_attempts, scode, data.get("sMsg"),
                     )
-                except Exception:  # noqa: BLE001
+                    result.error = f"taker_sCode_{scode}"
+                    await asyncio.sleep(taker_delay)
+                    taker_delay = min(taker_delay * 2, 2.0)
                     continue
-                od = (r.get("data") or [{}])[0]
-                if str(od.get("state", "")) == "filled":
-                    filled_sz = float(od.get("accFillSz") or 0.0)
-                    fill_avg = float(od.get("avgPx") or 0.0)
-                    fee_total = abs(float(od.get("fee") or 0.0))
-                    break
-            if filled_sz > 0:
-                result.taker_qty += filled_sz
-                result.filled_qty += filled_sz
-                cumulative_notional += filled_sz * fill_avg
-                remaining = max(0.0, remaining - filled_sz)
-                result.fills.append(ExitFill(
-                    px=fill_avg, qty=filled_sz, fee=fee_total, fee_type="taker",
-                ))
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("maker_exit: taker fallback failed: %s", exc)
-            result.error = f"taker_fallback_error: {exc}"
+                # Brief poll for fill details (market should fill near-instantly)
+                fill_avg = fee_total = filled_sz = 0.0
+                for _ in range(20):
+                    await asyncio.sleep(0.1)
+                    try:
+                        r = await client.get_order(
+                            symbol, ord_id=ord_id, client_oid=cl_ord,
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    od = (r.get("data") or [{}])[0]
+                    if str(od.get("state", "")) == "filled":
+                        filled_sz = float(od.get("accFillSz") or 0.0)
+                        fill_avg = float(od.get("avgPx") or 0.0)
+                        fee_total = abs(float(od.get("fee") or 0.0))
+                        break
+                if filled_sz > 0:
+                    result.taker_qty += filled_sz
+                    result.filled_qty += filled_sz
+                    cumulative_notional += filled_sz * fill_avg
+                    remaining = max(0.0, remaining - filled_sz)
+                    result.fills.append(ExitFill(
+                        px=fill_avg, qty=filled_sz, fee=fee_total, fee_type="taker",
+                    ))
+                    result.error = ""   # cleared: residual flattened
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("maker_exit: taker fallback attempt %d failed: %s",
+                                 attempt + 1, exc)
+                result.error = f"taker_fallback_error: {exc}"
+                await asyncio.sleep(taker_delay)
+                taker_delay = min(taker_delay * 2, 2.0)
 
     result.ttf_seconds = time.monotonic() - started_at
     if result.filled_qty > 0:

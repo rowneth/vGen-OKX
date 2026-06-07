@@ -30,14 +30,15 @@ farmer:
   capital_usd: 500.0
   leverage: 0                      # 0 = dynamic
 
-  margin_fraction_per_trade: 0.03  # 3% of equity as margin
+  margin_fraction_per_trade: 0.025  # 2.5% of equity as margin
   sizing:
     dynamic_leverage: true
     risk_per_trade_pct: 0.025
-    # Capped at 100x to match OKX retail live max on BTC-USDT-SWAP.
-    # Anything above is unreachable in production; demo allows 125x but we
-    # keep the bot's sizing honest so paper/demo/live all behave identically.
-    max_leverage: 100
+    # CONTROLLED cap (was 100). Volume farming has no edge, so we size for
+    # capital preservation, not throughput: 30x cap + 2.5% margin = ~0.75x wallet
+    # notional per trade, keeping the bleed slow. ATR-relative TP/SL (atr.relative
+    # true) scale the targets to volatility.
+    max_leverage: 30
     min_leverage: 5
 
   # Fallback fixed TP/SL (used when atr.relative = false)
@@ -66,13 +67,18 @@ farmer:
   # flatten. The retried force-close backstop in the executor covers the rare
   # case where even that market order bounces. Flip back to true to re-enable the
   # maker-first re-peg loop (cheaper fees, but can leave a position open).
+  # ENABLED: all-maker exits are the core cost minimizer ($250 -> ~$120 /$1M).
+  # The time-stop closes via the laddered maker re-peg loop (passive touch ->
+  # aggressive maker price as the order ages), falling back to a RETRIED taker
+  # market only as a last resort. The executor's force-close + recovery watcher
+  # guarantee the position can never strand open.
   maker_exit:
-    enabled: false
-    repeg_ms: 750                  # (unused while disabled) wait before re-pegging
-    max_repegs: 8                  # (unused while disabled) re-pins before taker
-    max_exit_seconds: 20.0         # (unused while disabled) hard ceiling
-    max_adverse_bps: 15.0          # (unused while disabled) cross-spread trigger
-    poll_ms: 120                   # (unused while disabled) order-state poll
+    enabled: true
+    repeg_ms: 750                  # wait per peg before re-pricing
+    max_repegs: 8                  # laddered pegs (passive->aggressive) before taker
+    max_exit_seconds: 20.0         # hard ceiling, then taker fallback
+    max_adverse_bps: 15.0          # market-moved-against trigger -> taker
+    poll_ms: 120                   # order-state poll
 
   # Entry re-peg loop (B). Follows the touch so post_only entries actually
   # fill in trending markets. The single-shot timeout approach left too many
@@ -109,11 +115,28 @@ farmer:
   atr:
     period: 14
     relative: true
-    tp_mult: 0.5
-    sl_mult: 1.5
-    tp_bps_min: 5.0
+    # tp_mult 1.0: slightly wider TP fills fewer-but-cheaper as maker.
+    # sl_mult 6.0: SL is a CATASTROPHIC floor only — the 1-bar time-stop is the
+    # real risk control, so the wide stop stops paying taker on intrabar wicks
+    # (drives maker-fill rate to ~100% in backtest, cost -> ~$120/$1M floor).
+    tp_mult: 1.0
+    sl_mult: 6.0
+    # 5bps sat below the 6.2bps robust (maker-open + taker-close) round trip,
+    # so a floor-pinned TP could not net-win when a limit TP crossed the spread.
+    tp_bps_min: 6.0
     sl_bps_min: 8.0
     min_usd: 120.0
+    # Fee-aware achievable TP (see volume_farmer._apply_tp_floor_cap):
+    #   round_trip = (maker*(1-rebate))*2*1e4 = (0.0002*0.6)*2*1e4 = 2.4bps  (limit_tp maker close)
+    #   floor      = tp_fee_cover_mult*round_trip + tp_profit_buffer_bps
+    #              = 2.0*2.4 + 2.0 = 6.8bps
+    # A filled TP then nets +4.4bps vs the maker-maker round trip, and stays
+    # positive (+0.6bps) even in the maker-open/taker-close worst case.
+    # Cap 15bps = backtest best-net; reachability collapses past ~18bps under
+    # the 1-bar time stop, so a high-ATR bar can't set an un-hittable TP.
+    tp_fee_cover_mult: 2.0
+    tp_profit_buffer_bps: 2.0
+    tp_bps_max: 25.0
 
   trend_break:
     enabled: false
@@ -121,10 +144,12 @@ farmer:
     adverse_bps: 20.0
 
 risk:
-  daily_loss_limit_pct: 0.50
-  max_drawdown_pct: 0.95
-  consecutive_losses_limit: 10
-  consecutive_losses_cooldown_bars: 12
+  # Tight, capital-preserving guards (this is a controlled COST, not a profit
+  # strategy — the goal is to bleed slowly and never blow up).
+  daily_loss_limit_pct: 0.02       # halt entries for the UTC day at -2%
+  max_drawdown_pct: 0.10           # HARD halt (manual restart) at -10% from peak
+  consecutive_losses_limit: 3      # 3 consecutive losing closes (incl. SL hits)
+  consecutive_losses_cooldown_bars: 72   # then pause entries 6h (72 x 5m), auto-resume
   stop_on_volume_target: true
 
 target:
