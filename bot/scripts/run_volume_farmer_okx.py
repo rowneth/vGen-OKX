@@ -28,6 +28,7 @@ import os
 import pathlib
 import signal
 import sys
+import time
 import io
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -93,6 +94,18 @@ _STUCK_BUTTONS = [
 
 SEED_CANDLES = 100
 DEFAULT_POLL_SECONDS = 20
+
+# Strong refs for fire-and-forget sends. The event loop keeps only weak refs
+# to tasks — without this, a GC pass could collect an in-flight Telegram send
+# (entry/exit/halt/milestone cards) and the message silently vanished.
+_BG_TASKS: set = set()
+
+
+def _bg(coro) -> "asyncio.Task":
+    t = asyncio.create_task(coro)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
 
 
 def _load_env(path: pathlib.Path) -> None:
@@ -300,6 +313,7 @@ async def _poll_loop(
     LOGGER.info("seeded %d closed bars, last=%s", len(history), last_bar_ts)
     LOGGER.info("polling %s %s every %ds (bar size %ds)", symbol, tf, poll_sec, bar_seconds)
 
+    fail_streak = 0
     while True:
         if end_at is not None and datetime.now(tz=timezone.utc) >= end_at:
             LOGGER.info("duration elapsed; stopping")
@@ -309,11 +323,31 @@ async def _poll_loop(
             break
 
         try:
-            raw = await client.get_candles(symbol, tf, limit=10)
+            # Gap backfill: after an outage longer than 10 bars the old fixed
+            # limit=10 silently dropped bars forever (an open position's TP/SL
+            # touch inside the gap was never evaluated). Fetch what's missing.
+            need = 10
+            if last_bar_ts is not None:
+                behind = (pd.Timestamp.now(tz="UTC") - last_bar_ts).total_seconds() / bar_seconds
+                need = int(min(300, max(10, behind + 5)))
+            raw = await client.get_candles(symbol, tf, limit=need)
             df_new = _normalize_okx_candles(raw)
+            fail_streak = 0
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("candle fetch failed: %s", exc)
-            await asyncio.sleep(poll_sec)
+            fail_streak += 1
+            LOGGER.warning("candle fetch failed (streak %d): %s", fail_streak, exc)
+            # The operator must hear about a persistent feed outage — the bot
+            # is flying blind on an open position. Alert at 5 consecutive
+            # failures, re-alert every 50.
+            if notifier and notifier.enabled and (fail_streak == 5 or fail_streak % 50 == 0):
+                _esc_ = TelegramNotifier.escape
+                _bg(notifier.send_raw(
+                    f"🚨 *Market data outage · {_esc_(mode_label)}*\n{_SEP}\n"
+                    f"{fail_streak} consecutive candle fetch failures\\.\n"
+                    f"Last error: `{_esc_(str(exc)[:150])}`\n"
+                    f"{_SEP}\n\\[{_esc_(bot_label)}\\]"
+                ))
+            await asyncio.sleep(min(poll_sec, 10))
             continue
 
         # Intrabar TP/SL detection — fire Telegram immediately on hit, don't wait for bar close.
@@ -382,7 +416,7 @@ async def _poll_loop(
                         f"{_lbl}"
                     )
                     entry_msg_id = intrabar.get(f"{ikey}_msg_id")
-                    asyncio.create_task(notifier.send_and_get_id(text, reply_to_message_id=entry_msg_id))
+                    _bg(notifier.send_and_get_id(text, reply_to_message_id=entry_msg_id))
                     LOGGER.info("INTRABAR %s detected for %s pos @ %.2f, notified", hit, pos.side, pos.entry_price)
 
         closed_new = df_new[df_new["closed"]].copy()
@@ -399,7 +433,24 @@ async def _poll_loop(
                     if session.halted:
                         break
 
-        await asyncio.sleep(poll_sec)
+        # Bar-aligned cadence. The fixed 20s sleep made ~15 redundant candle
+        # fetches per 5m bar AND delayed the entry signal up to 20s after bar
+        # close — a worse maker-queue position on every single entry. Sleep to
+        # just past the next bar close instead; PAPER keeps the short cadence
+        # too (its intrabar TP/SL cards need mid-bar polls); an overdue bar
+        # (OKX confirms late) re-polls every 2s until it lands.
+        if last_bar_ts is None:
+            sleep_s = float(poll_sec)
+        else:
+            next_close = last_bar_ts + pd.Timedelta(seconds=2 * bar_seconds)
+            wait = (next_close - pd.Timestamp.now(tz="UTC")).total_seconds() + 1.0
+            if wait <= 0:
+                wait = 2.0
+            if mode_label == "PAPER":
+                sleep_s = min(float(poll_sec), wait)
+            else:
+                sleep_s = min(wait, bar_seconds + 5.0)
+        await asyncio.sleep(sleep_s)
 
 
 def _write_daily_trade_log(log_dir: pathlib.Path, record: Dict[str, Any]) -> None:
@@ -455,11 +506,21 @@ def _make_event_handler(
             try:
                 raw = await client.get_candles(symbol, tf, limit=35)
                 bars = _normalize_okx_candles(raw)
-                chart = _draw_entry_chart(bars[bars["closed"]], side, entry, tp, sl, symbol=symbol, tf=tf)
+                # matplotlib render is ~0.5-2s of synchronous CPU; run it off
+                # the event loop so candle polling / order watching / Telegram
+                # long-poll never freeze during an entry card.
+                chart = await asyncio.to_thread(
+                    _draw_entry_chart, bars[bars["closed"]], side, entry, tp, sl,
+                    symbol=symbol, tf=tf,
+                )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("chart generation failed: %s", exc)
         if chart:
             msg_id = await notifier.send_photo(chart, caption=text)
+            if msg_id is None:
+                # Photo upload failed (429/caption too long/network): fall back
+                # to a plain text card rather than losing the entry message.
+                msg_id = await notifier.send_and_get_id(text)
         else:
             msg_id = await notifier.send_and_get_id(text)
         _pending["msg_id"] = msg_id
@@ -487,7 +548,7 @@ def _make_event_handler(
 
     def _tg(msg: str) -> None:
         if notifier and notifier.enabled:
-            asyncio.create_task(notifier.send_raw(msg + _lbl))
+            _bg(notifier.send_raw(msg + _lbl))
 
     async def _send_auto_real(kind: str, payload: Dict[str, Any]) -> None:
         """HALT / MILESTONE / REBATE card rebased on REAL OKX numbers (live mode).
@@ -618,7 +679,7 @@ def _make_event_handler(
                     f"Open fee  `${open_fee:.4f}` \\(maker\\)"
                 )
                 # Balance footer + bot label are appended inside the sender.
-                asyncio.create_task(_send_entry_with_chart(text, side, entry, tp, sl, equity))
+                _bg(_send_entry_with_chart(text, side, entry, tp, sl, equity))
             if state_path is not None:
                 try:
                     session.save_state(state_path)
@@ -664,10 +725,16 @@ def _make_event_handler(
             )
 
             ikey = f"{round(entry_px, 4)}"
-            already_notified = intrabar is not None and intrabar.get(ikey) == reason
-            if already_notified and intrabar is not None:
+            intrabar_guess = intrabar.get(ikey) if intrabar is not None else None
+            already_notified = intrabar_guess == reason
+            corrects_estimate = intrabar_guess is not None and intrabar_guess != reason
+            entry_msg_threaded: Optional[int] = None
+            if intrabar is not None:
+                # ALWAYS pop, match or not. A mismatched key used to leak
+                # forever AND wrongly suppress the intrabar card of a future
+                # trade at the same rounded entry price.
                 intrabar.pop(ikey, None)
-                intrabar.pop(f"{ikey}_msg_id", None)
+                entry_msg_threaded = intrabar.pop(f"{ikey}_msg_id", None)
 
             # PAPER only: render the exit card from the simulated touch. In
             # live/demo the ONE exit message is the executor's OKX-confirmed
@@ -675,26 +742,35 @@ def _make_event_handler(
             # there are never two conflicting exit messages with different
             # numbers, and never a "closed" card while the real position is open.
             if notifier and notifier.enabled and not already_notified and not is_real:
-                emoji = "✅" if reason == "tp" else ("❌" if reason == "sl" else "⏱")
+                # Honest at-a-glance icon per reason — sl_ambiguous and
+                # trend_break used to render with the time-stop icon.
+                emoji = {
+                    "tp": "✅", "sl": "❌", "sl_ambiguous": "❌",
+                    "time_stop": "⏱", "trend_break": "✂️", "manual": "📤",
+                }.get(reason, "⏱")
                 g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
                 n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
-                vol_pct = vol_now / vol_target * 100 if vol_target else 0
+                open_fee_disp = p.get("open_fee", 0.0) or 0.0
+                correction = (
+                    f"⚠️ _corrects earlier intrabar *{_esc(str(intrabar_guess).upper())}* estimate_\n"
+                    if corrects_estimate else ""
+                )
                 text = (
                     f"{emoji} *{_esc(reason.upper())} · {_esc(side.upper())} \\#{_esc(str(trade_num))} · {_esc(mode_label)}*\n"
+                    f"{correction}"
                     f"{_esc(symbol)}  `{entry_px:,.2f}` → `{exit_px:,.2f}`\n"
                     f"{_SEP}\n"
                     f"Gross   `{g_str}`\n"
-                    f"Fee     `${close_fee:.4f}` \\({_esc(close_fee_type)}\\)\n"
+                    f"Fees    `${open_fee_disp:.4f}` \\+ `${close_fee:.4f}` \\({_esc(close_fee_type)}\\)\n"
                     f"Net     `{n_str}`\n"
                     f"{_SEP}\n"
                     f"`{wins}W · {losses}L · {wr:.1f}% WR`\n"
                     f"{_SEP}\n"
-                    f"Balance  `${equity:.4f}`\n"
-                    f"{_SEP}\n"
-                    f"Vol  `${vol_now:,.0f}` / `${vol_target:,.0f}`  \\[`{vol_pct:.1f}%`\\]"
+                    f"Balance  `${equity:.4f}`"
                 )
-                entry_msg_id = _pending.get("msg_id")
-                asyncio.create_task(_send_exit(text, entry_msg_id))
+                text = text + "\n" + "\n".join(_journey_lines(session, cfg))
+                entry_msg_id = _pending.get("msg_id") or entry_msg_threaded
+                _bg(_send_exit(text, entry_msg_id))
             _pending.clear()
             if state_path is not None:
                 try:
@@ -708,7 +784,7 @@ def _make_event_handler(
                 if is_real:
                     # Rebase on the REAL account: trigger is the strategy guard,
                     # numbers are the live wallet/volume.
-                    asyncio.create_task(_send_auto_real("halt", evt.payload))
+                    _bg(_send_auto_real("halt", evt.payload))
                 else:
                     reason = evt.payload.get("reason", "?")
                     eq = evt.payload.get("equity", 0)
@@ -728,7 +804,7 @@ def _make_event_handler(
             LOGGER.info("MILESTONE %d%%  volume=$%.0f", pct, vol)
             if notifier and notifier.enabled:
                 if is_real:
-                    asyncio.create_task(_send_auto_real("milestone", evt.payload))
+                    _bg(_send_auto_real("milestone", evt.payload))
                 else:
                     _tg(
                         f"🎯 *Milestone {_esc(str(pct))}%* of volume target\n"
@@ -750,7 +826,7 @@ def _make_event_handler(
             )
             if notifier and notifier.enabled:
                 if is_real:
-                    asyncio.create_task(_send_auto_real("rebate_reminder", evt.payload))
+                    _bg(_send_auto_real("rebate_reminder", evt.payload))
                     return
                 mention_line = " ".join(_esc(h) for h in handles) if handles else ""
                 head = mention_line + "\n" if mention_line else ""
@@ -783,8 +859,17 @@ async def _fetch_real_account(client: Any, symbol: str) -> Dict[str, Any]:
         "equity": None, "pos_side": None, "pos_sz": None, "upl": None,
         "avg_px": None, "mark_px": None, "upl_ratio": None,
     }
+    # Balance + positions concurrently — these two sequential awaits sat on
+    # the critical path of every card and command.
+    bal_res, pos_res = await asyncio.gather(
+        client.get_balance("USDT"),
+        client.get_positions(symbol),
+        return_exceptions=True,
+    )
     try:
-        bal = await client.get_balance("USDT")
+        if isinstance(bal_res, Exception):
+            raise bal_res
+        bal = bal_res
         bd = (bal.get("data") or [{}])[0]
         for det in (bd.get("details") or []):
             if det.get("ccy") == "USDT":
@@ -795,7 +880,9 @@ async def _fetch_real_account(client: Any, symbol: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("real balance fetch failed: %s", exc)
     try:
-        pos = await client.get_positions(symbol)
+        if isinstance(pos_res, Exception):
+            raise pos_res
+        pos = pos_res
         for p in (pos.get("data") or []):
             sz = float(p.get("pos") or 0.0)
             if sz != 0.0:
@@ -963,8 +1050,33 @@ def _format_exit_breakdown(by_reason: Dict[str, Any]) -> str:
     return "  ·  ".join(parts)
 
 
+# TTL cache for the expensive real-stats fetch: up to 50 sequential
+# authenticated GETs per call, previously re-run from scratch on EVERY
+# /status //fees //trades command AND every live halt/milestone/rebate card —
+# burning auth rate limit exactly when an EXIT-FAILED flurry needs headroom.
+_STATS_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "val": None}
+_STATS_CACHE_TTL_S = 30.0
+# Instrument ctVal cache (was hardcoded 0.01 = BTC-only; wrong stats for any
+# other instrument).
+_CT_VAL_CACHE: Dict[str, float] = {}
+
+
+async def _instrument_ct_val(client: Any, symbol: str) -> float:
+    inst = to_okx_inst_id(symbol)
+    if inst in _CT_VAL_CACHE:
+        return _CT_VAL_CACHE[inst]
+    try:
+        spec = await client.get_instrument(symbol)
+        ct = float(spec.get("ctVal") or 0.01)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("ctVal fetch failed (defaulting 0.01): %s", exc)
+        return 0.01
+    _CT_VAL_CACHE[inst] = ct
+    return ct
+
+
 async def _fetch_okx_trade_stats(
-    client: Any, symbol: str, max_pages: int = 5,
+    client: Any, symbol: str, max_pages: int = 25,
 ) -> Optional[Dict[str, Any]]:
     """Build real-trade stats from OKX's OWN order history (the exchange truth).
 
@@ -974,9 +1086,22 @@ async def _fetch_okx_trade_stats(
     ``_real_trade_stats`` so the Telegram cards render identically — but now
     sourced from the exchange, immune to any local-logging drift. Returns None
     on any API error so the caller can fall back to the local jsonl.
+
+    max_pages=25 ⇒ up to 2,500 orders per endpoint. The old cap of 5 (~500
+    orders) silently under-reported volume for most of a 5M campaign (~1,600+
+    orders), so milestones fired late and the rebate ask was undersized.
+    Results are cached for ``_STATS_CACHE_TTL_S`` seconds.
     """
+    now = time.time()
+    cache_key = to_okx_inst_id(symbol)
+    if (
+        _STATS_CACHE["val"] is not None
+        and _STATS_CACHE["key"] == cache_key
+        and now - _STATS_CACHE["ts"] < _STATS_CACHE_TTL_S
+    ):
+        return _STATS_CACHE["val"]
     inst = to_okx_inst_id(symbol)
-    ct_val = 0.01  # BTC-USDT-SWAP: 1 contract = 0.01 BTC
+    ct_val = await _instrument_ct_val(client, symbol)
     merged: Dict[str, Any] = {}
     ok_any = False  # did ANY page return cleanly? if not, fall back to jsonl
     try:
@@ -1046,7 +1171,9 @@ async def _fetch_okx_trade_stats(
             "real_open_fee": open_fee,
             "real_close_fee": close_fee,
         })
-    return _real_trade_stats(records)
+    stats = _real_trade_stats(records)
+    _STATS_CACHE.update({"ts": time.time(), "key": cache_key, "val": stats})
+    return stats
 
 
 def _make_entry_filled_callback(
@@ -1095,27 +1222,36 @@ def _make_entry_filled_callback(
             f"{_SEP}\n"
             f"`ordId {ordid}`"
         )
-        if client is not None:
-            try:
-                acct = await _fetch_real_account(client, symbol)
-                text = text + "\n" + "\n".join(_real_acct_lines(acct))
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.debug("entry card acct fetch failed: %s", exc)
-        text = text + _lbl
         chart: Optional[bytes] = None
         if client is not None:
+            # Account snapshot and chart candles concurrently — these were
+            # 3 sequential REST round trips on the entry-card path.
+            acct_res, candles_res = await asyncio.gather(
+                _fetch_real_account(client, symbol),
+                client.get_candles(symbol, tf, limit=35),
+                return_exceptions=True,
+            )
+            if isinstance(acct_res, dict):
+                text = text + "\n" + "\n".join(_real_acct_lines(acct_res))
             try:
-                raw = await client.get_candles(symbol, tf, limit=35)
-                bars = _normalize_okx_candles(raw)
-                chart = _draw_entry_chart(
-                    bars[bars["closed"]], side, fill_px, tp, sl, symbol=symbol, tf=tf,
+                if isinstance(candles_res, Exception):
+                    raise candles_res
+                bars = _normalize_okx_candles(candles_res)
+                # Render off the event loop: the synchronous matplotlib pass
+                # used to freeze position polling for up to ~2s per entry.
+                chart = await asyncio.to_thread(
+                    _draw_entry_chart, bars[bars["closed"]], side, fill_px, tp, sl,
+                    symbol=symbol, tf=tf,
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("entry chart generation failed: %s", exc)
+        text = text + _lbl
         try:
+            msg_id = None
             if chart:
                 msg_id = await notifier.send_photo(chart, caption=text)
-            else:
+            if msg_id is None:
+                # No chart, or the photo upload failed — never lose the card.
                 msg_id = await notifier.send_and_get_id(text)
             if msg_id is not None:
                 trade.extras["entry_msg_id"] = msg_id
@@ -1199,12 +1335,51 @@ def _make_close_unverified_callback(
     return _on_close_unverified
 
 
+def _journey_lines(session: Any, cfg: Optional[Dict[str, Any]]) -> list:
+    """Compact campaign-progress block for exit/close/status cards.
+
+    Answers "where are we heading": % of target, pace vs required, ETA,
+    realized net cost per 1M, and projected total fees vs the reward.
+    """
+    try:
+        summ = session.summary()
+    except Exception:  # noqa: BLE001
+        return []
+    vol = float(summ.get("volume_usd") or 0.0)
+    tgt_cfg = (cfg or {}).get("target", {}) or {}
+    tgt = float(tgt_cfg.get("volume_usd", 0) or 0)
+    if tgt <= 0 or vol <= 0:
+        return []
+    reward = float(tgt_cfg.get("reward_usd", 1500.0) or 0)
+    pct = vol / tgt * 100.0
+    fees_net = float(summ.get("fees_net") or 0.0)
+    per_1m = float(summ.get("net_cost_per_1m") or 0.0)
+    proj_fees = per_1m * tgt / 1_000_000.0
+    pace = summ.get("pace") or {}
+    lines = [_SEP, f"📍 *Journey*  `{pct:.1f}%`  ·  `${vol:,.0f}` / `${tgt:,.0f}`"]
+    req = pace.get("required_per_day")
+    ach = pace.get("achieved_per_day")
+    days_left = pace.get("days_left")
+    if req is not None and ach:
+        status = "🟢 on pace" if float(ach) >= float(req) else "🔴 behind"
+        lines.append(f"Pace  `${float(ach):,.0f}/day`  need `${float(req):,.0f}/day`  {status}")
+        if days_left is not None and float(ach) > 0:
+            eta_days = (tgt - vol) / float(ach)
+            lines.append(f"ETA  `{eta_days:.1f}d`  \\(window `{float(days_left):.1f}d`\\)")
+    lines.append(f"Net fees  `${fees_net:,.2f}`  ·  `${per_1m:,.0f}/1M`")
+    if reward > 0 and proj_fees > 0:
+        lines.append(f"At target  fees `${proj_fees:,.0f}`  vs reward `${reward:,.0f}`")
+    return lines
+
+
 def _make_real_fill_callback(
     notifier: Optional[TelegramNotifier],
     symbol: str,
     mode_label: str,
     bot_label: str,
     client: Any = None,
+    session: Any = None,
+    cfg: Optional[Dict[str, Any]] = None,
 ):
     """Build the executor's on_close_confirmed callback — the REAL close card.
 
@@ -1221,12 +1396,18 @@ def _make_real_fill_callback(
             return
         reason = trade.close_reason or "closed"
         is_manual = reason == "manual"
-        emoji = {"tp": "✅", "sl": "❌", "time_stop": "⏱", "manual": "📤"}.get(reason, "📤")
+        emoji = {
+            "tp": "✅", "sl": "❌", "sl_ambiguous": "❌", "time_stop": "⏱",
+            "trend_break": "✂️", "manual": "📤",
+            "watch_timeout": "⚠️", "unmatched_close": "⚠️",
+        }.get(reason, "📤")
         # Spell the exit out so TP vs SL is unmistakable at a glance — OKX's own
         # email just says "stop order triggered" for every attached TP/SL leg.
         _REASON_TITLE = {
-            "tp": "TP HIT", "sl": "SL HIT", "time_stop": "TIME STOP",
-            "trend_break": "TREND EXIT", "manual": "MANUAL CLOSE",
+            "tp": "TP HIT", "sl": "SL HIT", "sl_ambiguous": "SL HIT (worst case)",
+            "time_stop": "TIME STOP", "trend_break": "TREND EXIT",
+            "manual": "MANUAL CLOSE", "watch_timeout": "CLOSED (watch timeout)",
+            "unmatched_close": "CLOSED (unmatched)",
         }
         label = _REASON_TITLE.get(reason, reason.upper())
         title = label if is_manual else f"REAL FILL · {_esc(label)}"
@@ -1237,15 +1418,17 @@ def _make_real_fill_callback(
         g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
         n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
         # Per-side bps slip vs the paper TP/SL (positive = we got a worse fill).
-        # Meaningless for an operator close (no intended target), so skip it.
+        # Only meaningful for genuine TP/SL exits — a time-stop/trend-break
+        # close has no intended price target, so comparing it to the (much
+        # wider) SL printed a large, meaningless "slip" figure.
         intended_close = trade.tp_px if reason == "tp" else trade.sl_px
-        if intended_close > 0 and trade.close_px > 0:
+        if reason in ("tp", "sl") and intended_close > 0 and trade.close_px > 0:
             if trade.side == "long":
                 slip = (intended_close - trade.close_px) / intended_close * 10_000
             else:
                 slip = (trade.close_px - intended_close) / intended_close * 10_000
         else:
-            slip = 0.0
+            slip = None
         lines = [
             f"{emoji} *{title} · "
             f"{_esc(trade.side.upper())} · {_esc(mode_label)}*",
@@ -1256,7 +1439,7 @@ def _make_real_fill_callback(
             f"Close fee `${close_fee:.4f}`",
             f"Net     `{n_str}`",
         ]
-        if not is_manual:
+        if slip is not None:
             lines += [_SEP, f"Slip vs paper  `{slip:+.1f}bps`"]
         if trade.exit_path and trade.exit_path != "native_tp_sl":
             lines.append(
@@ -1266,6 +1449,8 @@ def _make_real_fill_callback(
             )
             if trade.exit_adverse_bps:
                 lines.append(f"Adverse `{trade.exit_adverse_bps:.1f}bps`")
+        if session is not None:
+            lines.extend(_journey_lines(session, cfg))
         if client is not None:
             acct = await _fetch_real_account(client, symbol)
             lines.extend(_real_acct_lines(acct))
@@ -1299,6 +1484,8 @@ def _build_status_text(
     sym = cfg["exchange"]["symbol"]
     tf = cfg["exchange"]["timeframe"]
     status_str = "Halted" if session.halted else "Running"
+    _j = _journey_lines(session, cfg)
+    journey_block = ("\n".join(_j) + "\n") if _j else ""
     is_live = mode_label != "PAPER"
 
     # LIVE/DEMO: source everything from the REAL account + real-fill trade log,
@@ -1335,6 +1522,7 @@ def _build_status_text(
             f"{exit_line}"
             f"{_SEP}\n"
             f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`\n"
+            f"{journey_block}"
             f"{_SEP}\n"
             f"\\[{_esc(bot_label)}\\]"
         )
@@ -1365,6 +1553,7 @@ def _build_status_text(
         f"Position  `{_esc(pos_str)}`\n"
         f"{_SEP}\n"
         f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`\n"
+        f"{journey_block}"
         f"{_SEP}\n"
         f"{_real_acct_block(real_acct)}"
         f"\\[{_esc(bot_label)}\\]"
@@ -1429,8 +1618,8 @@ async def _build_position_text(
             dist_sl = abs(sl - current) / current * 10_000
             lines += [
                 _SEP,
-                f"TP  `{tp:,.2f}`  \\({dist_tp:.1f}bps away\\)",
-                f"SL  `{sl:,.2f}`  \\({dist_sl:.1f}bps away\\)",
+                f"TP  `{tp:,.2f}`  \\(`{dist_tp:.1f}bps` away\\)",
+                f"SL  `{sl:,.2f}`  \\(`{dist_sl:.1f}bps` away\\)",
             ]
         lines += [
             _SEP,
@@ -1474,8 +1663,8 @@ async def _build_position_text(
         f"Entry    `{pos.entry_price:,.2f}`\n"
         f"Current  `{current_price:,.2f}`\n"
         f"{_SEP}\n"
-        f"TP  `{pos.tp:,.2f}`  \\({dist_tp:.1f}bps away\\)\n"
-        f"SL  `{pos.sl:,.2f}`  \\({dist_sl:.1f}bps away\\)\n"
+        f"TP  `{pos.tp:,.2f}`  \\(`{dist_tp:.1f}bps` away\\)\n"
+        f"SL  `{pos.sl:,.2f}`  \\(`{dist_sl:.1f}bps` away\\)\n"
         f"Bars held  `{pos.bars_held}`\n"
         f"{_SEP}\n"
         f"Notional  `${pos.notional:,.2f}`\n"
@@ -1986,7 +2175,13 @@ async def _do_limit_close(
         )
     d = _close_direction(p, pos_mode)
     sz_str = _fmt_size(d["size"], lot_sz)
-    ord_type = "limit"
+    # post_only ALWAYS: the help text promises a maker close, but a plain
+    # 'limit' at/through the touch executes instantly as TAKER (0.05% vs
+    # 0.02%). post_only with an explicit crossing price is rejected with
+    # sCode 51280 instead — the rejection card already tells the operator to
+    # retry with a different price or use /close market, which is the honest
+    # behavior for a button labeled "maker".
+    ord_type = "post_only"
     if price is None:
         try:
             tk = await client.get_ticker(symbol)
@@ -2003,7 +2198,6 @@ async def _do_limit_close(
                 f"{_SEP}\n\\[{_esc(bot_label)}\\]"
             )
         price = touch
-        ord_type = "post_only"
     px_str = _fmt_size(_round_to_tick(price, tick_sz), tick_sz)
     ot = _mark_manual_close(live_executor)
     async with _MaybeLock(live_executor):
@@ -2240,15 +2434,18 @@ async def _dispatch_cmd(
     real_stats = None
     if is_live:
         real_stats = await _fetch_okx_trade_stats(client, symbol)
-        if real_stats is None and log_dir is not None:
-            real_stats = _real_trade_stats(_read_live_trades(log_dir))
-        # The exit-reason breakdown (TP/SL/TimeStop) lives only in our local log —
-        # OKX history can't distinguish a time-stop from a market exit. Source it
-        # locally and attach, so it's correct even when OKX fed the headline WR.
-        if real_stats is not None and log_dir is not None:
-            real_stats["by_reason"] = _real_trade_stats(
-                _read_live_trades(log_dir)
-            ).get("by_reason", {})
+        # Read the local jsonl ONCE (it grows for months over a campaign and
+        # used to be parsed twice per command): it is both the fallback for
+        # the headline stats and the only source of the exit-reason breakdown
+        # (OKX history can't distinguish a time-stop from a market exit).
+        local_stats = (
+            _real_trade_stats(_read_live_trades(log_dir))
+            if log_dir is not None else None
+        )
+        if real_stats is None:
+            real_stats = local_stats
+        elif local_stats is not None:
+            real_stats["by_reason"] = local_stats.get("by_reason", {})
     if data == "cmd_status":
         return _build_status_text(
             session, cfg, mode_label, bot_label, start_time, real_acct, real_stats,
@@ -2296,7 +2493,7 @@ def _build_rebate_text(
     elif reason == "non_positive_amount":
         head = "⚠️ *Rebate transfer skipped*"
         body = (
-            f"Amount must be > 0\n"
+            f"Amount must be \\> 0\n"
             f"Usage: `/rebate <amount>`"
         )
     else:
@@ -2398,8 +2595,36 @@ async def _command_loop(
     pos_mode: str = "net",
 ) -> None:
     if not notifier.enabled:
+        # CRITICAL: returning here used to end this task, which unblocked
+        # asyncio.wait(FIRST_COMPLETED) in main_async and shut the WHOLE BOT
+        # down seconds after startup whenever Telegram creds were missing or
+        # --no-telegram was passed (a 15s systemd crash loop). Without
+        # Telegram the bot must simply trade without a command channel.
+        LOGGER.info("telegram disabled — command loop idle (bot keeps running)")
+        await stop_evt.wait()
         return
     _esc = TelegramNotifier.escape
+
+    # Drain the update backlog BEFORE acting on anything. Telegram retains
+    # up to 24h of updates; starting at offset=0 used to replay commands sent
+    # while the bot was down — including a stale /close tap firing a real
+    # market close on a brand-new position the moment the bot restarted.
+    offset = 0
+    try:
+        discarded = 0
+        while True:
+            stale = await notifier.get_updates(offset=offset, timeout=0)
+            if not stale:
+                break
+            for upd in stale:
+                uid = upd.get("update_id") if isinstance(upd, dict) else None
+                if uid is not None:
+                    offset = uid + 1
+                    discarded += 1
+        if discarded:
+            LOGGER.info("discarded %d stale Telegram update(s) from before startup", discarded)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("startup backlog drain failed (continuing): %s", exc)
 
     menu_msg_id: Optional[int] = await notifier.send_with_buttons(
         f"🎛 *Controls* — tap to query or manage the bot\n"
@@ -2457,6 +2682,16 @@ async def _command_loop(
             await _reply(text, buttons, reply_to)
         except Exception as exc:
             LOGGER.warning("command dispatch error: %s", exc)
+            # Tell the operator the command failed — silence after tapping a
+            # close button is indistinguishable from "it worked".
+            try:
+                await _reply(
+                    f"⚠️ */{_esc(action)} failed* — `{_esc(str(exc)[:150])}`\n"
+                    f"{_SEP}\n\\[{_esc(bot_label)}\\]",
+                    None, reply_to,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             if guarded:
                 _inflight.discard("close")
@@ -2466,7 +2701,6 @@ async def _command_loop(
         _tasks.add(t)
         t.add_done_callback(_tasks.discard)
 
-    offset = 0
     while not stop_evt.is_set():
         try:
             updates = await notifier.get_updates(offset=offset, timeout=20)
@@ -2496,7 +2730,10 @@ async def _command_loop(
                 data = cq.get("data", "") or ""
                 await notifier.answer_callback(cq_id)
                 action = data[4:] if data.startswith("cmd_") else data
-                _spawn(_dispatch(action, "", menu_msg_id))
+                # Thread the reply under the message whose button was tapped
+                # (e.g. an EXIT-FAILED card), not the day-old Controls menu.
+                tapped_msg_id = (cq.get("message") or {}).get("message_id") or menu_msg_id
+                _spawn(_dispatch(action, "", tapped_msg_id))
 
             elif "message" in upd:
                 msg = upd.get("message") or {}
@@ -2521,6 +2758,57 @@ async def _command_loop(
                     "orders", "cancel", "help",
                 ):
                     _spawn(_dispatch(cmd, raw_text, reply_to))
+
+
+async def _daily_report_loop(
+    notifier: Optional[TelegramNotifier],
+    session: "VolumeFarmerSession",
+    cfg: Dict[str, Any],
+    mode_label: str,
+    bot_label: str,
+    stop_evt: asyncio.Event,
+) -> None:
+    """Send the daily digest at ``notifications.telegram.daily_report_hour`` UTC.
+
+    The ``send_daily`` / ``daily_report_hour`` knobs existed in both configs
+    but were never read by the runner — operators believed they had configured
+    daily digests that never arrived. One digest per UTC day: session stats,
+    fee/rebate totals and the campaign journey block.
+    """
+    tg_cfg = (cfg.get("notifications", {}) or {}).get("telegram", {}) or {}
+    if not (notifier and notifier.enabled and bool(tg_cfg.get("send_daily", False))):
+        await stop_evt.wait()
+        return
+    hour = int(tg_cfg.get("daily_report_hour", 0)) % 24
+    _esc = TelegramNotifier.escape
+    sent_for = ""
+    while not stop_evt.is_set():
+        now = datetime.now(tz=timezone.utc)
+        today_key = now.strftime("%Y-%m-%d")
+        if now.hour == hour and sent_for != today_key:
+            sent_for = today_key
+            try:
+                s = session.summary()
+                pnl = float(s.get("total_pnl") or 0.0)
+                pnl_str = f"+${pnl:.4f}" if pnl >= 0 else f"-${abs(pnl):.4f}"
+                lines = [
+                    f"🗞 *Daily report · {_esc(mode_label)}*",
+                    _SEP,
+                    f"Trades  `{s['round_trips']}`  ·  WR `{s['win_rate_pct']:.1f}%`",
+                    f"Equity  `${s['equity']:.4f}`  ·  PnL `{pnl_str}`",
+                    f"Fees    `${s['fees_gross']:.4f}` gross  ·  `${s['fees_net']:.4f}` net",
+                    f"Rebate  accrued `${s['rebate_accrued']:.4f}`  ·  available `${s['rebate_available']:.4f}`",
+                ]
+                lines.extend(_journey_lines(session, cfg))
+                lines += [_SEP, f"\\[{_esc(bot_label)}\\]"]
+                await notifier.send_raw("\n".join(lines))
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("daily report failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=300)
+            return
+        except asyncio.TimeoutError:
+            pass
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -2626,6 +2914,30 @@ async def main_async(args: argparse.Namespace) -> int:
         api_key=api_key, api_secret=api_secret, passphrase=passphrase,
         simulated=client_simulated,
     ) as client:
+        # Clock sanity: OKX rejects signatures past ~30s of drift (code 50102),
+        # which would break every private call — including managing an OPEN
+        # position. Check once at startup and warn loudly.
+        try:
+            srv_ms = await client.get_server_time_ms()
+            drift_s = abs(srv_ms / 1000.0 - time.time())
+            if drift_s > 10.0:
+                LOGGER.error(
+                    "LOCAL CLOCK DRIFT %.1fs vs OKX — private calls will fail "
+                    "past ~30s. Fix NTP on this host NOW.", drift_s,
+                )
+                if notifier.enabled:
+                    _e_drift = TelegramNotifier.escape
+                    _bg(notifier.send_raw(
+                        f"⏰ *Clock drift warning*\n{_SEP}\n"
+                        f"Local clock is `{drift_s:.1f}s` off OKX server time\\. "
+                        f"Past \\~30s every signed call fails — fix NTP\\.\n"
+                        f"{_SEP}\n\\[{_e_drift(args.label or 'okx-paper')}\\]"
+                    ))
+            else:
+                LOGGER.info("clock drift vs OKX: %.2fs (ok)", drift_s)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("server time check failed (continuing): %s", exc)
+
         live_executor: Optional[LiveVolumeExecutorOKX] = None
         if is_live_or_demo:
             farmer_cfg = cfg.get("farmer", {}) or {}
@@ -2678,6 +2990,11 @@ async def main_async(args: argparse.Namespace) -> int:
                     max_exit_seconds=float(mx_cfg.get("max_exit_seconds", 20.0)),
                     max_adverse_bps=float(mx_cfg.get("max_adverse_bps", 15.0)),
                     poll_ms=int(mx_cfg.get("poll_ms", 120)),
+                    # Ladder knobs were previously NOT plumbed from yaml — the
+                    # dataclass defaults always applied silently.
+                    ladder=bool(mx_cfg.get("ladder", True)),
+                    ladder_max_frac=float(mx_cfg.get("ladder_max_frac", 1.0)),
+                    ladder_start_frac=float(mx_cfg.get("ladder_start_frac", 0.0)),
                 ),
                 entry_repeg_cfg=EntryRepegConfig(
                     enabled=bool(er_cfg.get("enabled", True)),
@@ -2686,6 +3003,8 @@ async def main_async(args: argparse.Namespace) -> int:
                     max_entry_seconds=float(er_cfg.get("max_entry_seconds", 60.0)),
                     poll_ms=int(er_cfg.get("poll_ms", 150)),
                     taker_fallback=bool(er_cfg.get("taker_fallback", False)),
+                    max_chase_bps=float(er_cfg.get("max_chase_bps", 0.0)),
+                    use_amend=bool(er_cfg.get("use_amend", True)),
                 ),
                 # REAL-wallet circuit breaker — gates live entries on the actual
                 # OKX balance (not the simulation's paper equity). Reads its OWN
@@ -2741,7 +3060,7 @@ async def main_async(args: argparse.Namespace) -> int:
             # The confirmed close card (real avgPx + exchange fees + OKX pnl).
             live_executor.on_close_confirmed = _make_real_fill_callback(
                 notifier, symbol, mode_label=_exec_mode, bot_label=_exec_lbl,
-                client=client,
+                client=client, session=session, cfg=cfg,
             )
             # Honest alert when a close can't be priced or the position is still
             # open — never a fabricated "$0.00 REAL FILL".
@@ -2772,8 +3091,30 @@ async def main_async(args: argparse.Namespace) -> int:
                         LOGGER.warning("breaker telegram send failed: %s", exc)
 
                 live_executor.on_breaker = _on_breaker
-            # on_entry_abandoned is left unset on purpose: no-fill entries are
-            # silent (log only) per the chosen behaviour.
+
+                # Abandoned entries are no longer silent: each miss forfeits
+                # 2× notional of counted volume, and over a month a hidden
+                # fill-miss rate is the campaign's main volume leak. One
+                # compact card per miss with a running counter.
+                _abandon_count = {"n": 0}
+                _esc_ab = TelegramNotifier.escape
+
+                async def _on_entry_abandoned(trade) -> None:
+                    _abandon_count["n"] += 1
+                    lost_vol = 2.0 * float(getattr(trade, "notional_usd", 0.0) or 0.0)
+                    reason_ab = str(getattr(trade, "cancel_reason", "") or "no fill")
+                    try:
+                        await notifier.send_raw(
+                            f"🪂 *Entry missed \\#{_abandon_count['n']} · {_esc_ab(_exec_mode)}*\n"
+                            f"{_SEP}\n"
+                            f"Reason  `{_esc_ab(reason_ab[:120])}`\n"
+                            f"Volume forfeited  `${lost_vol:,.0f}`\n"
+                            f"{_SEP}\n\\[{_esc_ab(_exec_lbl)}\\]"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.warning("abandoned-entry telegram send failed: %s", exc)
+
+                live_executor.on_entry_abandoned = _on_entry_abandoned
 
         try:
             history = await _seed_history(client, symbol, tf, SEED_CANDLES)
@@ -2836,8 +3177,11 @@ async def main_async(args: argparse.Namespace) -> int:
             limit_tp = cfg.get("farmer", {}).get("limit_tp", False)
             min_lev = cfg.get("farmer", {}).get("sizing", {}).get("min_leverage", 5)
             max_lev = cfg.get("farmer", {}).get("sizing", {}).get("max_leverage", 125)
-            okx_cap = args.live_leverage if is_live_or_demo else None
-            okx_cap_line = f"  ·  OKX cap `{okx_cap}×`" if okx_cap else ""
+            # Show the leverage ACTUALLY set on the exchange (config cap clamped
+            # by --live-leverage), not just the optional CLI clamp — the card
+            # used to omit the applied setting entirely unless the flag was passed.
+            okx_cap = _exchange_lev if is_live_or_demo else None
+            okx_cap_line = f"  ·  OKX set `{okx_cap}×`" if okx_cap else ""
             vol_target = cfg.get("target", {}).get("volume_usd", 0)
             startup_msg = (
                 f"🚀 *vGen OKX · {_esc(mode_label)}*\n"
@@ -2915,19 +3259,55 @@ async def main_async(args: argparse.Namespace) -> int:
             log_dir=log_dir, live_executor=live_executor,
             pos_mode=args.pos_mode,
         ))
+        daily_task = asyncio.create_task(_daily_report_loop(
+            notifier, session, cfg, mode_label,
+            args.label or "okx-paper", stop_evt,
+        ))
+        stop_waiter = asyncio.create_task(stop_evt.wait())
+        all_tasks = (poll_task, cmd_task, daily_task, stop_waiter)
+        crash_exc: Optional[BaseException] = None
         try:
-            await asyncio.wait(
-                {poll_task, cmd_task, asyncio.create_task(stop_evt.wait())},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            done, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Capture a crashed task's exception WITHOUT re-raising here: the
+            # old bare `await t` in finally re-raised immediately, skipping
+            # BOTH the state save and any shutdown card — the bot died silent
+            # and lost session state on every unhandled exception.
+            for t in done:
+                if t is stop_waiter:
+                    continue
+                if not t.cancelled() and t.exception() is not None:
+                    crash_exc = t.exception()
+                    break
         finally:
-            for t in (poll_task, cmd_task):
+            for t in all_tasks:
                 t.cancel()
-            for t in (poll_task, cmd_task):
+            for t in all_tasks:
                 try:
                     await t
                 except asyncio.CancelledError:
                     pass
+                except Exception:  # noqa: BLE001 — already captured above
+                    pass
+
+        if crash_exc is not None:
+            LOGGER.error("FATAL: task crashed", exc_info=crash_exc)
+            try:
+                session.save_state(state_path)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("state save after crash failed: %s", exc)
+            if notifier.enabled:
+                _e = TelegramNotifier.escape
+                try:
+                    await notifier.send_and_get_id(
+                        f"💥 *BOT CRASHED · {_e(mode_label)}*\n{_SEP}\n"
+                        f"`{_e(type(crash_exc).__name__)}: {_e(str(crash_exc)[:200])}`\n"
+                        f"State saved\\. Supervisor should restart the bot\\.\n"
+                        f"{_SEP}\n\\[{_e(args.label or 'okx-paper')}\\]"
+                    )
+                    await notifier.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise crash_exc
 
     session.save_state(state_path)
     s = session.summary()
@@ -2990,8 +3370,11 @@ def main() -> int:
                    help="Submit real orders with REAL MONEY (needs LIVE_OKX_ACK=I_UNDERSTAND)")
     p.add_argument("--live-dry-run", action="store_true",
                    help="With --live: build orders but do NOT submit")
-    p.add_argument("--max-live-trades", type=int, default=100,
-                   help="Hard cap on number of live/demo orders submitted")
+    p.add_argument("--max-live-trades", type=int, default=100_000,
+                   help="Hard cap on FILLED live/demo trades. The old default of "
+                        "100 silently stopped all entries after ~1.3 days at the "
+                        "observed pace — a direct blocker for the 5M campaign. "
+                        "Keep it as a runaway backstop, not a working limit.")
     p.add_argument("--live-leverage", type=int, default=0,
                    help="Optional upper clamp on OKX exchange leverage. 0 (default) "
                         "= use config sizing.max_leverage (keeps locked margin = "

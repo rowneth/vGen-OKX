@@ -48,6 +48,11 @@ class MakerExitConfig:
     # tick inside the opposite touch; 0.5 = halfway). Lower keeps more spread but
     # fills less reliably.
     ladder_max_frac: float = 1.0
+    # Where the FIRST peg starts on the ladder (0.0 = passive touch, 0.5 =
+    # halfway to the aggressive price). For a volume farmer the adverse drift
+    # while waiting at the passive touch costs more than the fraction of
+    # spread given up, so starting mid-ladder fills sooner for ~free.
+    ladder_start_frac: float = 0.0
 
 
 @dataclass
@@ -120,7 +125,7 @@ async def close_position_maker(
     ct_val: float = 1.0,               # USD notional per contract (BTC-USDT-SWAP: 0.01 BTC × price)
     pos_side_param: Optional[str] = None,  # "long"/"short" in hedge mode, else None
     td_mode: str = "isolated",
-    cfg: MakerExitConfig = MakerExitConfig(),
+    cfg: Optional[MakerExitConfig] = None,
     cl_ord_prefix: str = "mex",
 ) -> ExitResult:
     """Close ``sz_contracts`` of an open position using maker-first re-peg loop.
@@ -133,6 +138,7 @@ async def close_position_maker(
     never escalate to cross the spread. Taker fallback fires only when one of
     the configured limits is breached.
     """
+    cfg = cfg if cfg is not None else MakerExitConfig()
     side_to_close = position_side.lower()
     if side_to_close not in ("long", "short"):
         raise ValueError(f"position_side must be long|short, got {position_side!r}")
@@ -146,6 +152,13 @@ async def close_position_maker(
     remaining = float(sz_contracts)
     started_at = time.monotonic()
     deadline = started_at + cfg.max_exit_seconds
+    # Rejection storm guard: post_only would-cross rejections (51280) and
+    # placement errors used to consume the re-peg budget without ever resting
+    # an order (~8 rejects in 1s in a fast market → straight to taker). They
+    # now count separately, bounded by their own cap, while only pegs that
+    # actually rested an order advance result.repegs.
+    rejects = 0
+    max_rejects = max(cfg.max_repegs * 3, 12)
 
     def _adverse_bps_from(touch_px: float) -> float:
         # adverse = exit worse than intended, in our direction-of-favor frame
@@ -163,8 +176,17 @@ async def close_position_maker(
         if result.repegs >= cfg.max_repegs:
             result.fallback_reason = f"max_repegs_{cfg.max_repegs}"
             break
+        if rejects >= max_rejects:
+            result.fallback_reason = f"reject_storm_{rejects}"
+            break
         if time.monotonic() >= deadline:
             result.fallback_reason = "max_exit_seconds"
+            break
+        if lot_sz > 0 and remaining < lot_sz:
+            # Sub-lot dust can't be expressed as a valid order size; pegging
+            # (or market-ordering) it just gets rejected until the executor's
+            # close-position backstop sweeps the whole position.
+            result.fallback_reason = "dust_residual"
             break
 
         # ---- fetch touch
@@ -196,10 +218,14 @@ async def close_position_maker(
         # ---- laddered peg price: passive touch -> aggressive (fill-certain)
         # maker price as re-pegs accumulate. Always stays one tick inside the
         # opposite touch, so it can never cross (post_only-valid every time).
+        # ladder_start_frac shifts the whole ladder toward the aggressive end
+        # so the first peg doesn't wait at the passive touch.
         if cfg.ladder and cfg.max_repegs > 1:
-            progress = min(1.0, result.repegs / float(cfg.max_repegs - 1)) * cfg.ladder_max_frac
+            base = min(1.0, result.repegs / float(cfg.max_repegs - 1))
+            start = min(max(cfg.ladder_start_frac, 0.0), 1.0)
+            progress = (start + (1.0 - start) * base) * cfg.ladder_max_frac
         else:
-            progress = 0.0
+            progress = min(max(cfg.ladder_start_frac, 0.0), 1.0) * cfg.ladder_max_frac if cfg.ladder else 0.0
         if side_to_close == "long":          # SELL to close
             passive_px = best_ask
             aggressive_px = best_bid + tick_sz       # most aggressive maker sell
@@ -228,7 +254,7 @@ async def close_position_maker(
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("maker_exit: place_order error: %s", exc)
             await asyncio.sleep(cfg.poll_ms / 1000.0)
-            result.repegs += 1
+            rejects += 1
             continue
 
         data = (resp.get("data") or [{}])[0]
@@ -238,7 +264,7 @@ async def close_position_maker(
             # 51280: post_only would cross. Treat as "re-peg, don't escalate."
             LOGGER.info("maker_exit: post_only rejected sCode=%s sMsg=%r — re-pegging",
                         scode, data.get("sMsg"))
-            result.repegs += 1
+            rejects += 1
             await asyncio.sleep(cfg.poll_ms / 1000.0)
             continue
 
@@ -350,7 +376,12 @@ async def close_position_maker(
                     await asyncio.sleep(taker_delay)
                     taker_delay = min(taker_delay * 2, 2.0)
                     continue
-                # Brief poll for fill details (market should fill near-instantly)
+                # Brief poll for fill details (market should fill near-instantly).
+                # Capture accFillSz on EVERY poll, not only state=="filled":
+                # a partially-filled-then-canceled market order (or a state
+                # read that lags past the window) used to report filled_sz=0,
+                # so the next attempt re-sent the FULL size and the executor
+                # logged "nothing filled" for a position that actually closed.
                 fill_avg = fee_total = filled_sz = 0.0
                 for _ in range(20):
                     await asyncio.sleep(0.1)
@@ -361,10 +392,18 @@ async def close_position_maker(
                     except Exception:  # noqa: BLE001
                         continue
                     od = (r.get("data") or [{}])[0]
-                    if str(od.get("state", "")) == "filled":
-                        filled_sz = float(od.get("accFillSz") or 0.0)
-                        fill_avg = float(od.get("avgPx") or 0.0)
-                        fee_total = abs(float(od.get("fee") or 0.0))
+                    try:
+                        acc = float(od.get("accFillSz") or 0.0)
+                        avg = float(od.get("avgPx") or 0.0)
+                        fee = abs(float(od.get("fee") or 0.0))
+                    except (TypeError, ValueError):
+                        acc = avg = fee = 0.0
+                    if acc > 0:
+                        filled_sz = acc
+                        if avg > 0:
+                            fill_avg = avg
+                        fee_total = max(fee_total, fee)
+                    if str(od.get("state", "")) in {"filled", "canceled", "mmp_canceled"}:
                         break
                 if filled_sz > 0:
                     result.taker_qty += filled_sz

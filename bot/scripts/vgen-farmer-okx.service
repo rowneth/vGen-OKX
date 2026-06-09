@@ -1,5 +1,5 @@
 [Unit]
-Description=vGen OKX volume farmer (paper — Fix5 ATR/limit-TP)
+Description=vGen OKX volume farmer (v3 5M campaign — DEMO; switch --demo to --live + LIVE_OKX_ACK for real money)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,9 +9,12 @@ User=root
 WorkingDirectory=/root/vGen-OKX/bot
 EnvironmentFile=-/root/vGen-OKX/bot/.env
 Environment="PYTHONUNBUFFERED=1"
+# NOTE: paper mode accrues ZERO real volume — the 5M bounty needs --demo (rehearsal)
+# or --live (real). For --live also set LIVE_OKX_ACK=I_UNDERSTAND in .env.
 ExecStart=/root/vGen-OKX/bot/.venv/bin/python3 /root/vGen-OKX/bot/scripts/run_volume_farmer_okx.py \
-    --config /root/vGen-OKX/bot/config/config_volume_farmer_okx.yaml \
-    --label okx-paper \
+    --config /root/vGen-OKX/bot/config/config_volume_farmer_okx_v3.yaml \
+    --label okx-v3 \
+    --demo \
     --duration-days 365
 Restart=always
 RestartSec=15

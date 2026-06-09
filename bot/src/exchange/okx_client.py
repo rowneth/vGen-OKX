@@ -88,9 +88,15 @@ class OKXClient:
         # (get_order / get_positions / orders-history) must not surface a
         # transient throttle as "no fill" / "still open" to the executor, so we
         # retry them a bounded number of times with exponential backoff.
+        # The same policy covers network-level errors (connection reset,
+        # timeout) on GETs — equally transient, equally idempotent.
         self._max_retries = 3
         self._retry_base_s = 0.25
         self._retry_max_s = 2.0
+        # Hot-path polls (ticker/order/position inside re-peg loops) get a
+        # short per-call timeout so one hung socket cannot eat most of a
+        # 20s maker-exit budget waiting on the blanket 15s client timeout.
+        self._hot_timeout = aiohttp.ClientTimeout(total=6)
 
     async def __aenter__(self) -> "OKXClient":
         if self._session is None:
@@ -145,6 +151,11 @@ class OKXClient:
         if after is not None:
             params["after"] = str(int(after))
         resp = await self._request("GET", path, params=params, auth=False)
+        if str(resp.get("code", "0")) != "0":
+            # An error payload must be distinguishable from "no new candles":
+            # the poll loop treats [] as a quiet bar and would silently stall
+            # on a persistent endpoint error.
+            raise RuntimeError(f"OKX candles error code={resp.get('code')}: {resp.get('msg')}")
         return list(resp.get("data") or [])
 
     async def get_instrument(self, symbol: str) -> Dict[str, Any]:
@@ -158,14 +169,24 @@ class OKXClient:
         return data[0]
 
     async def get_ticker(self, symbol: str) -> Dict[str, Any]:
-        """Latest ticker (last, bid, ask, ...)."""
+        """Latest ticker (last, bid, ask, ...). Hot-path: short timeout."""
         path = "/api/v5/market/ticker"
         params = {"instId": to_okx_inst_id(symbol)}
-        resp = await self._request("GET", path, params=params, auth=False)
+        resp = await self._request("GET", path, params=params, auth=False, hot=True)
         data = resp.get("data") or []
         if not data:
             raise RuntimeError(f"OKX: no ticker data for {symbol}")
         return data[0]
+
+    async def get_server_time_ms(self) -> int:
+        """OKX server time (ms epoch). Used to sanity-check local clock drift
+        at startup — a drift past OKX's ~30s signing window breaks every
+        private call with code 50102."""
+        resp = await self._request("GET", "/api/v5/public/time", auth=False)
+        data = resp.get("data") or []
+        if not data:
+            raise RuntimeError("OKX: no server time")
+        return int(data[0]["ts"])
 
     # ------------------------------------------------------------------
     # Account / positions
@@ -181,7 +202,7 @@ class OKXClient:
         params: Dict[str, Any] = {"instType": "SWAP"}
         if symbol is not None:
             params["instId"] = to_okx_inst_id(symbol)
-        return await self._request("GET", path, params=params, auth=True)
+        return await self._request("GET", path, params=params, auth=True, hot=True)
 
     async def set_position_mode(self, mode: str) -> Dict[str, Any]:
         """Set hedge ('long_short_mode') vs one-way ('net_mode') globally."""
@@ -294,7 +315,35 @@ class OKXClient:
             params["ordId"] = ord_id
         if client_oid:
             params["clOrdId"] = client_oid
-        return await self._request("GET", "/api/v5/trade/order", params=params, auth=True)
+        return await self._request("GET", "/api/v5/trade/order", params=params, auth=True, hot=True)
+
+    async def amend_order(
+        self, symbol: str, *,
+        ord_id: Optional[str] = None, client_oid: Optional[str] = None,
+        new_px: Optional[str] = None, new_sz: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-price (and/or re-size) a resting order in ONE call.
+
+        Replaces the cancel+replace re-peg dance: half the round trips, no
+        naked window with nothing resting on the book, and the amended order
+        keeps its ordId so fill polling continues seamlessly. ``cxlOnFail``
+        is deliberately False — on amend failure the original order stays
+        resting and the caller falls back to cancel+replace explicitly.
+        """
+        if not (ord_id or client_oid):
+            raise ValueError("amend_order: need ord_id or client_oid")
+        if not (new_px or new_sz):
+            raise ValueError("amend_order: need new_px or new_sz")
+        body: Dict[str, Any] = {"instId": to_okx_inst_id(symbol)}
+        if ord_id:
+            body["ordId"] = ord_id
+        if client_oid:
+            body["clOrdId"] = client_oid
+        if new_px is not None:
+            body["newPx"] = str(new_px)
+        if new_sz is not None:
+            body["newSz"] = str(new_sz)
+        return await self._request("POST", "/api/v5/trade/amend-order", body=body, auth=True)
 
     async def get_pending_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {"instType": "SWAP"}
@@ -314,15 +363,27 @@ class OKXClient:
     async def cancel_algos(
         self, symbol: str, algo_ids: List[str],
     ) -> Dict[str, Any]:
-        """Cancel one or more algo orders (max 10 per call per OKX spec)."""
+        """Cancel algo orders, chunked at OKX's 10-per-call cap.
+
+        Previously truncated silently at 10, leaving stale TP/SL algos
+        resting; now every id is cancelled across as many calls as needed
+        and the last payload is returned (per-chunk errors are logged).
+        """
         if not algo_ids:
             return {"code": "0", "data": []}
-        body: List[Dict[str, Any]] = [
-            {"instId": to_okx_inst_id(symbol), "algoId": str(a)} for a in algo_ids[:10]
-        ]
-        return await self._request(
-            "POST", "/api/v5/trade/cancel-algos", body=body, auth=True,
-        )
+        last: Dict[str, Any] = {"code": "0", "data": []}
+        for i in range(0, len(algo_ids), 10):
+            chunk = algo_ids[i:i + 10]
+            body: List[Dict[str, Any]] = [
+                {"instId": to_okx_inst_id(symbol), "algoId": str(a)} for a in chunk
+            ]
+            last = await self._request(
+                "POST", "/api/v5/trade/cancel-algos", body=body, auth=True,
+            )
+            if str(last.get("code", "")) not in ("0", ""):
+                LOGGER.warning("cancel_algos chunk failed code=%s ids=%s",
+                               last.get("code"), chunk)
+        return last
 
     async def close_position_market(
         self, symbol: str, *,
@@ -403,6 +464,7 @@ class OKXClient:
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Any] = None,  # dict for most endpoints; list for batch endpoints
         auth: bool = False,
+        hot: bool = False,           # hot-path poll: short per-call timeout
     ) -> Dict[str, Any]:
         if self._session is None:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
@@ -415,6 +477,12 @@ class OKXClient:
         body_str = json.dumps(body, separators=(",", ":")) if body is not None else ""
 
         url = self._base_url + request_path
+        # ONLY GETs are retried (throttles AND network errors). GETs
+        # (get_order / get_positions / orders-history) are idempotent.
+        # Re-sending a POST (e.g. place_order) could double-submit or, if the
+        # first silently landed, orphan an order — so POSTs surface errors to
+        # the caller instead.
+        retryable = method.upper() == "GET"
         attempt = 0
         while True:
             # Headers (and the auth signature) are rebuilt every attempt: the
@@ -435,42 +503,66 @@ class OKXClient:
             kwargs: Dict[str, Any] = {"headers": headers}
             if body_str:
                 kwargs["data"] = body_str
+            if hot:
+                kwargs["timeout"] = self._hot_timeout
 
-            async with self._session.request(method.upper(), url, **kwargs) as resp:
-                text = await resp.text()
-                try:
-                    payload = json.loads(text)
-                except json.JSONDecodeError:
-                    raise RuntimeError(f"OKX non-JSON response: HTTP {resp.status}: {text[:200]}")
-                code = str(payload.get("code", ""))
-                # Rate-limit backoff: HTTP 429 or an OKX too-frequent/busy code.
-                # Retry a bounded number of times so a transient throttle on a
-                # confirmation poll is not misread by the executor as a missing
-                # fill or a still-open position.
-                #
-                # ONLY GETs are retried. GETs (get_order / get_positions /
-                # orders-history) are idempotent. Re-sending a POST (e.g.
-                # place_order) on a 429 could double-submit or, if the first
-                # silently landed, orphan an order — so POSTs surface the
-                # rate-limit to the caller instead.
-                retryable = method.upper() == "GET"
-                if retryable and (resp.status == 429 or code in _RATE_LIMIT_CODES) and attempt < self._max_retries:
+            try:
+                async with self._session.request(method.upper(), url, **kwargs) as resp:
+                    status = resp.status
+                    text = await resp.text()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # Network-level transient (connection reset, DNS hiccup, hung
+                # socket). Same treatment as a throttle: bounded retry for
+                # idempotent GETs so confirmation polls don't surface a socket
+                # blip as "no fill" / "still open".
+                if retryable and attempt < self._max_retries:
                     delay = min(self._retry_base_s * (2 ** attempt), self._retry_max_s)
                     LOGGER.warning(
-                        "OKX rate-limited (HTTP %s code=%s) — retry %d/%d in %.2fs path=%s",
-                        resp.status, code, attempt + 1, self._max_retries, delay, request_path,
+                        "OKX network error (%s: %s) — retry %d/%d in %.2fs path=%s",
+                        type(exc).__name__, exc, attempt + 1, self._max_retries, delay, request_path,
                     )
                     attempt += 1
                     await asyncio.sleep(delay)
                     continue
-                if resp.status >= 400:
-                    raise RuntimeError(f"OKX HTTP {resp.status}: {payload}")
-                if code != "0" and code != "":
-                    # OKX returns code=0 on success. Non-zero is an API-level error.
-                    # Some endpoints (place_order) return code=0 outer with per-item
-                    # errors in data[].sCode; we let the caller handle those.
-                    if code in {"50112", "50113", "50111", "50114", "50102"}:
-                        raise RuntimeError(f"OKX auth error code={code}: {payload.get('msg')}")
-                    LOGGER.warning("OKX returned code=%s msg=%s path=%s",
-                                   code, payload.get("msg"), request_path)
-                return payload
+                raise
+
+            # Rate-limit backoff BEFORE body parsing: edge throttles
+            # (Cloudflare) return HTML bodies on 429/5xx — exactly the case
+            # the retry exists for, so the status check must not depend on
+            # the body being JSON.
+            if retryable and status in (429, 502, 503, 504) and attempt < self._max_retries:
+                delay = min(self._retry_base_s * (2 ** attempt), self._retry_max_s)
+                LOGGER.warning(
+                    "OKX throttled/unavailable (HTTP %s) — retry %d/%d in %.2fs path=%s",
+                    status, attempt + 1, self._max_retries, delay, request_path,
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+                continue
+
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                raise RuntimeError(f"OKX non-JSON response: HTTP {status}: {text[:200]}")
+            code = str(payload.get("code", ""))
+            # OKX-level too-frequent/busy codes arrive with HTTP 200.
+            if retryable and code in _RATE_LIMIT_CODES and attempt < self._max_retries:
+                delay = min(self._retry_base_s * (2 ** attempt), self._retry_max_s)
+                LOGGER.warning(
+                    "OKX rate-limited (code=%s) — retry %d/%d in %.2fs path=%s",
+                    code, attempt + 1, self._max_retries, delay, request_path,
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+                continue
+            if status >= 400:
+                raise RuntimeError(f"OKX HTTP {status}: {payload}")
+            if code != "0" and code != "":
+                # OKX returns code=0 on success. Non-zero is an API-level error.
+                # Some endpoints (place_order) return code=0 outer with per-item
+                # errors in data[].sCode; we let the caller handle those.
+                if code in {"50112", "50113", "50111", "50114", "50102"}:
+                    raise RuntimeError(f"OKX auth error code={code}: {payload.get('msg')}")
+                LOGGER.warning("OKX returned code=%s msg=%s path=%s",
+                               code, payload.get("msg"), request_path)
+            return payload

@@ -177,6 +177,63 @@ class TelegramNotifier:
 		assert self._queue is not None
 		await self._queue.put(markdown_v2_text)
 
+	async def _post_with_retry(
+		self,
+		url: str,
+		*,
+		json_payload: Optional[Dict[str, Any]] = None,
+		form_factory: Optional[Any] = None,   # () -> aiohttp.FormData, rebuilt per attempt
+		attempts: int = 3,
+		what: str = "send",
+	) -> tuple:
+		"""POST to the Bot API with bounded retries on 429/5xx/network errors.
+
+		Honors Telegram's ``retry_after`` on 429 — burst moments (milestone +
+		exit + breaker cards together) are exactly when 429s happen, and
+		dropping a live close card there is the worst possible outcome. Other
+		4xx (e.g. MarkdownV2 parse errors) are NOT retried.
+
+		Returns ``(data, status, body)``: ``data`` is the decoded JSON on
+		success, else None with the last status/body for caller-side handling.
+		"""
+		assert self._session is not None
+		status, body = 0, ""
+		for attempt in range(attempts):
+			try:
+				kwargs: Dict[str, Any] = (
+					{"json": json_payload} if json_payload is not None
+					else {"data": form_factory()}
+				)
+				async with self._session.post(url, **kwargs) as resp:
+					status = resp.status
+					if status == 200:
+						# HTTP 200 = delivered. An unparseable body must not be
+						# retried (that would double-send the message).
+						try:
+							return await resp.json(), status, ""
+						except Exception:  # noqa: BLE001
+							return {}, status, ""
+					body = await resp.text()
+					if status == 429:
+						delay = 1.0
+						try:
+							delay = float((json.loads(body).get("parameters") or {}).get("retry_after", 1.0))
+						except Exception:  # noqa: BLE001
+							pass
+						await asyncio.sleep(min(delay, 10.0) + 0.2)
+						continue
+					if status >= 500:
+						await asyncio.sleep(0.5 * (attempt + 1))
+						continue
+					break  # other 4xx: not retryable
+			except asyncio.CancelledError:
+				raise
+			except Exception as exc:  # noqa: BLE001
+				status, body = -1, str(exc)
+				await asyncio.sleep(0.5 * (attempt + 1))
+		LOGGER.error("Telegram %s failed (status=%s): %s", what, status, body[:500])
+		return None, status, body
+
 	async def send_and_get_id(
 		self,
 		markdown_v2_text: str,
@@ -204,42 +261,31 @@ class TelegramNotifier:
 		}
 		if reply_to_message_id is not None:
 			payload["reply_to_message_id"] = reply_to_message_id
+		data, status, body = await self._post_with_retry(
+			url, json_payload=payload, what="send_and_get_id",
+		)
+		# Graceful fallback: if the message we're replying to has been deleted
+		# or never existed (common after token swap or photo upload failure),
+		# drop the reply_to and retry once unthreaded.
+		if (
+			data is None
+			and status == 400
+			and "message to be replied not found" in body
+			and reply_to_message_id is not None
+		):
+			LOGGER.info(
+				"reply target msg_id=%s missing; retrying without thread",
+				reply_to_message_id,
+			)
+			payload.pop("reply_to_message_id", None)
+			data, _, _ = await self._post_with_retry(
+				url, json_payload=payload, what="send_and_get_id(no-thread)",
+			)
+		if data is None:
+			return None
 		try:
-			async with self._session.post(url, json=payload) as response:
-				if response.status != 200:
-					body = await response.text()
-					# Graceful fallback: if the message we're replying to has been
-					# deleted or never existed (common after token swap or photo
-					# upload failure), drop the reply_to and retry once.
-					if (
-						response.status == 400
-						and "message to be replied not found" in body
-						and reply_to_message_id is not None
-					):
-						LOGGER.info(
-							"reply target msg_id=%s missing; retrying without thread",
-							reply_to_message_id,
-						)
-						payload.pop("reply_to_message_id", None)
-						async with self._session.post(url, json=payload) as retry:
-							if retry.status == 200:
-								data = await retry.json()
-								return int(data["result"]["message_id"])
-							rbody = await retry.text()
-							LOGGER.error(
-								"Telegram retry without reply failed status=%s body=%s",
-								retry.status, rbody[:300],
-							)
-							return None
-					LOGGER.error(
-						"Telegram send_and_get_id failed status=%s body=%s",
-						response.status, body[:500],
-					)
-					return None
-				data = await response.json()
-				return int(data["result"]["message_id"])
-		except Exception as exc:  # noqa: BLE001
-			LOGGER.error("Telegram send_and_get_id exception: %s", exc)
+			return int(data["result"]["message_id"])
+		except (KeyError, TypeError, ValueError):
 			return None
 
 	async def send_photo(
@@ -265,25 +311,28 @@ class TelegramNotifier:
 			self._session = aiohttp.ClientSession(timeout=self._timeout)
 			self._owns_session = True
 		url = f"https://api.telegram.org/bot{self._bot_token}/sendPhoto"
-		form = aiohttp.FormData()
-		form.add_field("chat_id", str(self._chat_id))
-		form.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
-		if caption:
-			full_caption = (f"*\\[{_md(self._label)}\\]*  " + caption) if self._label else caption
-			form.add_field("caption", full_caption)
-			form.add_field("parse_mode", "MarkdownV2")
-		if reply_to_message_id is not None:
-			form.add_field("reply_to_message_id", str(reply_to_message_id))
+
+		def _build_form() -> aiohttp.FormData:
+			# Rebuilt per retry attempt — aiohttp consumes FormData on send.
+			form = aiohttp.FormData()
+			form.add_field("chat_id", str(self._chat_id))
+			form.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
+			if caption:
+				full_caption = (f"*\\[{_md(self._label)}\\]*  " + caption) if self._label else caption
+				form.add_field("caption", full_caption)
+				form.add_field("parse_mode", "MarkdownV2")
+			if reply_to_message_id is not None:
+				form.add_field("reply_to_message_id", str(reply_to_message_id))
+			return form
+
+		data, _, _ = await self._post_with_retry(
+			url, form_factory=_build_form, what="send_photo",
+		)
+		if data is None:
+			return None
 		try:
-			async with self._session.post(url, data=form) as response:
-				if response.status != 200:
-					body = await response.text()
-					LOGGER.error("Telegram send_photo failed status=%s body=%s", response.status, body[:500])
-					return None
-				data = await response.json()
-				return int(data["result"]["message_id"])
-		except Exception as exc:  # noqa: BLE001
-			LOGGER.error("Telegram send_photo exception: %s", exc)
+			return int(data["result"]["message_id"])
+		except (KeyError, TypeError, ValueError):
 			return None
 
 	async def set_reaction(
@@ -340,7 +389,23 @@ class TelegramNotifier:
 		req_timeout = aiohttp.ClientTimeout(total=timeout + 10)
 		try:
 			async with self._session.get(url, params=params, timeout=req_timeout) as resp:
+				if resp.status == 409:
+					# Two bot instances share this token (e.g. paper + demo
+					# variants): Telegram serves updates to only one of them.
+					# This was a silent DEBUG line — commands looked dead with
+					# no clue why. Surface it and back off the hot retry loop.
+					body = await resp.text()
+					LOGGER.warning(
+						"getUpdates 409 Conflict — another instance is polling "
+						"this bot token; commands will NOT work here. %s",
+						body[:200],
+					)
+					await asyncio.sleep(5.0)
+					return []
 				if resp.status != 200:
+					body = await resp.text()
+					LOGGER.warning("get_updates status=%s: %s", resp.status, body[:200])
+					await asyncio.sleep(2.0)
 					return []
 				data = await resp.json()
 				return data.get("result", [])
@@ -396,16 +461,24 @@ class TelegramNotifier:
 		}
 		if reply_to_message_id is not None:
 			payload["reply_to_message_id"] = reply_to_message_id
+		data, status, body = await self._post_with_retry(
+			url, json_payload=payload, what="send_with_buttons",
+		)
+		if (
+			data is None
+			and status == 400
+			and "message to be replied not found" in body
+			and reply_to_message_id is not None
+		):
+			payload.pop("reply_to_message_id", None)
+			data, _, _ = await self._post_with_retry(
+				url, json_payload=payload, what="send_with_buttons(no-thread)",
+			)
+		if data is None:
+			return None
 		try:
-			async with self._session.post(url, json=payload) as resp:
-				if resp.status != 200:
-					body = await resp.text()
-					LOGGER.error("send_with_buttons failed: %s %s", resp.status, body[:300])
-					return None
-				data = await resp.json()
-				return int(data["result"]["message_id"])
-		except Exception as exc:
-			LOGGER.error("send_with_buttons error: %s", exc)
+			return int(data["result"]["message_id"])
+		except (KeyError, TypeError, ValueError):
 			return None
 
 	async def _run_worker(self) -> None:
@@ -424,16 +497,15 @@ class TelegramNotifier:
 				"disable_web_page_preview": True,
 			}
 			try:
-				async with self._session.post(url, json=payload) as response:
-					if response.status != 200:
-						body = await response.text()
-						LOGGER.error(
-							"Telegram send failed status=%s body=%s",
-							response.status,
-							body[:500],
-						)
+				# Bounded retry (incl. 429 retry_after) — queued cards used to be
+				# dropped permanently on the first throttle, which hit exactly
+				# during burst moments (exit + milestone + breaker together).
+				await self._post_with_retry(url, json_payload=payload, what="queued send")
 			except Exception as exc:  # noqa: BLE001 - network is noisy; never crash caller
 				LOGGER.error("Telegram send exception: %s", exc)
+			# Gentle pacing between queued sends keeps a burst under Telegram's
+			# per-chat rate limit instead of slamming into it.
+			await asyncio.sleep(0.05)
 
 	# ------------------------------------------------------------------
 	# High-level lifecycle events

@@ -1,0 +1,202 @@
+app:
+  name: volume-farmer-okx-v3
+  environment: development
+  timezone: Asia/Colombo
+  log_level: INFO
+
+# OKX VOLUME FARMER — v3 "5M campaign" config.
+#
+# Goal: 5,000,000 USDT counted volume within 30 days (reward 1,500 USDT),
+# at the all-maker net cost floor (~$120-130 per 1M after the 40% rebate).
+#
+# v2 → v3 changes (from the 2026-06 full audit):
+#   THROUGHPUT (the binding constraint — v2 ceiling was ~$3.2M/month):
+#   1. reentry_same_bar: a close at bar N can re-enter on bar N — the minimum
+#      cycle drops from 2 bars to 1 (volume ceiling doubles).
+#   2. Session loss-streak cooldown now counts ONLY real SL hits
+#      (consecutive_losses_count_reasons) — time-stop scratches no longer
+#      trigger 1h entry pauses (this was the single biggest self-inflicted
+#      volume loss in live data).
+#   3. atr.min_usd: 0 — quiet regimes are the CHEAPEST to farm (tiny drift,
+#      easy maker fills); the old $120 gate blanked out whole days.
+#   4. skip_hours removed: -12.5% volume for ~0.7bps/trade was a bad trade
+#      against a hard monthly target.
+#   5. min_bar_range_bps 3.0 → 1.0: dead bars produce cheap maker scratches.
+#   6. working_capital_usd is EXPLICIT (v2 omitted it and silently sized off
+#      the full wallet); margin_fraction 0.025 → 0.04.
+#   7. pace: the controller scales margin per trade to converge on the
+#      target by day 30 (bounded 0.02..0.08).
+#   COST (already near the floor — keep it there):
+#   8. maker_exit.ladder_start_frac 0.5: first exit peg starts mid-ladder —
+#      fills sooner for a fraction of the spread (drift while waiting at the
+#      passive touch costs more than the spread given up).
+#   9. entry_repeg.use_amend: re-price via amend-order (1 REST call, no naked
+#      window) instead of cancel+replace.
+#  10. entry_repeg.max_chase_bps 10: stop chasing a runaway touch — the TP/SL
+#      bracket is anchored to the signal, so a long chase skews it.
+#  11. tp_bps_max 25 → 18 (backtest: reachability collapses past ~18bps under
+#      the 1-bar time stop; the old 25 contradicted its own comment).
+#  12. rebate_all_legs: true — the campaign rebates 40% of ALL fees (maker
+#      AND taker), per the program terms.
+#
+# IMPORTANT — DEMO FIRST. Run with --demo until a full day looks clean.
+
+exchange:
+  symbol: BTC_USDT
+  timeframe: 5m
+
+fees:
+  maker: 0.0002                    # 0.020% OKX maker
+  taker: 0.0005                    # 0.050% OKX taker
+  rebate_pct: 0.40                 # 40% rebate on fees
+  rebate_all_legs: true            # rebate applies to maker AND taker legs
+
+farmer:
+  capital_usd: 500.0               # sim equity (paper bookkeeping view)
+  working_capital_usd: 1500.0      # live sizing base cap: min(wallet, this)
+  leverage: 0                      # 0 = dynamic
+
+  margin_fraction_per_trade: 0.04  # base; the pace controller scales it
+  sizing:
+    dynamic_leverage: true
+    risk_per_trade_pct: 0.025
+    max_leverage: 30               # liq ~293bps vs ~70bps SL: 4x headroom
+    min_leverage: 5
+
+  # Campaign pace controller: margin_fraction is scaled by
+  # (required volume/day) / (achieved volume/day), clamped to
+  # [min_margin_fraction, max_margin_fraction], after warmup_trips.
+  pace:
+    enabled: true
+    campaign_days: 30
+    min_margin_fraction: 0.02
+    max_margin_fraction: 0.08
+    warmup_trips: 10
+
+  # Fallback fixed TP/SL (used when atr.relative = false)
+  tp_bps: 8.0
+  sl_bps: 50.0
+  max_hold_bars: 999               # legacy fallback; superseded by time_stop
+
+  # 1-bar time stop: the data-proven optimum (-3.04 bps/trade vs -4.67 with
+  # no stop over 15k+ backtest entries). The primary loser exit.
+  time_stop:
+    enabled: true
+    max_hold_bars: 1
+    bar_seconds: 300
+
+  # Maker-first exit ladder for the time-stop close. ladder_start_frac 0.5:
+  # first peg starts halfway to the aggressive maker price — for a volume
+  # farmer the adverse drift while waiting at the passive touch costs more
+  # than the half-spread given up.
+  maker_exit:
+    enabled: true
+    repeg_ms: 750
+    max_repegs: 8
+    max_exit_seconds: 20.0
+    max_adverse_bps: 15.0
+    poll_ms: 120
+    ladder: true
+    ladder_max_frac: 1.0
+    ladder_start_frac: 0.5
+
+  # Entry re-peg chase. taker_fallback stays ON: a missed entry forfeits
+  # 2x notional of counted volume; the taker leg still nets positive against
+  # the bounty (≈$300/1M) and rebates 40% too. max_chase_bps bounds the
+  # TP/SL-bracket skew of a long chase; use_amend halves re-peg round trips.
+  entry_repeg:
+    enabled: true
+    repeg_ms: 8000
+    max_repegs: 6
+    max_entry_seconds: 60.0
+    poll_ms: 150
+    taker_fallback: true
+    max_chase_bps: 10.0
+    use_amend: true
+
+  entry:
+    mode: micro_momentum
+    min_bar_range_bps: 1.0         # dead bars = cheap maker scratches; farm them
+    max_bar_range_bps: 40.0        # keep: adverse selection in violent bars
+    skip_hours: []                 # volume target beats the ~0.7bps/t saving
+
+  # Re-enter on the same bar a position closed (cycle floor 1 bar, not 2).
+  reentry_same_bar: true
+
+  alternate_direction: false
+
+  limit_tp: true
+
+  atr:
+    period: 14
+    relative: true
+    tp_mult: 1.0
+    sl_mult: 6.0                   # SL is a catastrophic floor; time-stop is
+                                   # the real risk control (maker-fill ~100%)
+    tp_bps_min: 6.0
+    sl_bps_min: 8.0
+    min_usd: 0.0                   # quiet markets are the cheapest volume
+    tp_fee_cover_mult: 2.0         # floor = 2.0*2.4 + 2.0 = 6.8bps
+    tp_profit_buffer_bps: 2.0
+    tp_bps_max: 18.0               # reachability collapses past ~18bps @ 1 bar
+
+  trend_break:
+    enabled: false
+    min_bars_held: 3
+    adverse_bps: 20.0
+
+risk:
+  # Session paper halts stay LOOSE on purpose (they exit the process); the
+  # real capital protection is the executor's live_breaker_* below.
+  daily_loss_limit_pct: 0.50
+  max_drawdown_pct: 0.95
+  live_breaker_daily_loss_pct: 0.05    # -5% of day's real wallet -> pause entries
+  live_breaker_max_drawdown_pct: 0.10  # -10% from peak -> hard halt
+  consecutive_losses_limit: 3
+  consecutive_losses_cooldown_bars: 12   # 12 x 5m = 1h
+  # ONLY these reasons advance the streak (session AND executor breaker).
+  # Time-stop scratches are designed fee-cost exits, not adverse moves.
+  consecutive_losses_count_reasons: ["sl", "sl_ambiguous"]
+  stop_on_volume_target: true
+
+target:
+  volume_usd: 5000000.0
+  volume_buffer_pct: 0.02          # halt 2% PAST target: never miss the bounty
+                                   # to a session-vs-exchange counting gap
+  reward_usd: 1500.0               # shown in journey projections
+  min_fee_cover_pct: 0.40
+
+notifications:
+  telegram:
+    enabled: true
+    send_daily: true               # now actually implemented (daily digest)
+    send_errors: true
+    send_milestones: true
+    daily_report_hour: 0           # UTC
+    rebate_reminder:
+      enabled: true
+      equity_floor_pct: 0.85
+      drawdown_pct: 0.08
+      min_rebate_usd: 5.0
+      cooldown_minutes: 60
+      mention_handles:
+        - "@rowneth"
+        - "@Litchth"
+        - "@ChaanaCM"
+
+# DEMO-only execution friction (ignored under --live).
+realism:
+  enabled: true
+  seed: 1337
+  entry:
+    fill_prob: 0.85
+    slip_bps: 0.4
+    taker_fee_mult: 2.5
+  exit:
+    sl_slip_bps: 3.0
+    taker_exit_fee_mult: 2.5
+    tp_fill_prob: 0.90
+    tp_miss_giveback_bps: 6.0
+
+reporting:
+  output_dir: data/reports

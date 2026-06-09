@@ -100,6 +100,16 @@ class EntryRepegConfig:
     max_entry_seconds: float = 60.0
     poll_ms: int = 150
     taker_fallback: bool = False
+    # Abandon the chase when the touch has drifted more than this many bps
+    # from the signal price (0 = no limit). The TP/SL bracket stays anchored
+    # to the SIGNAL, so an uncapped chase can fill with the TP nearly through
+    # price (or the SL effectively wider than configured) — bounding the chase
+    # bounds that bracket skew.
+    max_chase_bps: float = 0.0
+    # Re-price the resting order via amend-order (1 REST call, no naked
+    # window) instead of cancel+replace (2 calls + a gap with nothing resting).
+    # Falls back to cancel+replace automatically when an amend is rejected.
+    use_amend: bool = True
 
 
 @dataclass
@@ -279,8 +289,18 @@ class LiveVolumeExecutorOKX:
 
     # Mutable state
     _open_trade: Optional[LiveTradeOKX] = field(default=None, init=False)
-    _trade_count: int = field(default=0, init=False)
+    # Synchronous gate claim: set in consume_session_event BEFORE the entry
+    # task is scheduled, cleared when _handle_entry finishes claiming (or
+    # bails). Without it, two entry events landing in the same loop tick both
+    # passed the _open_trade check and opened two concurrent positions.
+    _entry_pending: bool = field(default=False, init=False)
+    _trade_count: int = field(default=0, init=False)        # FILLED entries
+    _attempt_count: int = field(default=0, init=False)      # placement attempts
     _watcher_task: Optional[asyncio.Task] = field(default=None, init=False)
+    # Strong refs to fire-and-forget tasks (entry lifecycle, recovery watcher,
+    # cards). The event loop holds only weak refs — without this set a GC pass
+    # can collect an in-flight task mid-trade (documented asyncio pitfall).
+    _bg_tasks: set = field(default_factory=set, init=False)
     # DEMO realism RNG (seeded once in initialize) + per-peg fill decisions.
     _demo_rng: Optional["random.Random"] = field(default=None, init=False)
     _demo_fill_decisions: Dict[str, bool] = field(default_factory=dict, init=False)
@@ -638,11 +658,23 @@ class LiveVolumeExecutorOKX:
             LOGGER.warning("max_live_trades=%d reached; ignoring entry",
                            self.max_live_trades)
             return
-        if self._open_trade is not None and not self._open_trade.closed:
-            LOGGER.warning("ignoring entry — prior live trade still open: %s",
-                           self._open_trade.cl_ord_id)
+        if self._entry_pending or (self._open_trade is not None and not self._open_trade.closed):
+            LOGGER.warning("ignoring entry — prior live trade still open/pending: %s",
+                           self._open_trade.cl_ord_id if self._open_trade else "<claiming>")
             return
-        asyncio.create_task(self._handle_entry(evt.payload))
+        # Claim the single-position gate SYNCHRONOUSLY — _handle_entry only
+        # assigns _open_trade after several awaits, so without this claim two
+        # back-to-back events could both pass the gate above.
+        self._entry_pending = True
+        self._spawn(self._handle_entry(evt.payload), name="handle_entry")
+
+    # ------------------------------------------------------------------
+    def _spawn(self, coro, *, name: str) -> asyncio.Task:
+        """create_task with a strong reference held until completion."""
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ------------------------------------------------------------------
     async def _fetch_wallet_usdt(self) -> Optional[float]:
@@ -678,6 +710,13 @@ class LiveVolumeExecutorOKX:
         lev = float(payload.get("leverage") or 0.0)
         if lev <= 0:
             return sim_notional
+        # The session's pace controller scales margin per trade to stay on the
+        # campaign target; honor its fraction when present (bounded by config),
+        # falling back to the static config value.
+        margin_frac = self.margin_frac
+        payload_frac = float(payload.get("margin_fraction") or 0.0)
+        if payload_frac > 0:
+            margin_frac = min(payload_frac, max(self.margin_frac * 3.0, self.margin_frac))
         real_bal = await self._fetch_wallet_usdt()
         if not real_bal or real_bal <= 0:
             LOGGER.warning("real balance unavailable; falling back to SIM notional $%.2f", sim_notional)
@@ -688,16 +727,36 @@ class LiveVolumeExecutorOKX:
         capped = self.working_capital_usd > 0 and real_bal > self.working_capital_usd
         if capped:
             base = self.working_capital_usd
-        notional = base * self.margin_frac * lev
+        notional = base * margin_frac * lev
         LOGGER.info(
             "sizing on %s: $%.4f × margin_frac %.3f × lev %.1f = notional $%.2f (wallet $%.2f, sim was $%.2f)",
             "WORKING CAP" if capped else "REAL wallet",
-            base, self.margin_frac, lev, notional, real_bal, sim_notional,
+            base, margin_frac, lev, notional, real_bal, sim_notional,
         )
         return notional
 
     async def _handle_entry(self, payload: Dict[str, Any]) -> None:
         """Place a real OKX order matching the session's entry decision."""
+        try:
+            trade, ok_side, pos_side, sz_payload = await self._prepare_entry(payload)
+        finally:
+            # Gate ownership transfers from the synchronous _entry_pending
+            # claim to _open_trade (set inside _prepare_entry) — or is
+            # released entirely when sizing bailed.
+            self._entry_pending = False
+        if trade is None:
+            return
+        try:
+            await self._submit_and_watch(trade, payload, ok_side, pos_side, sz_payload)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("entry lifecycle error (cid=%s): %s", trade.cl_ord_id, exc)
+            # Never let an unexpected placement error wedge the entry gate.
+            # (Once filled, _watch_open_position owns gate release.)
+            if self._open_trade is trade and not trade.filled and not trade.extras.get("still_open"):
+                self._open_trade = None
+
+    async def _prepare_entry(self, payload: Dict[str, Any]):
+        """Size + build the trade and claim the gate. Returns (None, …) to skip."""
         side = str(payload["side"]).lower()                 # long | short
         entry_req = float(payload["price"])
         notional = float(payload["notional"])
@@ -718,35 +777,39 @@ class LiveVolumeExecutorOKX:
         if contracts < self._min_sz:
             LOGGER.warning("sized %.4f contracts < minSz %.4f; skipping",
                            contracts, self._min_sz)
-            return
+            return None, "", None, ""
 
-        # Pin the entry to the current top-of-book so post_only lands at the
-        # front of the maker queue. The bar-close reference price is stale by
-        # the time we submit (5–25s after the bar close); placing AT the close
-        # leaves us deep in the book and post_only timeout-cancels with no fill.
-        # We never cross — best_ask-tick for long, best_bid+tick for short are
-        # both guaranteed post_only-valid. Falls back to bar close if ticker
-        # fetch fails. TP/SL targets stay anchored to the session's reference
-        # so paper/live ledgers don't diverge on those.
+        # Entry reference price. With the re-peg loop enabled (the default)
+        # the loop pins to the live touch itself per peg, so a pre-pin ticker
+        # fetch here would be fetched-and-discarded — skip the wasted call and
+        # the extra RTT of pre-fill latency. The legacy single-shot path still
+        # pins once below.
         ref_px = entry_req
-        try:
-            tk = await self.client.get_ticker(self.symbol)
-            best_bid = float(tk.get("bidPx") or 0.0)
-            best_ask = float(tk.get("askPx") or 0.0)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("ticker fetch failed, using bar close as entry px: %s", exc)
-            best_bid = best_ask = 0.0
-        if best_bid > 0 and best_ask > 0:
-            if side == "long":
-                # Top of bid book: 1 tick below best ask, but not above the signal
-                ref_px = min(best_ask - self._tick_sz, entry_req)
-            else:
-                # Top of ask book: 1 tick above best bid, but not below the signal
-                ref_px = max(best_bid + self._tick_sz, entry_req)
-            LOGGER.info(
-                "entry pin: side=%s bar_close=%.2f best_bid=%.2f best_ask=%.2f -> entry=%.2f (drift=%+.2f)",
-                side, entry_req, best_bid, best_ask, ref_px, ref_px - entry_req,
-            )
+        if not self.entry_repeg_cfg.enabled:
+            # Pin the entry to the current top-of-book so post_only lands at the
+            # front of the maker queue. The bar-close reference price is stale by
+            # the time we submit; placing AT the close leaves us deep in the book
+            # and post_only timeout-cancels with no fill. We never cross. Falls
+            # back to bar close if the ticker fetch fails. TP/SL targets stay
+            # anchored to the session's reference so ledgers don't diverge.
+            try:
+                tk = await self.client.get_ticker(self.symbol)
+                best_bid = float(tk.get("bidPx") or 0.0)
+                best_ask = float(tk.get("askPx") or 0.0)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("ticker fetch failed, using bar close as entry px: %s", exc)
+                best_bid = best_ask = 0.0
+            if best_bid > 0 and best_ask > 0:
+                if side == "long":
+                    # Top of bid book: 1 tick below best ask, but not above the signal
+                    ref_px = min(best_ask - self._tick_sz, entry_req)
+                else:
+                    # Top of ask book: 1 tick above best bid, but not below the signal
+                    ref_px = max(best_bid + self._tick_sz, entry_req)
+                LOGGER.info(
+                    "entry pin: side=%s bar_close=%.2f best_bid=%.2f best_ask=%.2f -> entry=%.2f (drift=%+.2f)",
+                    side, entry_req, best_bid, best_ask, ref_px, ref_px - entry_req,
+                )
         entry_px = _round_to_tick(ref_px, self._tick_sz)
         tp_px_r = _round_to_tick(tp_px, self._tick_sz)
         sl_px_r = _round_to_tick(sl_px, self._tick_sz)
@@ -769,8 +832,9 @@ class LiveVolumeExecutorOKX:
             sz_contracts=contracts, tp_px=tp_px_r, sl_px=sl_px_r,
             tp_bps=tp_bps, sl_bps=sl_bps, placed_at=time.time(),
         )
+        trade.extras["signal_px"] = entry_req
         self._open_trade = trade
-        self._trade_count += 1
+        self._attempt_count += 1
 
         sz_payload = _fmt_size(contracts, self._lot_sz)
         LOGGER.info(
@@ -778,9 +842,22 @@ class LiveVolumeExecutorOKX:
             side.upper(), to_okx_inst_id(self.symbol),
             sz_payload, notional, entry_px, tp_px_r, sl_px_r, cl_ord_id,
         )
+        return trade, ok_side, pos_side, sz_payload
+
+    async def _submit_and_watch(
+        self, trade: LiveTradeOKX, payload: Dict[str, Any],
+        ok_side: str, pos_side: Optional[str], sz_payload: str,
+    ) -> None:
+        entry_px = trade.entry_px_req
+        tp_px_r = trade.tp_px
+        sl_px_r = trade.sl_px
+        contracts = trade.sz_contracts
 
         if self.dry_run:
             LOGGER.info("DRY-RUN: not submitting")
+            # Release the gate — leaving the unfilled dry-run trade claimed
+            # wedged every subsequent entry of the run ("prior trade still open").
+            self._open_trade = None
             return
 
         # Entry placement — re-peg loop (B) by default, single-shot legacy if
@@ -840,10 +917,14 @@ class LiveVolumeExecutorOKX:
                 return
 
         # Entry is CONFIRMED filled on OKX (only reachable when a real position
-        # exists). Fire the entry card here — the single point where a real fill
-        # is known. Bounded inside _safe_callback so a slow Telegram/account
-        # fetch can never delay the close watcher below.
-        await self._fire_entry_filled(trade)
+        # exists). The fill — not the placement attempt — consumes the
+        # max_live_trades budget, so a string of no-fills can't exhaust it.
+        self._trade_count += 1
+        # Fire the entry card CONCURRENTLY — the card does a chart render +
+        # account fetch + photo upload (up to callback_timeout_s); awaiting it
+        # here used to delay the first position poll, so a fast TP inside that
+        # window was detected late and the gate sat closed for nothing.
+        self._spawn(self._fire_entry_filled(trade), name="entry_card")
         # Position is open — start the position + time-stop watch.
         await self._watch_open_position(trade)
 
@@ -864,8 +945,54 @@ class LiveVolumeExecutorOKX:
         side = trade.side
         deadline_wall = time.time() + cfg.max_entry_seconds
         repegs = 0
+        # Rejection storm guard (mirrors maker_exit): placement errors and
+        # would-cross rejections no longer burn the re-peg budget — only pegs
+        # that actually rested an order count.
+        rejects = 0
+        max_rejects = max(cfg.max_repegs * 3, 12)
+        signal_px = float(trade.extras.get("signal_px") or 0.0)
+        resting = False        # a live post_only currently rests on the book
+        last_px = 0.0
 
-        while time.time() < deadline_wall and repegs < cfg.max_repegs:
+        def _capture_fill(od: Dict[str, Any], note: str = "") -> bool:
+            """Adopt a filled order-state read into the trade. True if filled."""
+            if str(od.get("state", "")) != "filled":
+                return False
+            trade.filled = True
+            _raw = float(od.get("avgPx") or trade.entry_px_req)
+            trade.extras["demo_raw_fill_px"] = _raw
+            trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
+            trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
+            trade.real_open_fee = abs(float(od.get("fee") or 0.0))
+            self._last_entry_repegs = repegs
+            LOGGER.info(
+                "FILL  cid=%s  px=%.2f  fee=%.6f  repegs=%d%s",
+                trade.cl_ord_id, trade.fill_px, trade.real_open_fee, repegs,
+                f" ({note})" if note else "",
+            )
+            return True
+
+        async def _sweep_resting() -> bool:
+            """Cancel the resting peg; True if it actually filled in the race
+            window. MUST run on every exit path — an order left resting after
+            an 'abandoned' entry would fill later as an unmanaged position."""
+            nonlocal resting
+            if not resting or not trade.ord_id:
+                return False
+            try:
+                await self.client.cancel_order(self.symbol, ord_id=trade.ord_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("entry_repeg: cancel failed: %s", exc)
+            resting = False
+            try:
+                r = await self.client.get_order(
+                    self.symbol, ord_id=trade.ord_id, client_oid=trade.cl_ord_id,
+                )
+                return _capture_fill((r.get("data") or [{}])[0], "race-fill")
+            except Exception:  # noqa: BLE001
+                return False
+
+        while time.time() < deadline_wall and repegs < cfg.max_repegs and rejects < max_rejects:
             # 1. Fetch current touch
             try:
                 tk = await self.client.get_ticker(self.symbol)
@@ -885,121 +1012,150 @@ class LiveVolumeExecutorOKX:
                 px = best_bid + self._tick_sz
             entry_px = _round_to_tick(px, self._tick_sz)
 
-            # 3. Fresh client order id per peg
-            cl_ord = "vfox" + uuid.uuid4().hex[:14]
-            trade.cl_ord_id = cl_ord
-            trade.entry_px_req = entry_px
+            # 2b. Chase guard: the TP/SL bracket stays anchored to the SIGNAL
+            # price, so chasing too far skews the effective bracket (a TP can
+            # end up nearly through price at fill). Abandon past the limit.
+            if cfg.max_chase_bps > 0 and signal_px > 0:
+                drift_bps = ((entry_px - signal_px) if side == "long" else (signal_px - entry_px)) / signal_px * 10_000.0
+                if drift_bps > cfg.max_chase_bps:
+                    if await _sweep_resting():
+                        return True
+                    LOGGER.warning(
+                        "entry abandoned: touch drifted %+.1fbps from signal (max_chase %.1f)",
+                        drift_bps, cfg.max_chase_bps,
+                    )
+                    trade.canceled = True
+                    trade.cancel_reason = f"chase_limit_{drift_bps:.1f}bps"
+                    self._last_entry_repegs = repegs
+                    return False
 
             # DEMO: model post-only queue risk. Decide once per peg; on a "miss"
             # rest several ticks deeper so the demo engine genuinely won't fill —
-            # the existing cancel+re-peg loop then runs unchanged (no desync).
+            # the cancel/amend re-peg loop then runs unchanged (no desync).
             if self._demo_on():
-                hit = self._demo_fill_decisions.get(cl_ord)
+                demo_key = f"{trade.cl_ord_id}#{repegs}"
+                hit = self._demo_fill_decisions.get(demo_key)
                 if hit is None:
                     hit = self._demo_rng.random() <= self.demo_realism.entry_fill_prob
-                    self._demo_fill_decisions[cl_ord] = hit
+                    if len(self._demo_fill_decisions) > 2_000:
+                        self._demo_fill_decisions.clear()   # bound long-run growth
+                    self._demo_fill_decisions[demo_key] = hit
                 if not hit:
                     px2 = (best_ask - 3 * self._tick_sz) if side == "long" else (best_bid + 3 * self._tick_sz)
                     entry_px = _round_to_tick(px2, self._tick_sz)
+
+            # 3. Rest an order at entry_px: amend the existing one (1 call, no
+            # naked window) or place a fresh post_only with the TP/SL bundle.
+            if resting and cfg.use_amend and entry_px != last_px:
+                try:
+                    aresp = await self.client.amend_order(
+                        self.symbol, ord_id=trade.ord_id, new_px=str(entry_px),
+                    )
+                    adata = (aresp.get("data") or [{}])[0]
+                    ascode = str(adata.get("sCode", "0"))
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug("entry_repeg: amend error: %s", exc)
+                    ascode = "exc"
+                if ascode == "0":
+                    last_px = entry_px
                     trade.entry_px_req = entry_px
+                    LOGGER.info("entry_repeg #%d amended ordId=%s px=%.2f (bid=%.2f ask=%.2f)",
+                                repegs + 1, trade.ord_id, entry_px, best_bid, best_ask)
+                else:
+                    # Amend rejected: the order may have just filled, may have
+                    # been canceled, or the amend would cross. Poll once; on a
+                    # fill we're done, otherwise cancel + fall back to replace.
+                    try:
+                        r = await self.client.get_order(
+                            self.symbol, ord_id=trade.ord_id, client_oid=trade.cl_ord_id,
+                        )
+                        od = (r.get("data") or [{}])[0]
+                        if _capture_fill(od, "amend-race"):
+                            return True
+                        if str(od.get("state", "")) not in {"canceled", "mmp_canceled"}:
+                            await _sweep_resting()
+                            if trade.filled:
+                                return True
+                        else:
+                            resting = False
+                    except Exception:  # noqa: BLE001
+                        await _sweep_resting()
+                        if trade.filled:
+                            return True
+                    rejects += 1
+                    continue
+            elif not resting:
+                cl_ord = "vfox" + uuid.uuid4().hex[:14]
+                trade.cl_ord_id = cl_ord
+                trade.entry_px_req = entry_px
+                try:
+                    resp = await self.client.place_order(
+                        symbol=self.symbol,
+                        side=ok_side, pos_side=pos_side,
+                        td_mode=self.mgn_mode, ord_type="post_only",
+                        sz=sz_payload, px=str(entry_px),
+                        client_oid=cl_ord,
+                        tp_trigger_px=str(tp_px_r), tp_ord_px=str(tp_px_r),
+                        sl_trigger_px=str(sl_px_r), sl_ord_px="-1",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("entry_repeg: place_order error: %s", exc)
+                    rejects += 1
+                    await asyncio.sleep(cfg.poll_ms / 1000.0)
+                    continue
 
-            try:
-                resp = await self.client.place_order(
-                    symbol=self.symbol,
-                    side=ok_side, pos_side=pos_side,
-                    td_mode=self.mgn_mode, ord_type="post_only",
-                    sz=sz_payload, px=str(entry_px),
-                    client_oid=cl_ord,
-                    tp_trigger_px=str(tp_px_r), tp_ord_px=str(tp_px_r),
-                    sl_trigger_px=str(sl_px_r), sl_ord_px="-1",
-                )
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("entry_repeg: place_order error: %s", exc)
-                repegs += 1
-                await asyncio.sleep(cfg.poll_ms / 1000.0)
-                continue
+                data = (resp.get("data") or [{}])[0]
+                scode = str(data.get("sCode", "0"))
+                if scode != "0":
+                    # 51280 = would-cross. Touch moved during placement; re-peg.
+                    LOGGER.info(
+                        "entry_repeg #%d sCode=%s sMsg=%r — re-peg",
+                        repegs + 1, scode, data.get("sMsg"),
+                    )
+                    rejects += 1
+                    await asyncio.sleep(cfg.poll_ms / 1000.0)
+                    continue
 
-            data = (resp.get("data") or [{}])[0]
-            scode = str(data.get("sCode", "0"))
-            if scode != "0":
-                # 51280 = would-cross. Touch moved during placement; re-peg.
+                trade.ord_id = data.get("ordId")
+                resting = True
+                last_px = entry_px
                 LOGGER.info(
-                    "entry_repeg #%d sCode=%s sMsg=%r — re-peg",
-                    repegs + 1, scode, data.get("sMsg"),
+                    "entry_repeg #%d submitted ordId=%s cid=%s px=%.2f (bid=%.2f ask=%.2f)",
+                    repegs + 1, trade.ord_id, cl_ord, entry_px, best_bid, best_ask,
                 )
-                repegs += 1
-                await asyncio.sleep(cfg.poll_ms / 1000.0)
-                continue
-
-            trade.ord_id = data.get("ordId")
-            LOGGER.info(
-                "entry_repeg #%d submitted ordId=%s cid=%s px=%.2f (bid=%.2f ask=%.2f)",
-                repegs + 1, trade.ord_id, cl_ord, entry_px, best_bid, best_ask,
-            )
 
             # 4. Wait up to repeg_ms for fill or terminal state
             wait_deadline = time.time() + cfg.repeg_ms / 1000.0
-            filled_this_peg = False
             while time.time() < wait_deadline and time.time() < deadline_wall:
                 await asyncio.sleep(cfg.poll_ms / 1000.0)
                 try:
                     r = await self.client.get_order(
-                        self.symbol, ord_id=trade.ord_id, client_oid=cl_ord,
+                        self.symbol, ord_id=trade.ord_id, client_oid=trade.cl_ord_id,
                     )
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.debug("entry_repeg: get_order failed: %s", exc)
                     continue
                 od = (r.get("data") or [{}])[0]
-                state = str(od.get("state", ""))
-                if state == "filled":
-                    trade.filled = True
-                    _raw = float(od.get("avgPx") or entry_px)
-                    trade.extras["demo_raw_fill_px"] = _raw
-                    trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
-                    trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
-                    trade.real_open_fee = abs(float(od.get("fee") or 0.0))
-                    self._last_entry_repegs = repegs
-                    LOGGER.info(
-                        "FILL  cid=%s  px=%.2f  fee=%.6f  repegs=%d",
-                        trade.cl_ord_id, trade.fill_px, trade.real_open_fee, repegs,
-                    )
-                    filled_this_peg = True
-                    break
-                if state in {"canceled", "mmp_canceled"}:
-                    break
-
-            if filled_this_peg:
-                return True
-
-            # 5. Window elapsed without fill — cancel and re-peg
-            try:
-                await self.client.cancel_order(self.symbol, ord_id=trade.ord_id)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.debug("entry_repeg: cancel failed: %s", exc)
-            # Race window: a fill might have landed between our last poll and
-            # the cancel. Check once more before counting this as a missed peg.
-            try:
-                r = await self.client.get_order(
-                    self.symbol, ord_id=trade.ord_id, client_oid=cl_ord,
-                )
-                od = (r.get("data") or [{}])[0]
-                if str(od.get("state", "")) == "filled":
-                    trade.filled = True
-                    _raw = float(od.get("avgPx") or entry_px)
-                    trade.extras["demo_raw_fill_px"] = _raw
-                    trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
-                    trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
-                    trade.real_open_fee = abs(float(od.get("fee") or 0.0))
-                    self._last_entry_repegs = repegs
-                    LOGGER.info(
-                        "FILL  cid=%s  px=%.2f  fee=%.6f  repegs=%d (race-fill)",
-                        trade.cl_ord_id, trade.fill_px, trade.real_open_fee, repegs,
-                    )
+                if _capture_fill(od):
                     return True
-            except Exception:  # noqa: BLE001
-                pass
+                if str(od.get("state", "")) in {"canceled", "mmp_canceled"}:
+                    resting = False
+                    break
 
+            # 5. Window elapsed without fill. With amend enabled the order keeps
+            # resting (queue position at the old price is forfeited on the next
+            # amend anyway, but there is never a moment with nothing on the
+            # book); legacy mode cancels and replaces.
+            if resting and not cfg.use_amend:
+                if await _sweep_resting():
+                    return True
             repegs += 1
+
+        # Loop exhausted (deadline / max repegs / reject storm). Sweep any
+        # still-resting order FIRST — on every path below, an order left on the
+        # book could fill later as a completely unmanaged position.
+        if await _sweep_resting():
+            return True
 
         # All pegs exhausted. Optional taker fallback (off by default — we
         # prefer to skip a signal rather than pay taker on entry).
@@ -1212,8 +1368,10 @@ class LiveVolumeExecutorOKX:
                     trade.cl_ord_id,
                 )
                 # Self-healing hold: the recovery watcher keeps re-attempting the
-                # close AND releases the gate the moment OKX reports flat.
-                asyncio.create_task(self._recover_stuck_position(trade))
+                # close AND releases the gate the moment OKX reports flat. Strong
+                # ref via _spawn — losing this task to GC meant a stuck REAL
+                # position with nothing retrying the close.
+                self._spawn(self._recover_stuck_position(trade), name="recover_stuck")
 
         if flat is not False:
             # flat is True (incl. forced-flat-but-unpriced) or None (all polls errored)
@@ -1293,10 +1451,26 @@ class LiveVolumeExecutorOKX:
                 raise
 
         # Verify the position is actually still open before we touch the book.
-        try:
-            r = await self.client.get_positions(self.symbol)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("time_stop: positions fetch failed: %s", exc)
+        # Retry transient failures — a single socket blip here used to disarm
+        # the time-stop entirely, leaving the trade to ride to the catastrophic
+        # 6xATR taker SL (the exact loss the time-stop exists to prevent).
+        r = None
+        for attempt in range(4):
+            try:
+                r = await self.client.get_positions(self.symbol)
+                break
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("time_stop: positions fetch failed (try %d/4): %s",
+                               attempt + 1, exc)
+                await asyncio.sleep(0.5 * (attempt + 1))
+        if r is None:
+            LOGGER.error("time_stop: positions unavailable after retries — "
+                         "closing blind via maker exit (reduceOnly is safe on flat)")
+            async with self._close_lock:
+                if trade.close_reason == "manual" or trade.closed:
+                    return
+                await cancel_attached_algos(self.client, self.symbol)
+                await self._maker_close(trade, reason="time_stop", abs_qty=trade.sz_contracts)
             return
         positions = r.get("data") or []
         qty = 0.0
@@ -1375,6 +1549,14 @@ class LiveVolumeExecutorOKX:
 
         intended_px = trade.tp_px if reason == "tp" else trade.fill_px
         pos_side_param = trade.side if self.pos_mode == "hedge" else None
+        # Stamp the reason BEFORE the maker exit runs: _watch_position keeps
+        # polling during the re-peg loop, and when a peg fills it can resolve
+        # the close first — with an empty reason the proximity matcher used to
+        # relabel a time-stop scratch as "sl", advancing the breaker's loss
+        # streak (1h entry pause) off pure noise and mislabeling the Telegram
+        # card. With the reason pre-stamped, _resolve_close preserves it.
+        if not trade.close_reason:
+            trade.close_reason = reason
         result: ExitResult = await close_position_maker(
             self.client,
             symbol=self.symbol,
@@ -1400,14 +1582,21 @@ class LiveVolumeExecutorOKX:
             trade.close_px = result.avg_fill_px
             trade.close_ts = int(time.time() * 1000)
             trade.real_close_fee = sum(f.fee for f in result.fills)
+            # Gross over the qty that ACTUALLY closed at this price — a partial
+            # maker fill's residual closes later (force-close) at a different
+            # price; computing over full size fed wrong numbers to the breaker
+            # (and demo skips the OKX-pnl reconciliation that fixed it in live).
+            closed_qty = min(result.filled_qty, trade.sz_contracts)
             if trade.side == "long":
                 trade.real_gross_pnl = (
                     trade.close_px - trade.fill_px
-                ) * trade.sz_contracts * self._ct_val
+                ) * closed_qty * self._ct_val
             else:
                 trade.real_gross_pnl = (
                     trade.fill_px - trade.close_px
-                ) * trade.sz_contracts * self._ct_val
+                ) * closed_qty * self._ct_val
+            if result.error == "residual_unfilled":
+                trade.extras["partial_close_qty"] = closed_qty
             trade.closed = True
             trade.close_reason = reason
             LOGGER.info(
@@ -1519,7 +1708,10 @@ class LiveVolumeExecutorOKX:
                 # close, carries the true reason; preserve it so the card/stats
                 # don't mislabel it as a TP/SL price exit. Proximity only guesses
                 # for genuine native TP/SL fills, which arrive with no reason.
-                if trade.close_reason not in ("manual", "time_stop", "trend_break"):
+                if trade.close_reason not in (
+                    "manual", "time_stop", "trend_break",
+                    "watch_timeout", "unmatched_close",
+                ):
                     d_tp = abs(trade.close_px - trade.tp_px)
                     d_sl = abs(trade.close_px - trade.sl_px)
                     trade.close_reason = "tp" if d_tp < d_sl else "sl"

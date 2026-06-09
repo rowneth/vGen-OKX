@@ -81,8 +81,12 @@ class VolumeFarmerSession:
 	last_side: str = field(default="", init=False)       # for alternation
 	daily_pnl: float = field(default=0.0, init=False)
 	daily_pnl_date: str = field(default="", init=False)
+	day_start_equity: float = field(default=0.0, init=False)
 	milestones_hit: List[float] = field(default_factory=list, init=False)
 	last_rebate_reminder_at: Optional[str] = field(default=None, init=False)
+	# Campaign clock for the pace controller: ISO timestamp of the first bar
+	# processed (persisted), so required-volume-per-day math survives restarts.
+	campaign_start_iso: str = field(default="", init=False)
 
 	def __post_init__(self) -> None:
 		f = self.config["farmer"]
@@ -159,7 +163,13 @@ class VolumeFarmerSession:
 		self._h1_veto_blocks = 0  # diagnostic counter
 		self._entries_considered = 0   # times flat+ready → _decide_entry called
 		self._mtf_skips = 0            # times MTF alignment blocked an entry
-		self._alternate = bool(f.get("alternate_direction", True))
+		# Default FALSE: defaulting alternation ON silently inverted every other
+		# micro_momentum signal in any config that omitted the key.
+		self._alternate = bool(f.get("alternate_direction", False))
+		# Same-bar re-entry: when a position closes at bar close (time-stop/TP)
+		# the bot is flat with a fresh signal in hand — waiting a full extra bar
+		# halves the volume ceiling for nothing. Off by default (legacy).
+		self._reentry_same_bar = bool(f.get("reentry_same_bar", False))
 		# Session-hour filter: set of UTC hours to skip entries (e.g. low-liquidity windows)
 		self._skip_hours: set = set(int(h) for h in entry_cfg.get("skip_hours", []))
 		self._session_blocks = 0   # how many bars were silently skipped by hour filter
@@ -203,15 +213,41 @@ class VolumeFarmerSession:
 		self._maker_rate = float(fees_cfg.get("maker", 0.0001))
 		self._taker_rate = float(fees_cfg.get("taker", 0.0005))
 		self._rebate_pct = float(fees_cfg.get("rebate_pct", 0.0))
+		# Whether the 40% rebate applies to ALL fee legs (this campaign: yes)
+		# or to maker legs only. Drives rebate accrual and the round-trip fee
+		# floor; getting it wrong over/under-states reclaimable cash.
+		self._rebate_all_legs = bool(fees_cfg.get("rebate_all_legs", True))
 		risk_cfg = self.config.get("risk", {})
 		self._daily_loss_limit = float(risk_cfg.get("daily_loss_limit_pct", 0.05))
 		self._max_dd = float(risk_cfg.get("max_drawdown_pct", 0.25))
 		self._consec_loss_limit = int(risk_cfg.get("consecutive_losses_limit", 3))
 		self._consec_loss_cooldown_bars = int(risk_cfg.get("consecutive_losses_cooldown_bars", 24))
+		# Which close reasons advance the consecutive-loss streak. Time-stop
+		# scratches lose a few bps of fees by design — counting them used to
+		# trip a 1h entry pause every handful of trades (the single biggest
+		# self-inflicted throughput loss found in live data).
+		self._consec_loss_reasons = set(
+			risk_cfg.get("consecutive_losses_count_reasons", ["sl", "sl_ambiguous"])
+		)
 		self._stop_on_target = bool(risk_cfg.get("stop_on_volume_target", True))
 		target_cfg = self.config.get("target", {})
 		self._volume_target = float(target_cfg.get("volume_usd", 1_000_000.0))
+		# Overshoot buffer: session-counted volume can lag the exchange's
+		# official counter (close legs differ, abandoned entries, etc.), so we
+		# halt a little PAST the nominal target rather than risk missing the
+		# bounty by a rounding margin.
+		self._volume_target_buffer = float(target_cfg.get("volume_buffer_pct", 0.02))
 		self._milestones = [0.1, 0.25, 0.5, 0.75, 1.0]
+		# Pace controller: scale per-trade margin so the projected month-end
+		# volume converges on the target. Bounded multiplicatively so a slow
+		# first day can't triple position size out of the gate.
+		pace_cfg = f.get("pace", {}) or {}
+		self._pace_enabled = bool(pace_cfg.get("enabled", False))
+		self._pace_campaign_days = float(pace_cfg.get("campaign_days", 30.0))
+		self._pace_min_frac = float(pace_cfg.get("min_margin_fraction", self._margin_frac * 0.5))
+		self._pace_max_frac = float(pace_cfg.get("max_margin_fraction", self._margin_frac * 2.0))
+		self._pace_warmup_trips = int(pace_cfg.get("warmup_trips", 10))
+		self._last_pace: Dict[str, Any] = {}
 		# Auto rebate-top-up reminder: pings configured members on Telegram
 		# when the wallet looks shaky and there's enough available rebate to
 		# rescue it. Cooldown prevents spam.
@@ -242,6 +278,9 @@ class VolumeFarmerSession:
 		if d != self.daily_pnl_date:
 			self.daily_pnl_date = d
 			self.daily_pnl = 0.0
+			# Day-start equity anchors the daily-loss limit; denominating by
+			# session START equity made the limit drift with cumulative PnL.
+			self.day_start_equity = self.equity
 
 	# ------------------------------------------------------------------
 	def _check_halt(self, bar_time: pd.Timestamp) -> bool:
@@ -253,12 +292,15 @@ class VolumeFarmerSession:
 			self.halted = True
 			self.halt_reason = f"max_drawdown {dd*100:.2f}%"
 		# daily loss — HARD halt (account protection)
-		day_loss = -self.daily_pnl / max(self.start_equity, 1e-9)
+		day_base = self.day_start_equity if self.day_start_equity > 0 else self.start_equity
+		day_loss = -self.daily_pnl / max(day_base, 1e-9)
 		if day_loss >= self._daily_loss_limit:
 			self.halted = True
 			self.halt_reason = f"daily_loss {day_loss*100:.2f}%"
-		# volume target reached — halt
-		if self._stop_on_target and self.total_volume_usd >= self._volume_target:
+		# volume target reached — halt (with overshoot buffer so the exchange's
+		# official counter, which we may undercount, is safely past the target)
+		halt_volume = self._volume_target * (1.0 + self._volume_target_buffer)
+		if self._stop_on_target and self.total_volume_usd >= halt_volume:
 			self.halted = True
 			self.halt_reason = f"volume_target_reached {self.total_volume_usd:,.0f}"
 		if self.halted:
@@ -270,6 +312,29 @@ class VolumeFarmerSession:
 		return self.halted
 
 	# ------------------------------------------------------------------
+	def _set_pending_bracket(self, history: pd.DataFrame, ref_price: float) -> None:
+		"""Compute the ATR-relative, fee-floored TP/SL bracket for the next entry.
+
+		Every entry mode MUST route through this before opening — modes that
+		returned early used to trade on a stale/unfloored bracket, silently
+		opening positions whose TP could not clear fees.
+		"""
+		atr_val = self._compute_atr(history)
+		if self._atr_relative and not np.isnan(atr_val) and ref_price > 0:
+			atr_bps = atr_val / ref_price * 10_000
+			self._pending_tp_bps = self._apply_tp_floor_cap(
+				max(self._atr_tp_bps_min, self._atr_tp_mult * atr_bps)
+			)
+			self._pending_sl_bps = max(self._atr_sl_bps_min, self._atr_sl_mult * atr_bps)
+		else:
+			self._pending_tp_bps = self._apply_tp_floor_cap(self._tp_bps)
+			self._pending_sl_bps = self._sl_bps
+		# Firm effective-TP override — pin TP after the ATR bracket + floor/cap
+		# so nothing downstream can drift it. SL stays ATR-relative.
+		if self._force_tp_bps > 0:
+			self._pending_tp_bps = self._force_tp_bps
+
+	# ------------------------------------------------------------------
 	def _decide_entry(self, history: pd.DataFrame) -> Optional[str]:
 		"""Return 'long' | 'short' | None based on entry signal."""
 
@@ -278,11 +343,17 @@ class VolumeFarmerSession:
 
 		# RSI + WaveTrend entry (based on WTF Pine Scripts)
 		if self._entry_mode == "rsi_wt":
-			return self._rsi_wt_signal(history)
+			side = self._rsi_wt_signal(history)
+			if side is not None:
+				self._set_pending_bracket(history, float(history.iloc[-1]["close"]))
+			return side
 
 		# Bollinger-band fade with RSI + optional EMA trend filter
 		if self._entry_mode == "bollinger_fade":
-			return self._bollinger_fade_signal(history)
+			side = self._bollinger_fade_signal(history)
+			if side is not None:
+				self._set_pending_bracket(history, float(history.iloc[-1]["close"]))
+			return side
 
 		# Multi-timeframe trend alignment.
 		if self._entry_mode == "multi_timeframe":
@@ -312,15 +383,20 @@ class VolumeFarmerSession:
 				)
 				if direction is None:
 					self._mtf_skips += 1
+				else:
+					self._set_pending_bracket(history, close_p)
 				return direction
 			else:
 				# Old API (legacy): 5m + 15m SMA alignment, bypass range gate.
 				from strategy.mtf_direction import detect_direction
-				return detect_direction(
+				direction = detect_direction(
 					history,
 					lookback=self._mtf_lookback,
 					min_5m_bars=self._mtf_min_bars,
 				)
+				if direction is not None:
+					self._set_pending_bracket(history, float(history.iloc[-1]["close"]))
+				return direction
 
 		last = history.iloc[-1]
 		open_p = float(last["open"])
@@ -337,20 +413,7 @@ class VolumeFarmerSession:
 		atr_val = self._compute_atr(history)
 		if self._atr_min_usd > 0 and (np.isnan(atr_val) or atr_val < self._atr_min_usd):
 			return None  # skip: ATR below high-vol threshold
-		if self._atr_relative and not np.isnan(atr_val):
-			atr_bps = atr_val / open_p * 10_000
-			self._pending_tp_bps = self._apply_tp_floor_cap(
-				max(self._atr_tp_bps_min, self._atr_tp_mult * atr_bps)
-			)
-			self._pending_sl_bps = max(self._atr_sl_bps_min, self._atr_sl_mult * atr_bps)
-		else:
-			self._pending_tp_bps = self._apply_tp_floor_cap(self._tp_bps)
-			self._pending_sl_bps = self._sl_bps
-
-		# Firm effective-TP override — pin TP after the ATR bracket + floor/cap so
-		# nothing downstream can drift it. SL stays ATR-relative.
-		if self._force_tp_bps > 0:
-			self._pending_tp_bps = self._force_tp_bps
+		self._set_pending_bracket(history, open_p)
 
 		if self._entry_mode == "micro_momentum":
 			bias = "long" if close_p > open_p else "short"
@@ -502,12 +565,21 @@ class VolumeFarmerSession:
 
 		The open leg is always maker (post_only limit entry). The close leg is
 		maker when limit_tp is on (OKX limit TP fills maker), else taker. The
-		rebate reduces the maker legs only (this account rebates maker fees).
+		rebate reduces maker legs always; taker legs too when the program
+		rebates all fees (fees.rebate_all_legs, the default for this campaign).
 		"""
 		maker_eff = self._maker_rate * (1.0 - self._rebate_pct)
+		taker_eff = self._taker_rate * (1.0 - self._rebate_pct) if self._rebate_all_legs else self._taker_rate
 		open_leg = maker_eff
-		close_leg = maker_eff if self._limit_tp else self._taker_rate
+		close_leg = maker_eff if self._limit_tp else taker_eff
 		return (open_leg + close_leg) * 10_000.0
+
+	# ------------------------------------------------------------------
+	def _rebate_for(self, fee: float, fee_type: str) -> float:
+		"""Rebate accrued on one fee leg under the configured program rules."""
+		if fee_type == "maker" or self._rebate_all_legs:
+			return fee * self._rebate_pct
+		return 0.0
 
 	def _apply_tp_floor_cap(self, tp_bps: float) -> float:
 		"""Raise tp_bps to the fee-aware floor, then clamp to the achievability
@@ -530,16 +602,58 @@ class VolumeFarmerSession:
 		return tp_bps
 
 	# ------------------------------------------------------------------
+	def _pace_margin_frac(self, bar_time: pd.Timestamp) -> float:
+		"""Margin fraction for the next trade, scaled by campaign pace.
+
+		factor = (volume/day still required) / (volume/day achieved so far),
+		clamped to [0.5, 3.0], applied to the base margin fraction and bounded
+		by [min_margin_fraction, max_margin_fraction]. Until warmup (first
+		trips/first hours) the base fraction is used unchanged — early-rate
+		noise must not drive sizing.
+		"""
+		base = self._margin_frac
+		if not self.campaign_start_iso:
+			self.campaign_start_iso = bar_time.isoformat()
+		if not self._pace_enabled:
+			return base
+		try:
+			start = pd.Timestamp(self.campaign_start_iso)
+			elapsed_days = max((bar_time - start).total_seconds() / 86_400.0, 1e-6)
+		except Exception:  # noqa: BLE001
+			return base
+		days_left = max(self._pace_campaign_days - elapsed_days, 0.25)
+		remaining = max(self._volume_target - self.total_volume_usd, 0.0)
+		required_per_day = remaining / days_left
+		achieved_per_day = self.total_volume_usd / elapsed_days
+		self._last_pace = {
+			"elapsed_days": round(elapsed_days, 2),
+			"days_left": round(days_left, 2),
+			"required_per_day": round(required_per_day, 0),
+			"achieved_per_day": round(achieved_per_day, 0),
+			"projected_total": round(achieved_per_day * self._pace_campaign_days, 0),
+			"margin_fraction": base,
+		}
+		if remaining <= 0:
+			return self._pace_min_frac
+		if self.round_trips < self._pace_warmup_trips or elapsed_days < 0.5 or achieved_per_day <= 0:
+			return base
+		factor = max(0.5, min(required_per_day / achieved_per_day, 3.0))
+		frac = max(self._pace_min_frac, min(base * factor, self._pace_max_frac))
+		self._last_pace["margin_fraction"] = round(frac, 5)
+		return frac
+
+	# ------------------------------------------------------------------
 	def _open_position(self, side: str, price: float, bar_time: pd.Timestamp) -> None:
 		# Reset dull-market counter — we're entering a trade.
 		self._flat_skip_bars = 0
 		self._dull_last_emit_at = 0
-		margin = self.equity * self._margin_frac
+		margin_frac = self._pace_margin_frac(bar_time)
+		margin = self.equity * margin_frac
 		leverage = self._calc_leverage(margin, sl_bps=self._pending_sl_bps)
 		notional = margin * leverage
 		open_fee = notional * self._maker_rate  # limit order = maker
 		self.total_fees_gross += open_fee
-		self.total_rebate_accrued += open_fee * self._rebate_pct
+		self.total_rebate_accrued += self._rebate_for(open_fee, "maker")
 		self.total_volume_usd += notional
 		self.equity -= open_fee  # fee paid on open
 		tp = price * (1 + self._pending_tp_bps / 10_000) if side == "long" else price * (1 - self._pending_tp_bps / 10_000)
@@ -554,6 +668,7 @@ class VolumeFarmerSession:
 			payload={
 				"side": side, "price": price, "notional": notional,
 				"margin": round(margin, 4),
+				"margin_fraction": round(margin_frac, 5),
 				"leverage": round(leverage, 1),
 				"open_fee": open_fee,
 				"fee_type": "maker",
@@ -567,8 +682,10 @@ class VolumeFarmerSession:
 				"capital": self.equity,
 				"wins": self.wins,
 				"losses": self.losses,
+				"pace": dict(self._last_pace),
 			},
 		))
+		self._check_milestones(bar_time)
 
 	# ------------------------------------------------------------------
 	def _close_position(
@@ -594,10 +711,18 @@ class VolumeFarmerSession:
 		else:
 			close_fee = p.notional * self._taker_rate
 			close_fee_type = "taker"
-		net_pnl = gross_pnl - close_fee
+		open_fee = p.notional * self._maker_rate
+		# Net PnL must charge BOTH legs' fees. Charging only the close fee
+		# inflated total_pnl/win-rate and weakened the daily-loss halt (the
+		# demo state file showed equity +$11.10 vs reported PnL +$22.39 —
+		# the gap was exactly the sum of uncounted open fees).
+		net_pnl = gross_pnl - open_fee - close_fee
 		self.total_fees_gross += close_fee
-		self.total_rebate_accrued += close_fee * self._rebate_pct
-		self.total_volume_usd += p.notional
+		self.total_rebate_accrued += self._rebate_for(close_fee, close_fee_type)
+		# Close-leg volume at the EXIT price: the exchange counts the closing
+		# fill's notional, not the entry's. Same contracts, different price.
+		close_leg_notional = p.notional * (exit_price / max(p.entry_price, 1e-9))
+		self.total_volume_usd += close_leg_notional
 		self.total_pnl += net_pnl
 		self.equity += gross_pnl - close_fee
 		self.peak_equity = max(self.peak_equity, self.equity)
@@ -610,11 +735,15 @@ class VolumeFarmerSession:
 			self.consec_losses = 0
 		else:
 			self.losses += 1
-			self.consec_losses += 1
-			if self.consec_losses >= self._consec_loss_limit:
-				self.cooldown_bars_left = self._consec_loss_cooldown_bars
-				self.consec_losses = 0  # reset streak so next losses start fresh
-		open_fee = p.notional * self._maker_rate
+			# Only configured reasons advance the cooldown streak: a 1-bar
+			# time-stop scratch is a designed fee-cost exit, not an adverse
+			# move — counting scratches paused entries for 1h after every 3
+			# non-winners and starved the volume target.
+			if reason in self._consec_loss_reasons:
+				self.consec_losses += 1
+				if self.consec_losses >= self._consec_loss_limit:
+					self.cooldown_bars_left = self._consec_loss_cooldown_bars
+					self.consec_losses = 0  # reset streak so next losses start fresh
 		fee_overage = close_fee - p.notional * self._maker_rate
 		wr_running = round(self.wins / self.round_trips * 100.0, 1) if self.round_trips else 0.0
 		self.ledger.append({
@@ -722,7 +851,14 @@ class VolumeFarmerSession:
 				self._close_position(close, bar_time, reason="trend_break")
 			elif p.bars_held >= self._max_hold:
 				self._close_position(close, bar_time, reason="time_stop")
-			return  # don't open new trade on same bar we closed one
+			# Same-bar re-entry: if we just closed and the config allows it,
+			# fall through to the entry logic on this same closed bar — the
+			# minimum round-trip cycle drops from 2 bars to 1, doubling the
+			# volume ceiling. Halt/cooldown gates below still apply.
+			if not (self._reentry_same_bar and self.position is None):
+				return  # legacy: don't open a new trade on the close bar
+			if self._check_halt(bar_time):
+				return
 
 		# Step 2: flat — look for entry (respect cooldown)
 		if self.cooldown_bars_left > 0:
@@ -889,9 +1025,12 @@ class VolumeFarmerSession:
 	# ------------------------------------------------------------------
 	def summary(self) -> Dict[str, Any]:
 		wr = (self.wins / self.round_trips * 100.0) if self.round_trips else 0.0
-		net_fees = self.total_fees_gross * (1.0 - self._rebate_pct)
+		# Net fees from the per-leg accrual (respects rebate_all_legs) rather
+		# than a blanket gross*(1-rebate) that assumed every leg rebates.
+		net_fees = self.total_fees_gross - self.total_rebate_accrued
 		# fee_cover_pct: how much of gross fees the trade PnL covers
 		fee_cover = (self.total_pnl / self.total_fees_gross * 100) if self.total_fees_gross > 0 else 0.0
+		cost_per_1m = (net_fees / self.total_volume_usd * 1_000_000) if self.total_volume_usd > 0 else 0.0
 		return {
 			"equity": round(self.equity, 4),
 			"start_equity": self.start_equity,
@@ -900,7 +1039,10 @@ class VolumeFarmerSession:
 			"volume_target_pct": round(self.total_volume_usd / max(self._volume_target, 1e-9) * 100, 2),
 			"fees_gross": round(self.total_fees_gross, 4),
 			"fees_net": round(net_fees, 4),
-			"rebate_estimate": round(self.total_fees_gross * self._rebate_pct, 4),
+			"net_cost_per_1m": round(cost_per_1m, 2),
+			"pace": dict(self._last_pace),
+			"campaign_start": self.campaign_start_iso,
+			"rebate_estimate": round(self.total_rebate_accrued, 4),
 			"rebate_accrued": round(self.total_rebate_accrued, 4),
 			"rebate_transferred": round(self.total_rebate_transferred, 4),
 			"rebate_available": round(self.available_rebate, 4),
@@ -952,8 +1094,11 @@ class VolumeFarmerSession:
 			"last_side": self.last_side,
 			"daily_pnl": self.daily_pnl,
 			"daily_pnl_date": self.daily_pnl_date,
+			"day_start_equity": self.day_start_equity,
 			"milestones_hit": self.milestones_hit,
 			"last_rebate_reminder_at": self.last_rebate_reminder_at,
+			"_rr_last_daily_date": self._rr_last_daily_date,
+			"campaign_start_iso": self.campaign_start_iso,
 			"position": pos_data,
 			"ledger": self.ledger[-500:],  # cap
 			"saved_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -971,7 +1116,8 @@ class VolumeFarmerSession:
 			"total_rebate_transferred", "total_pnl", "wins", "losses",
 			"round_trips", "consec_losses", "cooldown_bars_left", "halted",
 			"halt_reason", "last_side", "daily_pnl", "daily_pnl_date",
-			"milestones_hit", "last_rebate_reminder_at",
+			"day_start_equity", "milestones_hit", "last_rebate_reminder_at",
+			"_rr_last_daily_date", "campaign_start_iso",
 		]:
 			if key in s:
 				setattr(self, key, s[key])
@@ -1015,28 +1161,32 @@ class VolumeFarmerSession:
 				continue
 			hi = float(bar["high"])
 			lo = float(bar["low"])
+			cl = float(bar["close"])
 			bar_time = bar["open_time"]
-			if pos.side == "long":
-				if hi >= pos.tp:
-					LOGGER.info("reconcile: orphan LONG hit TP at %.2f (bar %s)", pos.tp, bar_time)
-					self._close_position(pos.tp, bar_time, "tp")
-					self.position = None
-					return "tp"
-				if lo <= pos.sl:
-					LOGGER.info("reconcile: orphan LONG hit SL at %.2f (bar %s)", pos.sl, bar_time)
-					self._close_position(pos.sl, bar_time, "sl")
-					self.position = None
-					return "sl"
-			else:
-				if lo <= pos.tp:
-					LOGGER.info("reconcile: orphan SHORT hit TP at %.2f (bar %s)", pos.tp, bar_time)
-					self._close_position(pos.tp, bar_time, "tp")
-					self.position = None
-					return "tp"
-				if hi >= pos.sl:
-					LOGGER.info("reconcile: orphan SHORT hit SL at %.2f (bar %s)", pos.sl, bar_time)
-					self._close_position(pos.sl, bar_time, "sl")
-					self.position = None
-					return "sl"
+			pos.bars_held += 1
+			tp_hit = (pos.side == "long" and hi >= pos.tp) or (pos.side == "short" and lo <= pos.tp)
+			sl_hit = (pos.side == "long" and lo <= pos.sl) or (pos.side == "short" and hi >= pos.sl)
+			# Same rules as the live bar loop: worst-case SL when both levels
+			# touched, then TP, then SL, then the time-stop. The replay used to
+			# skip the time-stop entirely, so an orphan restored after restart
+			# rode to the catastrophic 6xATR taker SL — the exact loss profile
+			# the 1-bar time-stop exists to prevent.
+			if tp_hit and sl_hit:
+				LOGGER.info("reconcile: orphan %s both-touched bar — worst-case SL at %.2f (bar %s)",
+							pos.side.upper(), pos.sl, bar_time)
+				self._close_position(pos.sl, bar_time, "sl_ambiguous")
+				return "sl_ambiguous"
+			if tp_hit:
+				LOGGER.info("reconcile: orphan %s hit TP at %.2f (bar %s)", pos.side.upper(), pos.tp, bar_time)
+				self._close_position(pos.tp, bar_time, "tp")
+				return "tp"
+			if sl_hit:
+				LOGGER.info("reconcile: orphan %s hit SL at %.2f (bar %s)", pos.side.upper(), pos.sl, bar_time)
+				self._close_position(pos.sl, bar_time, "sl")
+				return "sl"
+			if pos.bars_held >= self._max_hold:
+				LOGGER.info("reconcile: orphan %s time-stopped at %.2f (bar %s)", pos.side.upper(), cl, bar_time)
+				self._close_position(cl, bar_time, "time_stop")
+				return "time_stop"
 		LOGGER.info("reconcile: position still open (tp=%.2f sl=%.2f) — resuming", pos.tp, pos.sl)
 		return None

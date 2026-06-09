@@ -236,7 +236,9 @@ def test_limit_close_explicit_price_long_is_reduceonly_sell():
     kw = client.place_kwargs
     assert kw["side"] == "sell"
     assert kw["reduce_only"] is True
-    assert kw["ord_type"] == "limit"
+    # post_only even with an explicit price: the UI promises a MAKER close, and
+    # a plain 'limit' at/through the touch fills instantly as taker (5bps).
+    assert kw["ord_type"] == "post_only"
     assert kw["sz"] == "0.25"
     assert kw["px"] == "60500.0"
     assert kw["pos_side"] is None
