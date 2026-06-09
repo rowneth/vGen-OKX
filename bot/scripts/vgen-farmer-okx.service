@@ -1,5 +1,5 @@
 [Unit]
-Description=vGen OKX volume farmer (paper — Fix5 ATR/limit-TP)
+Description=vGen OKX volume farmer (DEMO — micro-momentum, source-faithful)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,9 +9,16 @@ User=root
 WorkingDirectory=/root/vGen-OKX/bot
 EnvironmentFile=-/root/vGen-OKX/bot/.env
 Environment="PYTHONUNBUFFERED=1"
+# DEMO MODE (OKX simulated trading, virtual USDT). Requires OKX_DEMO_API_* in .env.
+# To go LIVE (real money): replace --demo with --live and add
+#   Environment="LIVE_OKX_ACK=I_UNDERSTAND"
+# only after validating behavior on demo.
+# State is auto-loaded from data/volume_farmer_okx_<label>_state.json if present
+# (resume is automatic); delete that file to start a fresh session.
 ExecStart=/root/vGen-OKX/bot/.venv/bin/python3 /root/vGen-OKX/bot/scripts/run_volume_farmer_okx.py \
     --config /root/vGen-OKX/bot/config/config_volume_farmer_okx.yaml \
-    --label okx-paper \
+    --label okx-demo \
+    --demo \
     --duration-days 365
 Restart=always
 RestartSec=15

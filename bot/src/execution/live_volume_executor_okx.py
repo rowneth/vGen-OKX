@@ -57,6 +57,13 @@ def _round_size(x: float, lot: float) -> float:
     return math.floor(x / lot) * lot
 
 
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class LiveTradeOKX:
     """Bookkeeping for one live OKX trade lifecycle."""
@@ -84,6 +91,10 @@ class LiveTradeOKX:
     real_gross_pnl: float = 0.0
     real_open_fee: float = 0.0
     real_close_fee: float = 0.0
+    # Real position metadata read back from OKX /account/positions after fill.
+    real_lever: float = 0.0
+    real_liq_px: float = 0.0
+    real_margin: float = 0.0
     extras: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -102,6 +113,12 @@ class LiveVolumeExecutorOKX:
     max_live_trades: int = 1_000_000
     dry_run: bool = False
     log_dir: pathlib.Path = field(default_factory=lambda: pathlib.Path("data/logs"))
+
+    # Real-data callbacks — fired ONLY on confirmed OKX state (fill / close) with
+    # values read back from the exchange (avgPx, fee, liqPx, lever). These let the
+    # runner send Telegram messages built from real exchange data, never estimates.
+    real_entry_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+    real_close_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
     # Cached instrument metadata
     _ct_val: float = field(default=0.01, init=False)
@@ -284,10 +301,75 @@ class LiveVolumeExecutorOKX:
             self._open_trade = None
             return
 
-        # Position is now open; wait for it to close via attached TP/SL.
+        # Position is now open. Read the REAL position metadata back from OKX
+        # (liquidation price, applied leverage, isolated margin) and announce the
+        # entry from confirmed exchange data — never paper estimates.
+        snap = await self._position_snapshot(trade.side)
+        trade.real_lever = snap.get("lever", 0.0)
+        trade.real_liq_px = snap.get("liq_px", 0.0)
+        trade.real_margin = snap.get("margin", 0.0)
+        if self.real_entry_callback is not None:
+            real_notional = trade.fill_px * trade.sz_contracts * self._ct_val
+            try:
+                await self.real_entry_callback({
+                    "symbol": to_okx_inst_id(self.symbol),
+                    "side": trade.side,
+                    "entry_price": trade.fill_px,
+                    "tp_price": trade.tp_px,
+                    "sl_price": trade.sl_px,
+                    "tp_bps": trade.tp_bps,
+                    "sl_bps": trade.sl_bps,
+                    "leverage": trade.real_lever,
+                    "liq_price": trade.real_liq_px,
+                    "margin": trade.real_margin,
+                    "sz_contracts": trade.sz_contracts,
+                    "notional": real_notional,
+                    "open_fee": trade.real_open_fee,
+                    "cl_ord_id": trade.cl_ord_id,
+                    "ord_id": trade.ord_id,
+                })
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("real_entry_callback failed: %s", exc)
+
+        # Wait for it to close via attached TP/SL.
         await self._watch_position(trade)
         self._log_trade(trade)
         self._open_trade = None
+
+    async def _position_snapshot(self, side: str) -> Dict[str, float]:
+        """Read real liquidation price / leverage / isolated margin for our open
+        position from OKX. Retries briefly because the position can lag the fill.
+        Returns zeros if it cannot be read (callback then shows what it has)."""
+        want = "short" if side == "short" else "long"
+        for _ in range(4):
+            try:
+                r = await self.client.get_positions(self.symbol)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("position_snapshot get_positions failed: %s", exc)
+                await asyncio.sleep(0.6)
+                continue
+            for p in (r.get("data") or []):
+                try:
+                    pos_sz = float(p.get("pos") or 0.0)
+                except ValueError:
+                    pos_sz = 0.0
+                if pos_sz == 0.0:
+                    continue
+                # net mode: posSide == "net"; infer side from sign of pos.
+                ps = str(p.get("posSide") or "net")
+                inferred = "long" if pos_sz > 0 else "short"
+                if ps in ("long", "short") and ps != want:
+                    continue
+                if ps == "net" and inferred != want:
+                    continue
+                return {
+                    "liq_px": _as_float(p.get("liqPx")),
+                    "lever": _as_float(p.get("lever")),
+                    "margin": _as_float(p.get("margin")) or _as_float(p.get("imr")),
+                    "upl": _as_float(p.get("upl")),
+                }
+            await asyncio.sleep(0.6)
+        return {"liq_px": 0.0, "lever": 0.0, "margin": 0.0, "upl": 0.0}
 
     async def _watch_position(self, trade: LiveTradeOKX) -> None:
         start = time.time()
@@ -335,6 +417,7 @@ class LiveVolumeExecutorOKX:
             LOGGER.warning("orders-history fetch failed: %s", exc)
             trade.closed = True
             trade.close_reason = "history_fetch_failed"
+            await self._emit_close(trade, resolved=False)
             return
 
         for o in r.get("data") or []:
@@ -362,6 +445,7 @@ class LiveVolumeExecutorOKX:
             LOGGER.warning("could not match close fill for cid=%s", trade.cl_ord_id)
             trade.closed = True
             trade.close_reason = "unmatched_close"
+            await self._emit_close(trade, resolved=False)
             return
 
         # Realized gross PnL
@@ -375,6 +459,38 @@ class LiveVolumeExecutorOKX:
             trade.cl_ord_id, trade.close_reason, trade.fill_px, trade.close_px,
             trade.real_gross_pnl, trade.real_open_fee, trade.real_close_fee,
         )
+        await self._emit_close(trade, resolved=True)
+
+    async def _emit_close(self, trade: LiveTradeOKX, *, resolved: bool) -> None:
+        """Fire ``real_close_callback`` with REAL exchange numbers: real exit
+        price, real open+close fees (from the order ``fee`` fields) and real
+        net PnL. ``resolved`` is False when the close fill could not be matched
+        in order history (exit price/fee unknown)."""
+        if self.real_close_callback is None:
+            return
+        real_net = trade.real_gross_pnl - trade.real_open_fee - trade.real_close_fee
+        try:
+            await self.real_close_callback({
+                "symbol": to_okx_inst_id(self.symbol),
+                "side": trade.side,
+                "reason": trade.close_reason,
+                "resolved": resolved,
+                "entry_price": trade.fill_px,
+                "exit_price": trade.close_px,
+                "sz_contracts": trade.sz_contracts,
+                "notional": trade.notional_usd,
+                "open_fee": trade.real_open_fee,
+                "close_fee": trade.real_close_fee,
+                "gross_pnl": trade.real_gross_pnl,
+                "net_pnl": real_net,
+                "leverage": trade.real_lever,
+                "liq_price": trade.real_liq_px,
+                "tp_price": trade.tp_px,
+                "sl_price": trade.sl_px,
+                "cl_ord_id": trade.cl_ord_id,
+            })
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("real_close_callback failed: %s", exc)
 
     def _log_trade(self, trade: LiveTradeOKX) -> None:
         rec = {

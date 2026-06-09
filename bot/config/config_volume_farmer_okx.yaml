@@ -4,84 +4,94 @@ app:
   timezone: Asia/Colombo
   log_level: INFO
 
-# OKX VOLUME FARMER — Fix5 optimal config.
+# OKX VOLUME FARMER — faithful port of the source's proven micro-momentum farmer
+# (mexc-bot config_volume_farmer_optimal.yaml), switched to OKX.
+#
+# STRATEGY (identical to source):
+#   - micro-momentum entry + forced alternation (keeps net exposure ~0)
+#   - fixed TP 8bps / SL 50bps (ATR-relative bracket available but OFF)
+#   - trend-break early exit (3 bars / 20bps) — cuts losers before full SL
+#   - dynamic leverage (ebirth.net formula): lev = risk$ / (margin$ × SL%)
+#   - no time-stop; let TP/SL/trend-break resolve
+#
+# OKX-NATIVE (approved extras, not in source):
+#   - limit_tp: TP placed as a LIMIT order → fills as MAKER (cheaper than taker)
+#   - restart persistence + orphan reconciliation (in the runner/session code)
 #
 # REAL FEE STRUCTURE (OKX perpetuals, regular tier):
-#   Maker (POST_ONLY open):  0.020%  (0.0002)
-#   Taker (SL/trend-break):  0.050%  (0.0005)
-#   Limit-TP (maker fill):   0.020%  (0.0002)
-#   Rebate:                  40% of maker fee earned
-#
-# Fix5 backtest result (BTC 5m, full history):
-#   WR 73.5% | High-vol-only filter (ATR ≥ p67 = $167.6)
-#   ATR-relative TP = 0.5×ATR_bps, SL = 1.5×ATR_bps
-#   Limit-TP enabled: 99.9% maker fill rate confirmed
-#   No alternation, no trend-break
-#
-# NOTE: 73.5% WR < 80.4% break-even WR at 40% rebate.
-# Strategy is volume/rebate driven — negotiate higher rebate tier to close gap.
+#   Maker (post-only open, limit-TP close): 0.020%  (0.0002)
+#   Taker (SL / trend-break market close):  0.050%  (0.0005)
 
 exchange:
   symbol: BTC_USDT
   timeframe: 5m
 
 fees:
-  maker: 0.0002                    # 0.020% OKX maker
-  taker: 0.0005                    # 0.050% OKX taker
-  rebate_pct: 0.40                 # 40% rebate on maker fees
+  maker: 0.0002                    # 0.020% OKX maker (post-only open + limit TP)
+  taker: 0.0005                    # 0.050% OKX taker (SL / trend-break close)
+  rebate_pct: 0.40                 # OKX rebate tier estimate (display only; not used in sizing)
 
 farmer:
-  capital_usd: 500.0
+  capital_usd: 500.0               # deployment scale (source used 30.0); overridden by live wallet balance
   leverage: 0                      # 0 = dynamic
 
   margin_fraction_per_trade: 0.03  # 3% of equity as margin
   sizing:
     dynamic_leverage: true
     risk_per_trade_pct: 0.025      # 2.5% risk per trade
-    max_leverage: 125
+    # SL-SAFETY CAP: at the 50bps SL, OKX isolated liquidation sits at ~1/lev - MMR.
+    # max_leverage 68 keeps liquidation at ~101.6bps ≈ 2.03× the SL (so the SL
+    # always triggers well before liquidation). 100x → liq ~55bps (razor-thin);
+    # 125x → liq ~35bps (INSIDE the SL → liquidated before stop). Do NOT raise
+    # above 68 without widening the SL. (OKX tier-1 hard cap is 100x regardless.)
+    max_leverage: 68
     min_leverage: 5
 
-  # Fallback fixed TP/SL (used when atr.relative = false)
-  tp_bps: 8.0
-  sl_bps: 50.0
-  max_hold_bars: 999               # no time-stop — let TP/SL resolve
+  # Source-optimal fixed bracket: 8bps TP / 50bps SL.
+  tp_bps: 8.0                      # 0.08% TP
+  sl_bps: 50.0                     # 0.50% SL (rare, taker exit)
+  max_hold_bars: 999               # no time-stop — let TP/SL/trend-break resolve
 
+  # Winning entry: micro-momentum + alternation (highest volume, simplest).
   entry:
     mode: micro_momentum
     min_bar_range_bps: 3.0         # skip dead bars
     max_bar_range_bps: 40.0        # skip violent bars
 
-  alternate_direction: false       # no alternation: pure momentum signal
+  alternate_direction: true        # flip bias each trade to keep net exposure ~0
 
-  # Limit TP: place TP as a limit order on OKX → maker fill (0.020%)
+  # OKX-native: maker-fill TP (limit order at TP price). Set false to revert to
+  # taker TP (exact source fee behavior).
   limit_tp: true
 
-  # ATR-relative TP/SL + high-vol session filter
+  # ATR-relative bracket — capability kept, but OFF so the bracket matches the
+  # source's fixed 8/50 bps exactly. Flip `relative` true (and/or set min_usd)
+  # to enable ATR sizing / high-vol session filter.
   atr:
-    period: 14                     # Wilder ATR-14
-    relative: true                 # use ATR-relative bracket
-    tp_mult: 0.5                   # TP = 0.5 × ATR_bps
-    sl_mult: 1.5                   # SL = 1.5 × ATR_bps
-    tp_bps_min: 5.0                # floor: at least 5 bps TP
-    sl_bps_min: 8.0                # floor: at least 8 bps SL
-    min_usd: 120.0                 # skip when ATR < $120 (recalibrated Jun 2026; current ATR ~$146)
+    period: 14
+    relative: false                # OFF — use fixed tp_bps/sl_bps above
+    tp_mult: 0.5
+    sl_mult: 1.5
+    tp_bps_min: 5.0
+    sl_bps_min: 8.0
+    min_usd: 0.0                   # 0 = no high-vol filter (source behavior)
 
-  # Trend-break disabled — ATR-relative SL already sizes appropriately
+  # Trend-break early exit — source-optimal (3 bars / 20bps).
   trend_break:
-    enabled: false
-    min_bars_held: 3
-    adverse_bps: 20.0
+    enabled: true
+    min_bars_held: 3               # give the move 15 min to resolve first
+    adverse_bps: 20.0              # exit if price moved 20bps against entry
 
-# Survival rails
+# Survival rails — lenient (volume/rebate driven, DD expected to recover).
 risk:
-  daily_loss_limit_pct: 0.50       # 50% per day — very lenient (rebate recovers)
+  daily_loss_limit_pct: 0.50       # 50% per day
   max_drawdown_pct: 0.95           # 95% absolute DD halt
   consecutive_losses_limit: 10
   consecutive_losses_cooldown_bars: 12
   stop_on_volume_target: true
 
 target:
-  volume_usd: 5000000.0
+  volume_usd: 5000000.0            # campaign volume target (source used 100000.0)
   min_fee_cover_pct: 0.40
 
 notifications:
