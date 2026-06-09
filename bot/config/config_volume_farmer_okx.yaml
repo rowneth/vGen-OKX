@@ -38,7 +38,12 @@ farmer:
   sizing:
     dynamic_leverage: true
     risk_per_trade_pct: 0.025      # 2.5% risk per trade
-    max_leverage: 125
+    # SL-SAFETY CAP: with isolated margin, liquidation ≈ (1/lev - MMR) from entry.
+    # At the 50bps SL, max_leverage 68 keeps liquidation at ~101.6bps ≈ 2.03× the
+    # SL (stop always triggers before liquidation). 100x→liq ~55bps (razor-thin);
+    # 125x→liq ~35bps (INSIDE the SL → liquidated before the stop). Verified vs
+    # OKX tier-1 MMR=0.4%. The exchange leverage is set to THIS value (synced).
+    max_leverage: 68
     min_leverage: 5
 
   # Fallback fixed TP/SL (used when atr.relative = false)

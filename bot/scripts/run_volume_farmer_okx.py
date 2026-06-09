@@ -2697,8 +2697,14 @@ async def main_async(args: argparse.Namespace) -> int:
                 live_executor.entry_repeg_cfg.max_entry_seconds,
                 live_executor.entry_repeg_cfg.taker_fallback,
             )
+            # Exchange leverage MUST equal the session's sizing leverage cap so
+            # that locked margin = margin_fraction and the real liquidation price
+            # matches the SL-safety analysis. Drive it from config sizing.max_leverage
+            # (single source of truth); --live-leverage is only an optional upper clamp.
+            _cfg_max_lev = int(cfg.get("farmer", {}).get("sizing", {}).get("max_leverage", args.live_leverage or 50))
+            _exchange_lev = min(_cfg_max_lev, args.live_leverage) if args.live_leverage else _cfg_max_lev
             try:
-                await live_executor.initialize(leverage_cap=args.live_leverage)
+                await live_executor.initialize(leverage_cap=_exchange_lev)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("live executor init failed: %s", exc)
                 return 2
@@ -2964,8 +2970,10 @@ def main() -> int:
                    help="With --live: build orders but do NOT submit")
     p.add_argument("--max-live-trades", type=int, default=100,
                    help="Hard cap on number of live/demo orders submitted")
-    p.add_argument("--live-leverage", type=int, default=50,
-                   help="Leverage cap to set on OKX for the symbol")
+    p.add_argument("--live-leverage", type=int, default=0,
+                   help="Optional upper clamp on OKX exchange leverage. 0 (default) "
+                        "= use config sizing.max_leverage (keeps locked margin = "
+                        "margin_fraction and liquidation in sync with the SL-safety cap).")
     p.add_argument("--pos-mode", type=str, default="net", choices=["net", "hedge"],
                    help="OKX position mode (net = one-way, hedge = both sides)")
     p.add_argument("--no-telegram", action="store_true",
