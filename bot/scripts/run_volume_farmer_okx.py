@@ -42,6 +42,7 @@ if str(SRC_DIR) not in sys.path:
 
 from exchange.okx_client import OKXClient, to_okx_bar, to_okx_inst_id  # noqa: E402
 from execution.live_volume_executor_okx import (  # noqa: E402
+    DemoRealismConfig,
     EntryRepegConfig,
     LiveVolumeExecutorOKX,
     _fmt_size,
@@ -2633,6 +2634,24 @@ async def main_async(args: argparse.Namespace) -> int:
             er_cfg = farmer_cfg.get("entry_repeg", {}) or {}
             risk_cfg = cfg.get("risk", {}) or {}
             tf_seconds = _parse_timeframe_seconds(tf)
+            # DEMO realism overlay — constructed ONLY in simulated mode so it can
+            # never reach --live real-money execution (passes None when live).
+            rl_cfg = cfg.get("realism", {}) or {}
+            rl_entry = rl_cfg.get("entry", {}) or {}
+            rl_exit = rl_cfg.get("exit", {}) or {}
+            demo_realism = None
+            if client_simulated and bool(rl_cfg.get("enabled", True)):
+                demo_realism = DemoRealismConfig(
+                    enabled=True,
+                    seed=rl_cfg.get("seed"),
+                    entry_fill_prob=float(rl_entry.get("fill_prob", 0.85)),
+                    entry_slip_bps=float(rl_entry.get("slip_bps", 0.4)),
+                    entry_taker_fee_mult=float(rl_entry.get("taker_fee_mult", 2.5)),
+                    sl_slip_bps=float(rl_exit.get("sl_slip_bps", 3.0)),
+                    taker_exit_fee_mult=float(rl_exit.get("taker_exit_fee_mult", 2.5)),
+                    tp_fill_prob=float(rl_exit.get("tp_fill_prob", 0.90)),
+                    tp_miss_giveback_bps=float(rl_exit.get("tp_miss_giveback_bps", 6.0)),
+                )
             live_executor = LiveVolumeExecutorOKX(
                 client=client,
                 symbol=symbol,
@@ -2643,6 +2662,8 @@ async def main_async(args: argparse.Namespace) -> int:
                 # hardcoded capital_usd. margin_fraction_per_trade comes from the
                 # same farmer config the SIM uses, so sizing stays consistent.
                 margin_frac=float(farmer_cfg.get("margin_fraction_per_trade", 0.03)),
+                # Cap the sizing base (e.g. run a $500 account on a larger demo wallet).
+                working_capital_usd=float(farmer_cfg.get("working_capital_usd", 0.0)),
                 dry_run=args.live_dry_run,
                 log_dir=log_dir,
                 time_stop_enabled=bool(ts_cfg.get("enabled", False)),
@@ -2685,6 +2706,7 @@ async def main_async(args: argparse.Namespace) -> int:
                     "live_breaker_daily_loss_pct", risk_cfg.get("daily_loss_limit_pct", 0.05))),
                 breaker_max_drawdown_pct=float(risk_cfg.get(
                     "live_breaker_max_drawdown_pct", risk_cfg.get("max_drawdown_pct", 0.10))),
+                demo_realism=demo_realism,
             )
             LOGGER.info(
                 "live executor: time_stop=%s (max_hold=%d bars, %ds each), maker_exit=%s, "

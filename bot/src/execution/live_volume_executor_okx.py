@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import pathlib
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -102,6 +103,22 @@ class EntryRepegConfig:
 
 
 @dataclass
+class DemoRealismConfig:
+    """DEMO-ONLY execution-friction overlay. Never constructed under --live, so
+    these frictions can physically never touch real-money execution."""
+
+    enabled: bool = True
+    seed: Optional[int] = None
+    entry_fill_prob: float = 0.85
+    entry_slip_bps: float = 0.4
+    entry_taker_fee_mult: float = 2.5
+    sl_slip_bps: float = 3.0
+    taker_exit_fee_mult: float = 2.5
+    tp_fill_prob: float = 0.90
+    tp_miss_giveback_bps: float = 6.0
+
+
+@dataclass
 class LiveTradeOKX:
     """Bookkeeping for one live OKX trade lifecycle."""
 
@@ -158,6 +175,11 @@ class LiveVolumeExecutorOKX:
     # and never a hardcoded capital_usd. Leverage is equity-independent so the
     # SIM's leverage is reused. 0 disables (falls back to the SIM's notional).
     margin_frac: float = 0.0
+    # When > 0, CAP the sizing base at this many USDT: the order is sized off
+    # min(real_wallet, working_capital_usd). Lets a small "working" account run on
+    # a larger (e.g. demo) wallet — every trade risks off this fixed capital, not
+    # the full balance. 0 = no cap (use the full wallet).
+    working_capital_usd: float = 0.0
     dry_run: bool = False
     log_dir: pathlib.Path = field(default_factory=lambda: pathlib.Path("data/logs"))
     # Feature 1 — time-stop (close non-winning trades at touch instead of letting
@@ -174,6 +196,9 @@ class LiveVolumeExecutorOKX:
     # timeout-cancel problem in trending markets where the bar-close reference
     # price goes stale within seconds.
     entry_repeg_cfg: EntryRepegConfig = field(default_factory=EntryRepegConfig)
+    # DEMO-ONLY realism overlay. None under --live (the runner only constructs it
+    # when the OKX client is in simulated mode), so frictions can't reach real money.
+    demo_realism: Optional[DemoRealismConfig] = None
     # ------------------------------------------------------------------
     # OKX-confirmed lifecycle callbacks. Each fires ONLY at a real exchange
     # confirmation point so Telegram never announces a trade the exchange did
@@ -256,6 +281,9 @@ class LiveVolumeExecutorOKX:
     _open_trade: Optional[LiveTradeOKX] = field(default=None, init=False)
     _trade_count: int = field(default=0, init=False)
     _watcher_task: Optional[asyncio.Task] = field(default=None, init=False)
+    # DEMO realism RNG (seeded once in initialize) + per-peg fill decisions.
+    _demo_rng: Optional["random.Random"] = field(default=None, init=False)
+    _demo_fill_decisions: Dict[str, bool] = field(default_factory=dict, init=False)
     _initialized: bool = field(default=False, init=False)
     # Serializes the strategy's own close path (time-stop / maker-exit) against an
     # operator-triggered manual close from Telegram, so the two can't fire
@@ -286,7 +314,35 @@ class LiveVolumeExecutorOKX:
                             leverage_cap, self.mgn_mode, resp.get("code"), resp.get("msg"))
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("set_leverage failed (continuing): %s", exc)
+        if self.demo_realism is not None and self.demo_realism.enabled:
+            self._demo_rng = random.Random(self.demo_realism.seed)
+            LOGGER.info(
+                "DEMO REALISM overlay active: entry_fill_prob=%.2f entry_slip=%.1fbps "
+                "sl_slip=%.1fbps tp_fill_prob=%.2f seed=%s",
+                self.demo_realism.entry_fill_prob, self.demo_realism.entry_slip_bps,
+                self.demo_realism.sl_slip_bps, self.demo_realism.tp_fill_prob,
+                self.demo_realism.seed,
+            )
         self._initialized = True
+
+    # ------------------------------------------------------------------
+    # DEMO realism overlay (demo-only; physically inert under --live)
+    # ------------------------------------------------------------------
+    def _demo_on(self) -> bool:
+        """True only when running against the OKX simulated endpoint AND a realism
+        overlay is configured. Double-gated: ``demo_realism`` is None under --live."""
+        return (
+            bool(getattr(self.client, "_simulated", False))
+            and self.demo_realism is not None
+            and self.demo_realism.enabled
+            and self._demo_rng is not None
+        )
+
+    def _apply_demo_entry_slip(self, side: str, raw_px: float) -> float:
+        """Adverse entry slippage vs the demo avgPx (long fills higher, short lower)."""
+        slip = raw_px * (self.demo_realism.entry_slip_bps / 10_000.0)
+        px = raw_px + slip if side == "long" else raw_px - slip
+        return _round_to_tick(px, self._tick_sz)
 
     # ------------------------------------------------------------------
     # OKX-confirmation helpers (shared by entry + close paths)
@@ -626,10 +682,17 @@ class LiveVolumeExecutorOKX:
         if not real_bal or real_bal <= 0:
             LOGGER.warning("real balance unavailable; falling back to SIM notional $%.2f", sim_notional)
             return sim_notional
-        notional = real_bal * self.margin_frac * lev
+        # Cap the sizing base at the configured working capital so a small account
+        # can run on a larger (demo) wallet — risk off min(wallet, cap), not all of it.
+        base = real_bal
+        capped = self.working_capital_usd > 0 and real_bal > self.working_capital_usd
+        if capped:
+            base = self.working_capital_usd
+        notional = base * self.margin_frac * lev
         LOGGER.info(
-            "sizing on REAL wallet: $%.4f × margin_frac %.3f × lev %.1f = notional $%.2f (sim was $%.2f)",
-            real_bal, self.margin_frac, lev, notional, sim_notional,
+            "sizing on %s: $%.4f × margin_frac %.3f × lev %.1f = notional $%.2f (wallet $%.2f, sim was $%.2f)",
+            "WORKING CAP" if capped else "REAL wallet",
+            base, self.margin_frac, lev, notional, real_bal, sim_notional,
         )
         return notional
 
@@ -827,6 +890,19 @@ class LiveVolumeExecutorOKX:
             trade.cl_ord_id = cl_ord
             trade.entry_px_req = entry_px
 
+            # DEMO: model post-only queue risk. Decide once per peg; on a "miss"
+            # rest several ticks deeper so the demo engine genuinely won't fill —
+            # the existing cancel+re-peg loop then runs unchanged (no desync).
+            if self._demo_on():
+                hit = self._demo_fill_decisions.get(cl_ord)
+                if hit is None:
+                    hit = self._demo_rng.random() <= self.demo_realism.entry_fill_prob
+                    self._demo_fill_decisions[cl_ord] = hit
+                if not hit:
+                    px2 = (best_ask - 3 * self._tick_sz) if side == "long" else (best_bid + 3 * self._tick_sz)
+                    entry_px = _round_to_tick(px2, self._tick_sz)
+                    trade.entry_px_req = entry_px
+
             try:
                 resp = await self.client.place_order(
                     symbol=self.symbol,
@@ -877,7 +953,9 @@ class LiveVolumeExecutorOKX:
                 state = str(od.get("state", ""))
                 if state == "filled":
                     trade.filled = True
-                    trade.fill_px = float(od.get("avgPx") or entry_px)
+                    _raw = float(od.get("avgPx") or entry_px)
+                    trade.extras["demo_raw_fill_px"] = _raw
+                    trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
                     trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
                     trade.real_open_fee = abs(float(od.get("fee") or 0.0))
                     self._last_entry_repegs = repegs
@@ -907,7 +985,9 @@ class LiveVolumeExecutorOKX:
                 od = (r.get("data") or [{}])[0]
                 if str(od.get("state", "")) == "filled":
                     trade.filled = True
-                    trade.fill_px = float(od.get("avgPx") or entry_px)
+                    _raw = float(od.get("avgPx") or entry_px)
+                    trade.extras["demo_raw_fill_px"] = _raw
+                    trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
                     trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
                     trade.real_open_fee = abs(float(od.get("fee") or 0.0))
                     self._last_entry_repegs = repegs
@@ -1009,7 +1089,9 @@ class LiveVolumeExecutorOKX:
             state = str(data.get("state", ""))
             if state == "filled":
                 trade.filled = True
-                trade.fill_px = float(data.get("avgPx") or trade.entry_px_req)
+                _raw = float(data.get("avgPx") or trade.entry_px_req)
+                trade.extras["demo_raw_fill_px"] = _raw
+                trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
                 trade.fill_ts = int(data.get("fillTime") or int(time.time() * 1000))
                 trade.real_open_fee = abs(float(data.get("fee") or 0.0))
                 LOGGER.info("FILL  cid=%s  px=%.2f  fee=%.6f",
@@ -1153,6 +1235,12 @@ class LiveVolumeExecutorOKX:
         runs immediately after the close, the only opposite-side fills after the
         entry timestamp belong to THIS trade.
         """
+        # DEMO: the realism overlay already recomputed gross from the slipped
+        # close_px in _resolve_close. OKX's authoritative `pnl` ignores our
+        # frictions, so adopting it here would erase them — skip in demo.
+        if self._demo_on():
+            trade.extras["pnl_source"] = "recomputed_demo"
+            return
         exp_close_side = "sell" if trade.side == "long" else "buy"
         try:
             r = await self.client.get_orders_history(self.symbol, limit=50)
@@ -1447,11 +1535,39 @@ class LiveVolumeExecutorOKX:
                            trade.cl_ord_id)
             return False
 
+        # DEMO: SL/taker exits slip adversely through the trigger; native limit-TPs
+        # occasionally miss and give back profit (degrading to a worse taker exit).
+        # Applied AFTER the reason is decided (won't reclassify) and BEFORE the
+        # gross recompute below. Idempotent via the demo_exit_adj flag.
+        if self._demo_on() and not trade.extras.get("demo_exit_adj"):
+            trade.extras["demo_exit_adj"] = True
+            trade.extras["demo_raw_close_px"] = trade.close_px
+            r = self.demo_realism
+            if trade.close_reason == "sl":
+                # SL market exit slips worse (it already carries a taker fee in demo;
+                # don't uplift the fee or it double-counts — slippage only).
+                bump = trade.close_px * (r.sl_slip_bps / 10_000.0)
+                trade.close_px = _round_to_tick(
+                    trade.close_px - bump if trade.side == "long" else trade.close_px + bump,
+                    self._tick_sz)
+            elif trade.close_reason == "tp":
+                if self._demo_rng.random() > r.tp_fill_prob:
+                    # TP "missed" → chased to a worse exit + maker→taker fee.
+                    gb = trade.close_px * (r.tp_miss_giveback_bps / 10_000.0)
+                    trade.close_px = _round_to_tick(
+                        trade.close_px - gb if trade.side == "long" else trade.close_px + gb,
+                        self._tick_sz)
+                    trade.real_close_fee *= r.taker_exit_fee_mult
+                    trade.extras["demo_tp_missed"] = True
+            if trade.close_px <= 0:  # never drive price non-positive
+                trade.close_px = trade.extras["demo_raw_close_px"]
+
         # Realized gross PnL — prefer OKX's own authoritative `pnl`; recompute
         # from fill/close prices if it's absent OR the literal "0"/"" string
-        # (don't silently log $0 on a real close).
+        # (don't silently log $0 on a real close). In DEMO, always recompute so
+        # the slipped close_px above flows into PnL (the demo `pnl` ignores it).
         gross = None
-        if okx_pnl_str not in (None, "", "0"):
+        if not self._demo_on() and okx_pnl_str not in (None, "", "0"):
             try:
                 gross = float(okx_pnl_str)
             except (TypeError, ValueError):

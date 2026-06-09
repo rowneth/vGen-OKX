@@ -31,7 +31,12 @@ fees:
   rebate_pct: 0.40                 # 40% rebate on maker fees
 
 farmer:
-  capital_usd: 500.0
+  capital_usd: 500.0               # sim/session starting equity
+  # Run as a $1,500 account: in demo/live the executor sizes off
+  # min(real_wallet, working_capital_usd). On the $4,987 demo wallet this caps
+  # sizing to a $1,500 account; on a real $1,500 wallet it uses the full balance
+  # and naturally scales down as it bleeds. 0 = use full wallet.
+  working_capital_usd: 1500.0
   leverage: 0                      # 0 = dynamic
 
   margin_fraction_per_trade: 0.03  # 3% of equity as margin
@@ -49,6 +54,10 @@ farmer:
   # Fallback fixed TP/SL (used when atr.relative = false)
   tp_bps: 8.0
   sl_bps: 50.0
+  # Pin the EFFECTIVE TP to a firm 12 bps (overrides the ATR-relative TP after
+  # the floor/cap). 0 = disabled (use tp_bps / ATR bracket). The ATR-relative SL
+  # is left intact. Applies in all modes (paper/demo/live).
+  force_tp_bps: 12.0
   max_hold_bars: 999               # no time-stop — let TP/SL resolve
 
   entry:
@@ -108,6 +117,25 @@ notifications:
         - "@rowneth"
         - "@Litchth"
         - "@ChaanaCM"
+
+# DEMO-ONLY execution-realism overlay. ZERO effect under --live (gated on the
+# OKX client's simulated flag in the executor). Makes demo fills behave like real
+# maker/taker execution: some post-only entries miss, fills slip adversely,
+# stop-losses/taker exits cost more, and limit-TPs occasionally don't fill — so
+# demo PnL reflects real-world frictions instead of perfect simulated fills.
+# Defaults tuned for BTC-USDT-SWAP 5m, OKX tier-1 fees (maker 2bps / taker 5bps).
+realism:
+  enabled: true                  # master switch (demo only; ignored under --live)
+  seed: 1337                     # RNG seed for reproducible demo runs; null = nondeterministic
+  entry:
+    fill_prob: 0.85              # P(a resting post-only peg actually fills); ~15% miss → re-peg/abandon
+    slip_bps: 0.4                # adverse entry slippage vs the demo avgPx
+    taker_fee_mult: 2.5          # taker/maker fee ratio when an entry falls back to taker
+  exit:
+    sl_slip_bps: 3.0             # extra adverse slippage on SL / taker market closes
+    taker_exit_fee_mult: 2.5     # maker→taker fee uplift on taker/SL exits
+    tp_fill_prob: 0.90           # P(a native limit-TP fills at the TP price); else degrades to taker
+    tp_miss_giveback_bps: 6.0    # when a TP misses, haircut the exit toward entry by this many bps
 
 reporting:
   output_dir: data/reports

@@ -194,6 +194,9 @@ class VolumeFarmerSession:
 		self._tp_profit_buffer_bps = float(atr_cfg.get("tp_profit_buffer_bps", 0.0))
 		self._tp_bps_max = float(atr_cfg.get("tp_bps_max", 0.0))  # <=0 disables cap
 		self._limit_tp = bool(f.get("limit_tp", False))
+		# Firm effective-TP override: pin the TP to a fixed bps after the ATR
+		# bracket + floor/cap. 0 = disabled.
+		self._force_tp_bps = float(f.get("force_tp_bps", 0.0))
 		self._pending_tp_bps: float = self._tp_bps
 		self._pending_sl_bps: float = self._sl_bps
 		fees_cfg = self.config.get("fees", {})
@@ -343,6 +346,11 @@ class VolumeFarmerSession:
 		else:
 			self._pending_tp_bps = self._apply_tp_floor_cap(self._tp_bps)
 			self._pending_sl_bps = self._sl_bps
+
+		# Firm effective-TP override — pin TP after the ATR bracket + floor/cap so
+		# nothing downstream can drift it. SL stays ATR-relative.
+		if self._force_tp_bps > 0:
+			self._pending_tp_bps = self._force_tp_bps
 
 		if self._entry_mode == "micro_momentum":
 			bias = "long" if close_p > open_p else "short"
