@@ -63,42 +63,11 @@ def _round_size(x: float, lot: float) -> float:
     return math.floor(x / lot) * lot
 
 
-def _lot_decimals(lot: float) -> int:
-    """How many decimal places ``lot`` carries. e.g. 0.01 -> 2, 0.1 -> 1, 1 -> 0."""
-    if lot <= 0:
-        return 8
-    # log10 may yield -1.9999… for 0.01 due to float repr; round before negating.
-    return max(0, -int(round(math.log10(lot))))
-
-
-def _fmt_size(x: float, lot: float) -> str:
-    """Format a contract size as a string OKX will accept.
-
-    OKX validates ``sz`` textually against ``lotSz``: ``2.5500000000000003``
-    is rejected as not a clean multiple even though it numerically is. Format
-    to the lot's decimal precision so the string matches the grid exactly.
-    """
-    return f"{x:.{_lot_decimals(lot)}f}"
-
-
-@dataclass
-class EntryRepegConfig:
-    """Tuning for the entry post_only re-peg loop.
-
-    Each "peg" places a post_only at the current touch, waits ``repeg_ms`` for
-    fill, and on no-fill cancels and re-prices. ``max_repegs`` and
-    ``max_entry_seconds`` bound the total chase. ``taker_fallback`` (off by
-    default) sends a market order after exhausting the maker loop; leaving it
-    off means an unfilled entry is simply abandoned for the next signal — the
-    volume-preserving option since the next 5m bar still produces a signal.
-    """
-
-    enabled: bool = True
-    repeg_ms: int = 8_000
-    max_repegs: int = 6
-    max_entry_seconds: float = 60.0
-    poll_ms: int = 150
-    taker_fallback: bool = False
+def _as_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -128,14 +97,10 @@ class LiveTradeOKX:
     real_gross_pnl: float = 0.0
     real_open_fee: float = 0.0
     real_close_fee: float = 0.0
-    # Exit-execution metrics (populated when maker_exit / time_stop path runs).
-    exit_path: str = "native_tp_sl"     # "native_tp_sl" | "maker_exit" | "taker_fallback"
-    exit_repegs: int = 0
-    exit_ttf_s: float = 0.0
-    exit_maker_qty: float = 0.0
-    exit_taker_qty: float = 0.0
-    exit_fee_bps: float = 0.0
-    exit_adverse_bps: float = 0.0
+    # Real position metadata read back from OKX /account/positions after fill.
+    real_lever: float = 0.0
+    real_liq_px: float = 0.0
+    real_margin: float = 0.0
     extras: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -244,6 +209,12 @@ class LiveVolumeExecutorOKX:
 
     # Per-trade entry-repeg metrics (most-recent attempt only — for log line)
     _last_entry_repegs: int = field(default=0, init=False)
+
+    # Real-data callbacks — fired ONLY on confirmed OKX state (fill / close) with
+    # values read back from the exchange (avgPx, fee, liqPx, lever). These let the
+    # runner send Telegram messages built from real exchange data, never estimates.
+    real_entry_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+    real_close_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 
     # Cached instrument metadata
     _ct_val: float = field(default=0.01, init=False)
@@ -1098,48 +1069,38 @@ class LiveVolumeExecutorOKX:
             )
             return
 
-        # ---- Close not verified flat. Before declaring it stuck, FORCE it.
-        if flat is False:
-            # The maker-exit's lone taker fallback may have been rejected/throttled
-            # and silently given up. Hammer a retried market close — the guaranteed
-            # flatten the operator would otherwise have to do by hand.
-            if await self._force_market_close(trade):
-                LOGGER.info("force_close flattened the position (cid=%s) — finalizing",
-                            trade.cl_ord_id)
-                if not (trade.closed and trade.close_px > 0):
-                    await self._resolve_close(trade)
-                if trade.closed and trade.close_px > 0:
-                    await self._reconcile_okx_pnl(trade)
-                    await self._update_breaker_on_close(trade)
-                    trade.extras["close_verified"] = True
-                    self._log_trade(trade)
-                    await self._safe_callback(
-                        self.on_close_confirmed or self.on_real_fill,
-                        trade, "on_close_confirmed",
-                    )
-                    return
-                # Flat now but couldn't price it → flat-but-unpriced unverified.
-                flat = True
-            else:
-                trade.extras["still_open"] = True
-                trade.closed = False
-                trade.close_reason = "close_failed_still_open"
-                LOGGER.error(
-                    "CLOSE UNVERIFIED — OKX still shows a position open after force-close "
-                    "attempts (cid=%s); pausing entries until flat (recovery keeps retrying)",
-                    trade.cl_ord_id,
-                )
-                # Self-healing hold: the recovery watcher keeps re-attempting the
-                # close AND releases the gate the moment OKX reports flat.
-                asyncio.create_task(self._recover_stuck_position(trade))
+        # Position is now open. Read the REAL position metadata back from OKX
+        # (liquidation price, applied leverage, isolated margin) and announce the
+        # entry from confirmed exchange data — never paper estimates.
+        snap = await self._position_snapshot(trade.side)
+        trade.real_lever = snap.get("lever", 0.0)
+        trade.real_liq_px = snap.get("liq_px", 0.0)
+        trade.real_margin = snap.get("margin", 0.0)
+        if self.real_entry_callback is not None:
+            real_notional = trade.fill_px * trade.sz_contracts * self._ct_val
+            try:
+                await self.real_entry_callback({
+                    "symbol": to_okx_inst_id(self.symbol),
+                    "side": trade.side,
+                    "entry_price": trade.fill_px,
+                    "tp_price": trade.tp_px,
+                    "sl_price": trade.sl_px,
+                    "tp_bps": trade.tp_bps,
+                    "sl_bps": trade.sl_bps,
+                    "leverage": trade.real_lever,
+                    "liq_price": trade.real_liq_px,
+                    "margin": trade.real_margin,
+                    "sz_contracts": trade.sz_contracts,
+                    "notional": real_notional,
+                    "open_fee": trade.real_open_fee,
+                    "cl_ord_id": trade.cl_ord_id,
+                    "ord_id": trade.ord_id,
+                })
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("real_entry_callback failed: %s", exc)
 
-        if flat is not False:
-            # flat is True (incl. forced-flat-but-unpriced) or None (all polls errored)
-            trade.close_reason = trade.close_reason or "unverified_close"
-            LOGGER.warning(
-                "CLOSE UNVERIFIED — flat=%s close_px=%.2f (cid=%s reason=%s)",
-                flat, trade.close_px, trade.cl_ord_id, trade.close_reason,
-            )
+        # Wait for it to close via attached TP/SL.
+        await self._watch_position(trade)
         self._log_trade(trade)
         await self._safe_callback(self.on_close_unverified, trade, "on_close_unverified")
 
@@ -1336,6 +1297,41 @@ class LiveVolumeExecutorOKX:
                 trade.cl_ord_id, result.error,
             )
 
+    async def _position_snapshot(self, side: str) -> Dict[str, float]:
+        """Read real liquidation price / leverage / isolated margin for our open
+        position from OKX. Retries briefly because the position can lag the fill.
+        Returns zeros if it cannot be read (callback then shows what it has)."""
+        want = "short" if side == "short" else "long"
+        for _ in range(4):
+            try:
+                r = await self.client.get_positions(self.symbol)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("position_snapshot get_positions failed: %s", exc)
+                await asyncio.sleep(0.6)
+                continue
+            for p in (r.get("data") or []):
+                try:
+                    pos_sz = float(p.get("pos") or 0.0)
+                except ValueError:
+                    pos_sz = 0.0
+                if pos_sz == 0.0:
+                    continue
+                # net mode: posSide == "net"; infer side from sign of pos.
+                ps = str(p.get("posSide") or "net")
+                inferred = "long" if pos_sz > 0 else "short"
+                if ps in ("long", "short") and ps != want:
+                    continue
+                if ps == "net" and inferred != want:
+                    continue
+                return {
+                    "liq_px": _as_float(p.get("liqPx")),
+                    "lever": _as_float(p.get("lever")),
+                    "margin": _as_float(p.get("margin")) or _as_float(p.get("imr")),
+                    "upl": _as_float(p.get("upl")),
+                }
+            await asyncio.sleep(0.6)
+        return {"liq_px": 0.0, "lever": 0.0, "margin": 0.0, "upl": 0.0}
+
     async def _watch_position(self, trade: LiveTradeOKX) -> None:
         """Poll /positions until the position closes, then resolve its price/PnL.
 
@@ -1386,8 +1382,24 @@ class LiveVolumeExecutorOKX:
         trade.close_reason = trade.close_reason or "watch_timeout"
         await self._resolve_close(trade)
 
-    async def _resolve_close(self, trade: LiveTradeOKX) -> bool:
-        """Match the closing fill in order history for exit price/fee/pnl.
+    async def _resolve_close(self, trade: LiveTradeOKX) -> None:
+        """Look up the last reduceOnly fill to identify exit price and reason."""
+        try:
+            # The attached algo's fill appears in order history as a reduceOnly
+            # order. Pull the most recent one matching our side.
+            r = await self.client._request(  # noqa: SLF001 — fallback to raw
+                "GET", "/api/v5/trade/orders-history",
+                params={"instType": "SWAP",
+                        "instId": to_okx_inst_id(self.symbol),
+                        "limit": "10"},
+                auth=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("orders-history fetch failed: %s", exc)
+            trade.closed = True
+            trade.close_reason = "history_fetch_failed"
+            await self._emit_close(trade, resolved=False)
+            return
 
         Returns True ONLY when a real closing fill is matched (a priced close).
         On no-match or a fetch error it returns False WITHOUT marking the trade
@@ -1443,9 +1455,11 @@ class LiveVolumeExecutorOKX:
                 await asyncio.sleep(0.5)   # let order-history catch up, then refetch
 
         if trade.close_px == 0.0:
-            LOGGER.warning("could not match close fill for cid=%s (will retry/verify)",
-                           trade.cl_ord_id)
-            return False
+            LOGGER.warning("could not match close fill for cid=%s", trade.cl_ord_id)
+            trade.closed = True
+            trade.close_reason = "unmatched_close"
+            await self._emit_close(trade, resolved=False)
+            return
 
         # Realized gross PnL — prefer OKX's own authoritative `pnl`; recompute
         # from fill/close prices if it's absent OR the literal "0"/"" string
@@ -1468,7 +1482,38 @@ class LiveVolumeExecutorOKX:
             trade.cl_ord_id, trade.close_reason, trade.fill_px, trade.close_px,
             trade.real_gross_pnl, trade.real_open_fee, trade.real_close_fee,
         )
-        return True
+        await self._emit_close(trade, resolved=True)
+
+    async def _emit_close(self, trade: LiveTradeOKX, *, resolved: bool) -> None:
+        """Fire ``real_close_callback`` with REAL exchange numbers: real exit
+        price, real open+close fees (from the order ``fee`` fields) and real
+        net PnL. ``resolved`` is False when the close fill could not be matched
+        in order history (exit price/fee unknown)."""
+        if self.real_close_callback is None:
+            return
+        real_net = trade.real_gross_pnl - trade.real_open_fee - trade.real_close_fee
+        try:
+            await self.real_close_callback({
+                "symbol": to_okx_inst_id(self.symbol),
+                "side": trade.side,
+                "reason": trade.close_reason,
+                "resolved": resolved,
+                "entry_price": trade.fill_px,
+                "exit_price": trade.close_px,
+                "sz_contracts": trade.sz_contracts,
+                "notional": trade.notional_usd,
+                "open_fee": trade.real_open_fee,
+                "close_fee": trade.real_close_fee,
+                "gross_pnl": trade.real_gross_pnl,
+                "net_pnl": real_net,
+                "leverage": trade.real_lever,
+                "liq_price": trade.real_liq_px,
+                "tp_price": trade.tp_px,
+                "sl_price": trade.sl_px,
+                "cl_ord_id": trade.cl_ord_id,
+            })
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("real_close_callback failed: %s", exc)
 
     def _log_trade(self, trade: LiveTradeOKX) -> None:
         rec = {

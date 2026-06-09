@@ -291,6 +291,7 @@ async def _poll_loop(
     bot_label: str = "",
     cfg: Optional[Dict[str, Any]] = None,
     intrabar: Optional[Dict[str, Any]] = None,
+    live_mode: bool = False,
 ) -> None:
     bar_seconds = _parse_timeframe_seconds(tf)
     last_bar_ts: Optional[pd.Timestamp] = (
@@ -316,11 +317,7 @@ async def _poll_loop(
             continue
 
         # Intrabar TP/SL detection — fire Telegram immediately on hit, don't wait for bar close.
-        # PAPER only: this is a SIMULATED touch off local candles with simulated PnL. In
-        # demo/live the authoritative exit notice is the executor's on_close_confirmed card
-        # (real fills), so we suppress the simulated touch message to avoid quoting fake numbers.
-        if (notifier and notifier.enabled and mode_label == "PAPER"
-                and session.position is not None and cfg is not None and intrabar is not None):
+        if notifier and notifier.enabled and not live_mode and session.position is not None and cfg is not None and intrabar is not None:
             pos = session.position
             unclosed = df_new[~df_new["closed"]]
             if not unclosed.empty:
@@ -424,8 +421,12 @@ def _make_event_handler(
     bot_label: str = "",
     intrabar: Optional[Dict[str, Any]] = None,
     state_path: Optional[pathlib.Path] = None,
-    cfg: Optional[Dict[str, Any]] = None,
+    live_mode: bool = False,
 ):
+    # live_mode (demo/live): the paper session still drives strategy decisions and
+    # bookkeeping, but Telegram entry/exit messages are sent by the executor's
+    # real-data callbacks (real fill price, real fee, real liqPx) — NOT from these
+    # paper-estimated events. So suppress the paper entry/exit sends here.
     _pending: Dict[str, Any] = {}
     _esc = TelegramNotifier.escape
     _lbl = f"\n{_SEP}\n\\[{_esc(bot_label)}\\]" if bot_label else ""
@@ -616,8 +617,8 @@ def _make_event_handler(
                     f"{_SEP}\n"
                     f"Open fee  `${open_fee:.4f}` \\(maker\\)"
                 )
-                # Balance footer + bot label are appended inside the sender.
-                asyncio.create_task(_send_entry_with_chart(text, side, entry, tp, sl, equity))
+                if not live_mode:
+                    asyncio.create_task(_send_entry_with_chart(text, side, entry, tp, sl))
             if state_path is not None:
                 try:
                     session.save_state(state_path)
@@ -668,12 +669,7 @@ def _make_event_handler(
                 intrabar.pop(ikey, None)
                 intrabar.pop(f"{ikey}_msg_id", None)
 
-            # PAPER only: render the exit card from the simulated touch. In
-            # live/demo the ONE exit message is the executor's OKX-confirmed
-            # close card (on_close_confirmed) — this SIM card is suppressed so
-            # there are never two conflicting exit messages with different
-            # numbers, and never a "closed" card while the real position is open.
-            if notifier and notifier.enabled and not already_notified and not is_real:
+            if notifier and notifier.enabled and not already_notified and not live_mode:
                 emoji = "✅" if reason == "tp" else ("❌" if reason == "sl" else "⏱")
                 g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
                 n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
@@ -768,6 +764,154 @@ def _make_event_handler(
 
     return on_event
 
+
+async def _okx_usdt_balance(client: "OKXClient") -> Optional[float]:
+    """Real USDT equity from the OKX wallet (demo or live), or None."""
+    try:
+        r = await client.get_balance("USDT")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("balance fetch failed: %s", exc)
+        return None
+    for acct in (r.get("data") or []):
+        for d in (acct.get("details") or []):
+            if str(d.get("ccy")) == "USDT":
+                try:
+                    return float(d.get("eq") or d.get("availBal") or 0.0)
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _make_real_callbacks(
+    notifier: Optional[TelegramNotifier],
+    symbol: str,
+    tf: str,
+    session: VolumeFarmerSession,
+    client: "OKXClient",
+    mode_label: str,
+    bot_label: str,
+    intrabar: Optional[Dict[str, Any]] = None,
+):
+    """Build (real_entry_cb, real_close_cb) that render Telegram from CONFIRMED
+    OKX data only — real fill price, real fees, real liquidation price, real
+    wallet balance. Used in demo/live mode so no estimate ever reaches Telegram.
+    """
+    _esc = TelegramNotifier.escape
+    _lbl = f"\n{_SEP}\n\\[{_esc(bot_label)}\\]" if bot_label else ""
+    _state: Dict[str, Any] = {"entry_msg_id": None}
+
+    async def real_entry_cb(info: Dict[str, Any]) -> None:
+        if not (notifier and notifier.enabled):
+            return
+        side = str(info.get("side", "long"))
+        entry = float(info.get("entry_price") or 0.0)
+        tp = float(info.get("tp_price") or 0.0)
+        sl = float(info.get("sl_price") or 0.0)
+        tp_bps = float(info.get("tp_bps") or 0.0)
+        sl_bps = float(info.get("sl_bps") or 0.0)
+        lev = float(info.get("leverage") or 0.0)
+        liq = float(info.get("liq_price") or 0.0)
+        margin = float(info.get("margin") or 0.0)
+        notional = float(info.get("notional") or 0.0)
+        sz = float(info.get("sz_contracts") or 0.0)
+        open_fee = float(info.get("open_fee") or 0.0)
+        trade_num = session.wins + session.losses + 1
+        arrow = "🟢" if side == "long" else "🔴"
+        # Liquidation distance + safety badge (liq inside SL = stop gives no protection)
+        liq_line = ""
+        if liq > 0 and entry > 0:
+            liq_dist = (liq - entry) / entry * 10_000
+            badge = ""
+            if abs(liq_dist) <= sl_bps:
+                badge = "  ⚠ INSIDE SL"
+            elif abs(liq_dist) < 2 * sl_bps:
+                badge = "  ⚠ tight"
+            liq_line = f"Liq   →  `{liq:,.2f}`   `{liq_dist:+.0f}bps`{_esc(badge)}\n"
+        bal = await _okx_usdt_balance(client)
+        bal_line = f"`${bal:,.2f}` USDT" if bal is not None else "`n/a`"
+        text = (
+            f"{arrow} *{_esc(side.upper())} \\#{_esc(str(trade_num))} · {_esc(mode_label)}* `✓ real fill`\n"
+            f"{_esc(symbol)} · {_esc(tf)}\n"
+            f"{_SEP}\n"
+            f"Entry →  `{entry:,.2f}`\n"
+            f"TP    →  `{tp:,.2f}`   `+{tp_bps:.1f}bps`\n"
+            f"SL    →  `{sl:,.2f}`   `-{sl_bps:.1f}bps`\n"
+            f"{liq_line}"
+            f"{_SEP}\n"
+            f"Margin  `${margin:,.2f}`  ·  Lev `{lev:.0f}×`\n"
+            f"Size    `${notional:,.2f}`  ·  `{sz:g} ct`\n"
+            f"{_SEP}\n"
+            f"Open fee  `${open_fee:.4f}`  \\(real, maker\\)\n"
+            f"{_SEP}\n"
+            f"Balance  {bal_line}"
+            f"{_lbl}"
+        )
+        try:
+            mid = await notifier.send_and_get_id(text)
+            _state["entry_msg_id"] = mid
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("real entry telegram failed: %s", exc)
+
+    async def real_close_cb(info: Dict[str, Any]) -> None:
+        if not (notifier and notifier.enabled):
+            return
+        side = str(info.get("side", "")).upper()
+        reason = str(info.get("reason", "?"))
+        resolved = bool(info.get("resolved", True))
+        entry = float(info.get("entry_price") or 0.0)
+        exit_px = float(info.get("exit_price") or 0.0)
+        gross = float(info.get("gross_pnl") or 0.0)
+        open_fee = float(info.get("open_fee") or 0.0)
+        close_fee = float(info.get("close_fee") or 0.0)
+        net = float(info.get("net_pnl") or 0.0)
+        trade_num = session.wins + session.losses
+        reply_id = _state.get("entry_msg_id")
+        _state["entry_msg_id"] = None
+        bal = await _okx_usdt_balance(client)
+        bal_line = f"`${bal:,.2f}` USDT" if bal is not None else "`n/a`"
+        wins = int(session.wins)
+        losses = int(session.losses)
+        wr = (wins / (wins + losses) * 100) if (wins + losses) else 0.0
+        vol = float(session.total_volume_usd)
+        vtarget = float(session._volume_target)  # noqa: SLF001
+        vol_pct = vol / vtarget * 100 if vtarget else 0.0
+        fee_type = "maker" if reason == "tp" else "taker"
+        emoji = "✅" if reason == "tp" else ("❌" if reason == "sl" else "⏱")
+        g = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
+        n = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
+        if not resolved:
+            # Exchange closed the position but we couldn't match the close fill.
+            text = (
+                f"⚠️ *{_esc(side)} closed · {_esc(mode_label)}* `reconciling`\n"
+                f"{_esc(symbol)}  entry `{entry:,.2f}`\n"
+                f"{_SEP}\n"
+                f"Exit fill not yet matched in order history — PnL will reconcile.\n"
+                f"Balance  {bal_line}"
+                f"{_lbl}"
+            )
+        else:
+            text = (
+                f"{emoji} *{_esc(reason.upper())} · {_esc(side)} \\#{_esc(str(trade_num))} · {_esc(mode_label)}* `✓ real`\n"
+                f"{_esc(symbol)}  `{entry:,.2f}` → `{exit_px:,.2f}`\n"
+                f"{_SEP}\n"
+                f"Gross      `{g}`\n"
+                f"Open fee   `-${open_fee:.4f}`  \\(maker\\)\n"
+                f"Close fee  `-${close_fee:.4f}`  \\({_esc(fee_type)}\\)\n"
+                f"*Net       `{n}`*  _round\\-trip_\n"
+                f"{_SEP}\n"
+                f"`{wins}W · {losses}L · {wr:.1f}% WR`\n"
+                f"{_SEP}\n"
+                f"Balance  {bal_line}\n"
+                f"{_SEP}\n"
+                f"Vol  `${vol:,.0f}` / `${vtarget:,.0f}`  \\[`{vol_pct:.1f}%`\\]"
+                f"{_lbl}"
+            )
+        try:
+            await notifier.send_and_get_id(text, reply_to_message_id=reply_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("real close telegram failed: %s", exc)
+
+    return real_entry_cb, real_close_cb
 
 
 async def _fetch_real_account(client: Any, symbol: str) -> Dict[str, Any]:
@@ -2397,6 +2541,10 @@ async def _command_loop(
     pos_mode: str = "net",
 ) -> None:
     if not notifier.enabled:
+        # No Telegram control panel to run, but this task must stay pending so it
+        # doesn't trip the FIRST_COMPLETED teardown — let the poll loop / duration
+        # decide when to stop.
+        await stop_evt.wait()
         return
     _esc = TelegramNotifier.escape
 
@@ -2602,27 +2750,22 @@ async def main_async(args: argparse.Namespace) -> int:
     # --demo we want simulated=True; for --live we want simulated=False.
     client_simulated = args.demo and not args.live
 
-    # OKX demo and live use separate API key tiers. When --demo, prefer the
-    # OKX_DEMO_* env vars; fall back to live keys only if demo keys are absent
-    # (in which case authenticated calls will 401 with code=50120 and entries
-    # will silently fail — visible warning emitted here).
+    # OKX simulated trading uses SEPARATE demo API keys (generated in the OKX
+    # demo environment). Prefer OKX_DEMO_API_* in demo mode, falling back to the
+    # live keys if demo keys are not set. Live mode always uses OKX_API_*.
     if client_simulated:
-        api_key = os.environ.get("OKX_DEMO_API_KEY") or os.environ.get("OKX_API_KEY", "")
-        api_secret = os.environ.get("OKX_DEMO_API_SECRET") or os.environ.get("OKX_API_SECRET", "")
-        passphrase = os.environ.get("OKX_DEMO_API_PASSPHRASE") or os.environ.get("OKX_API_PASSPHRASE", "")
-        if not os.environ.get("OKX_DEMO_API_KEY"):
-            LOGGER.warning(
-                "--demo selected but OKX_DEMO_API_KEY not set in .env; falling back to "
-                "live keys which will 401 on authenticated demo calls. Generate demo keys at "
-                "https://www.okx.com/account/demo-trading and add OKX_DEMO_API_KEY/SECRET/PASSPHRASE.",
-            )
+        api_key = os.environ.get("OKX_DEMO_API_KEY", "") or os.environ.get("OKX_API_KEY", "")
+        api_secret = os.environ.get("OKX_DEMO_API_SECRET", "") or os.environ.get("OKX_API_SECRET", "")
+        passphrase = os.environ.get("OKX_DEMO_API_PASSPHRASE", "") or os.environ.get("OKX_API_PASSPHRASE", "")
     else:
         api_key = os.environ.get("OKX_API_KEY", "")
         api_secret = os.environ.get("OKX_API_SECRET", "")
         passphrase = os.environ.get("OKX_API_PASSPHRASE", "")
 
     async with OKXClient(
-        api_key=api_key, api_secret=api_secret, passphrase=passphrase,
+        api_key=api_key,
+        api_secret=api_secret,
+        passphrase=passphrase,
         simulated=client_simulated,
     ) as client:
         live_executor: Optional[LiveVolumeExecutorOKX] = None
@@ -2697,8 +2840,15 @@ async def main_async(args: argparse.Namespace) -> int:
                 live_executor.entry_repeg_cfg.max_entry_seconds,
                 live_executor.entry_repeg_cfg.taker_fallback,
             )
+            # Exchange leverage MUST match the session's sizing leverage cap so
+            # that the locked margin = the intended margin_fraction and the real
+            # liquidation price matches the SL-safety analysis. Drive it from the
+            # config's sizing.max_leverage (single source of truth); --live-leverage
+            # is only an upper clamp.
+            cfg_max_lev = int(cfg.get("farmer", {}).get("sizing", {}).get("max_leverage", args.live_leverage))
+            exchange_lev = min(cfg_max_lev, args.live_leverage) if args.live_leverage else cfg_max_lev
             try:
-                await live_executor.initialize(leverage_cap=args.live_leverage)
+                await live_executor.initialize(leverage_cap=exchange_lev)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("live executor init failed: %s", exc)
                 return 2
@@ -2763,8 +2913,20 @@ async def main_async(args: argparse.Namespace) -> int:
         handler = _make_event_handler(log_dir, symbol, session, live_executor,
                                       notifier=notifier, mode_label=mode_label,
                                       client=client, tf=tf, bot_label=args.label or "okx-paper",
-                                      intrabar=_intrabar, state_path=state_path, cfg=cfg)
+                                      intrabar=_intrabar, state_path=state_path,
+                                      live_mode=is_live_or_demo)
         session.event_callback = handler
+
+        # In demo/live mode, route Telegram entry/exit through the executor's
+        # real-data callbacks (real fill price, real fee, real liqPx, real wallet
+        # balance) instead of the paper-estimated session events above.
+        if live_executor is not None:
+            real_entry_cb, real_close_cb = _make_real_callbacks(
+                notifier, symbol, tf, session, client, mode_label,
+                bot_label=args.label or "okx-paper", intrabar=_intrabar,
+            )
+            live_executor.real_entry_callback = real_entry_cb
+            live_executor.real_close_callback = real_close_cb
 
         # Load persisted state and reconcile any orphan position.
         _esc_resume = TelegramNotifier.escape
@@ -2878,6 +3040,7 @@ async def main_async(args: argparse.Namespace) -> int:
             history, end_at, log_dir, handler,
             notifier=notifier, mode_label=mode_label,
             bot_label=args.label or "okx-paper", cfg=cfg, intrabar=_intrabar,
+            live_mode=is_live_or_demo,
         ))
         cmd_task = asyncio.create_task(_command_loop(
             notifier, session, client, symbol, tf, cfg,
@@ -2964,8 +3127,11 @@ def main() -> int:
                    help="With --live: build orders but do NOT submit")
     p.add_argument("--max-live-trades", type=int, default=100,
                    help="Hard cap on number of live/demo orders submitted")
-    p.add_argument("--live-leverage", type=int, default=50,
-                   help="Leverage cap to set on OKX for the symbol")
+    p.add_argument("--live-leverage", type=int, default=0,
+                   help="Optional upper clamp on the OKX exchange leverage. "
+                        "0 (default) = use config sizing.max_leverage (recommended, "
+                        "keeps locked margin = margin_fraction and liquidation in sync "
+                        "with the SL-safety analysis).")
     p.add_argument("--pos-mode", type=str, default="net", choices=["net", "hedge"],
                    help="OKX position mode (net = one-way, hedge = both sides)")
     p.add_argument("--no-telegram", action="store_true",
