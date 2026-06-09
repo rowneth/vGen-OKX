@@ -101,6 +101,18 @@ notifications:
     send_errors: true
     send_milestones: true
     daily_report_hour: 0
+    # Auto-reminder: pings members when the wallet is shaky and accrued
+    # rebate could rescue it. Cooldown prevents spam.
+    rebate_reminder:
+      enabled: true
+      equity_floor_pct: 0.85       # remind when equity < 85% of start
+      drawdown_pct: 0.08           # OR drawdown from peak >= 8%
+      min_rebate_usd: 5.0          # only nag if at least $5 in rebate pool
+      cooldown_minutes: 60
+      mention_handles:
+        - "@rowneth"
+        - "@Litchth"
+        - "@ChaanaCM"
 
 reporting:
   output_dir: data/reports

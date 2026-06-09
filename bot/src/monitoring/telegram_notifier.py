@@ -208,6 +208,29 @@ class TelegramNotifier:
 			async with self._session.post(url, json=payload) as response:
 				if response.status != 200:
 					body = await response.text()
+					# Graceful fallback: if the message we're replying to has been
+					# deleted or never existed (common after token swap or photo
+					# upload failure), drop the reply_to and retry once.
+					if (
+						response.status == 400
+						and "message to be replied not found" in body
+						and reply_to_message_id is not None
+					):
+						LOGGER.info(
+							"reply target msg_id=%s missing; retrying without thread",
+							reply_to_message_id,
+						)
+						payload.pop("reply_to_message_id", None)
+						async with self._session.post(url, json=payload) as retry:
+							if retry.status == 200:
+								data = await retry.json()
+								return int(data["result"]["message_id"])
+							rbody = await retry.text()
+							LOGGER.error(
+								"Telegram retry without reply failed status=%s body=%s",
+								retry.status, rbody[:300],
+							)
+							return None
 					LOGGER.error(
 						"Telegram send_and_get_id failed status=%s body=%s",
 						response.status, body[:500],
@@ -350,8 +373,14 @@ class TelegramNotifier:
 		self,
 		markdown_v2_text: str,
 		buttons: list,
+		reply_to_message_id: Optional[int] = None,
 	) -> Optional[int]:
-		"""Send a MarkdownV2 message with an inline keyboard. Returns message_id."""
+		"""Send a MarkdownV2 message with an inline keyboard. Returns message_id.
+
+		Pass ``reply_to_message_id`` to thread the message (and its buttons) as a
+		reply under an existing message — used so the EXIT-FAILED alert's action
+		buttons hang under the same entry card.
+		"""
 		if not self._enabled or not self._bot_token:
 			return None
 		if self._session is None:
@@ -365,6 +394,8 @@ class TelegramNotifier:
 			"disable_web_page_preview": True,
 			"reply_markup": {"inline_keyboard": buttons},
 		}
+		if reply_to_message_id is not None:
+			payload["reply_to_message_id"] = reply_to_message_id
 		try:
 			async with self._session.post(url, json=payload) as resp:
 				if resp.status != 200:
