@@ -178,6 +178,26 @@ class OKXClient:
             raise RuntimeError(f"OKX: no ticker data for {symbol}")
         return data[0]
 
+    async def get_trade_fee(self, symbol: str, *, inst_type: str = "SWAP") -> Dict[str, Any]:
+        """ACTUAL fee rates for this account from GET /account/trade-fee.
+
+        Returns the raw row: ``makerU``/``takerU`` (USDT-margined contracts,
+        falling back to ``maker``/``taker``) as SIGNED rates — OKX reports
+        fees you PAY as negative (e.g. "-0.0002" = 2bps cost). Used at
+        startup to verify the config's assumed maker/taker against reality:
+        the whole campaign cost model rests on those two numbers, so they
+        must never be trusted from a yaml comment alone.
+        """
+        resp = await self._request(
+            "GET", "/api/v5/account/trade-fee",
+            params={"instType": inst_type, "instId": to_okx_inst_id(symbol)},
+            auth=True,
+        )
+        data = resp.get("data") or []
+        if not data:
+            raise RuntimeError("OKX: no trade-fee data")
+        return data[0]
+
     async def get_server_time_ms(self) -> int:
         """OKX server time (ms epoch). Used to sanity-check local clock drift
         at startup — a drift past OKX's ~30s signing window breaks every

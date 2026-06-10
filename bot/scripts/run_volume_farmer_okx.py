@@ -826,7 +826,11 @@ def _make_event_handler(
             )
             if notifier and notifier.enabled:
                 if is_real:
-                    _bg(_send_auto_real("rebate_reminder", evt.payload))
+                    # Live/demo rebate reminders are owned by _live_ops_loop,
+                    # which triggers on the REAL wallet + REAL 24h fees. The
+                    # session's trigger keys off simulated paper equity and
+                    # its ask compounded lifetime fees — not real facts.
+                    LOGGER.debug("sim rebate_reminder suppressed in %s (ops loop owns it)", mode_label)
                     return
                 mention_line = " ".join(_esc(h) for h in handles) if handles else ""
                 head = mention_line + "\n" if mention_line else ""
@@ -2780,6 +2784,198 @@ async def _command_loop(
                     _spawn(_dispatch(cmd, raw_text, reply_to))
 
 
+async def _fees_last_24h(client: Any, symbol: str) -> Optional[float]:
+    """Sum of |fee| over FILLED orders in the last 24h — straight from OKX
+    order history, no local bookkeeping. Returns None when the API is
+    unavailable so callers can say "unavailable" instead of a fake $0."""
+    inst = to_okx_inst_id(symbol)
+    cutoff_ms = int((time.time() - 86_400) * 1000)
+    total = 0.0
+    after = ""
+    ok = False
+    try:
+        for _ in range(10):                      # ≤1,000 orders, newest first
+            params = {"instType": "SWAP", "instId": inst, "limit": "100"}
+            if after:
+                params["after"] = after
+            r = await client._request(  # noqa: SLF001
+                "GET", "/api/v5/trade/orders-history", params=params, auth=True,
+            )
+            if str(r.get("code")) != "0":
+                break
+            ok = True
+            data = r.get("data") or []
+            if not data:
+                break
+            page_older_than_cutoff = False
+            for o in data:
+                if str(o.get("state", "")) != "filled":
+                    continue
+                ft = int(o.get("fillTime") or 0)
+                if ft and ft < cutoff_ms:
+                    page_older_than_cutoff = True
+                    continue
+                try:
+                    total += abs(float(o.get("fee") or 0.0))
+                except (TypeError, ValueError):
+                    continue
+            after = data[-1].get("ordId") or ""
+            if page_older_than_cutoff or not after or len(data) < 100:
+                break
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("24h fee fetch failed: %s", exc)
+        return None
+    return total if ok else None
+
+
+async def _verify_fee_tier(client: Any, symbol: str, cfg: Dict[str, Any]) -> str:
+    """Compare the config's assumed maker/taker rates against the account's
+    ACTUAL tier from GET /account/trade-fee. The entire campaign cost model
+    (TP fee floor, cost-per-1M, rebate estimates) rests on these two numbers —
+    they must come from the exchange, not a yaml comment.
+
+    Returns a MarkdownV2-safe note for the startup card: verified, mismatch
+    warning, or unavailable.
+    """
+    try:
+        row = await client.get_trade_fee(symbol)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("fee-tier verification unavailable: %s", exc)
+        return "fee tier: `unverified` \\(API unavailable\\)"
+
+    def _rate(*keys: str) -> Optional[float]:
+        for k in keys:
+            v = row.get(k)
+            if v not in (None, ""):
+                try:
+                    return abs(float(v))      # OKX reports paid fees negative
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    real_maker = _rate("makerU", "maker")
+    real_taker = _rate("takerU", "taker")
+    cfg_m = float(cfg["fees"]["maker"])
+    cfg_t = float(cfg["fees"]["taker"])
+    LOGGER.info("OKX ACTUAL fee tier: maker=%s taker=%s (config assumes %s/%s)",
+                real_maker, real_taker, cfg_m, cfg_t)
+    if real_maker is None or real_taker is None:
+        return "fee tier: `unverified` \\(no rate in response\\)"
+    if abs(real_maker - cfg_m) <= cfg_m * 0.05 and abs(real_taker - cfg_t) <= cfg_t * 0.05:
+        return f"fee tier: `verified` \\(`{real_maker*1e4:.1f}`/`{real_taker*1e4:.1f}bps` live API\\)"
+    LOGGER.error("FEE TIER MISMATCH: config %s/%s but account pays %s/%s — "
+                 "the cost model is wrong until the config matches",
+                 cfg_m, cfg_t, real_maker, real_taker)
+    return (f"⚠️ fee tier MISMATCH: config `{cfg_m*1e4:.1f}`/`{cfg_t*1e4:.1f}bps` "
+            f"but account pays `{real_maker*1e4:.1f}`/`{real_taker*1e4:.1f}bps`")
+
+
+async def _live_ops_loop(
+    notifier: Optional[TelegramNotifier],
+    client: Any,
+    symbol: str,
+    cfg: Dict[str, Any],
+    mode_label: str,
+    bot_label: str,
+    stop_evt: asyncio.Event,
+) -> None:
+    """LIVE/DEMO operations watchdog — every number from the REAL exchange.
+
+    Replaces the simulation-triggered rebate reminder in real modes (the sim's
+    paper equity drifts away from the actual wallet, so its triggers were not
+    "real facts"). Hourly:
+      * fetch the actual wallet balance (anchored at startup for the floor),
+      * fetch the actual fees paid in the last 24h from order history,
+      * daily: ping the mention list to recycle ~24h × rebate%  back into the
+        wallet (per-day ask — the old card re-asked the LIFETIME rebate every
+        time),
+      * urgent (6h cooldown): wallet under floor% of the anchor — at a small
+        starting balance the rebate recycle is the campaign's lifeline, so
+        this fires loudly with the configured @handles.
+    """
+    if not (notifier and notifier.enabled) or mode_label == "PAPER":
+        await stop_evt.wait()
+        return
+    tg_cfg = (cfg.get("notifications", {}) or {}).get("telegram", {}) or {}
+    rr = tg_cfg.get("rebate_reminder", {}) or {}
+    if not bool(rr.get("enabled", True)):
+        await stop_evt.wait()
+        return
+    floor_pct = float(rr.get("equity_floor_pct", 0.85))
+    min_usd = float(rr.get("min_rebate_usd", 5.0))
+    rebate_pct = float((cfg.get("fees", {}) or {}).get("rebate_pct", 0.40))
+    handles = list(rr.get("mention_handles", []) or [])
+    if "@rowneth" not in handles:
+        handles.insert(0, "@rowneth")
+    _esc = TelegramNotifier.escape
+    anchor: Optional[float] = None
+    daily_sent_for = ""
+    low_bal_last = 0.0
+    while not stop_evt.is_set():
+        low_balance = False
+        try:
+            acct = await _fetch_real_account(client, symbol)
+            wallet = acct.get("equity")
+            if wallet is not None and anchor is None:
+                anchor = float(wallet)
+                LOGGER.info("ops: campaign wallet anchor $%.4f (floor $%.4f)",
+                            anchor, anchor * floor_pct)
+            fees24 = await _fees_last_24h(client, symbol)
+            rebate24 = fees24 * rebate_pct if fees24 is not None else None
+            now = datetime.now(tz=timezone.utc)
+            today = now.strftime("%Y-%m-%d")
+            low_balance = bool(
+                wallet is not None and anchor is not None
+                and wallet < anchor * floor_pct
+            )
+            daily_due = (daily_sent_for != today
+                         and rebate24 is not None and rebate24 >= min_usd)
+            urgent_due = low_balance and (time.time() - low_bal_last) > 6 * 3600
+            if daily_due or urgent_due:
+                mention = " ".join(_esc(h) for h in handles)
+                w_str = f"${wallet:,.4f}" if wallet is not None else "unavailable"
+                f24_str = f"${fees24:,.4f}" if fees24 is not None else "unavailable"
+                r24_str = f"${rebate24:,.2f}" if rebate24 is not None else "unavailable"
+                if urgent_due:
+                    head = f"🚨 *WALLET BELOW FLOOR · {_esc(mode_label)}*"
+                    anchor_str = f"${anchor:,.4f}" if anchor is not None else "—"
+                    floor_str = f"${anchor*floor_pct:,.4f}" if anchor is not None else "—"
+                    body = (
+                        f"Wallet now   `{w_str}`  \\(floor `{floor_str}` of start `{anchor_str}`\\)\n"
+                        f"Fees 24h     `{f24_str}`  \\(real OKX history\\)\n"
+                        f"Rebate 24h   `{r24_str}`  \\(est {int(rebate_pct*100)}%\\)\n"
+                        f"{_SEP}\n"
+                        f"*Action needed:* transfer accumulated rebates "
+                        f"\\(and top up if available\\) — sizing shrinks with the wallet "
+                        f"and the campaign stalls below the floor\\."
+                    )
+                else:
+                    head = f"💸 *Daily rebate recycle · {_esc(mode_label)}*"
+                    body = (
+                        f"Wallet now   `{w_str}`\n"
+                        f"Fees 24h     `{f24_str}`  \\(real OKX history\\)\n"
+                        f"Rebate 24h   `{r24_str}`  \\(est {int(rebate_pct*100)}%\\)\n"
+                        f"{_SEP}\n"
+                        f"Please transfer `{r24_str}` back to this wallet to keep "
+                        f"the campaign self\\-funding\\."
+                    )
+                await notifier.send_raw(
+                    f"{mention}\n{head}\n{_SEP}\n{body}\n{_SEP}\n\\[{_esc(bot_label)}\\]"
+                )
+                if daily_due:
+                    daily_sent_for = today
+                if urgent_due:
+                    low_bal_last = time.time()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("live ops loop error: %s", exc)
+        try:
+            await asyncio.wait_for(stop_evt.wait(),
+                                   timeout=1800.0 if low_balance else 3600.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _daily_report_loop(
     notifier: Optional[TelegramNotifier],
     session: "VolumeFarmerSession",
@@ -3203,6 +3399,11 @@ async def main_async(args: argparse.Namespace) -> int:
             okx_cap = _exchange_lev if is_live_or_demo else None
             okx_cap_line = f"  ·  OKX set `{okx_cap}×`" if okx_cap else ""
             vol_target = cfg.get("target", {}).get("volume_usd", 0)
+            # Real-money guard: confirm the account's ACTUAL fee tier matches
+            # the config the whole cost model is built on (live API, not yaml).
+            fee_note = ""
+            if mode_label != "PAPER" and client is not None:
+                fee_note = await _verify_fee_tier(client, symbol, cfg) + "\n"
             startup_msg = (
                 f"🚀 *vGen OKX · {_esc(mode_label)}*\n"
                 f"{_esc(symbol)} · {_esc(tf)}\n"
@@ -3215,6 +3416,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 f"{_SEP}\n"
                 f"Maker  `{maker_bps:.0f}bps`  ·  rebate `{rebate_pct:.0f}%`\n"
                 f"Taker  `{taker_bps:.0f}bps`\n"
+                f"{fee_note}"
                 f"{_SEP}\n"
                 f"Target  `${vol_target:,.0f}` volume\n"
                 f"Duration  `{_esc(dur)}`  ·  poll `{args.poll_seconds}s`\n"
@@ -3283,8 +3485,12 @@ async def main_async(args: argparse.Namespace) -> int:
             notifier, session, cfg, mode_label,
             args.label or "okx-paper", stop_evt,
         ))
+        ops_task = asyncio.create_task(_live_ops_loop(
+            notifier, client, symbol, cfg, mode_label,
+            args.label or "okx-paper", stop_evt,
+        ))
         stop_waiter = asyncio.create_task(stop_evt.wait())
-        all_tasks = (poll_task, cmd_task, daily_task, stop_waiter)
+        all_tasks = (poll_task, cmd_task, daily_task, ops_task, stop_waiter)
         crash_exc: Optional[BaseException] = None
         try:
             done, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
