@@ -840,6 +840,11 @@ class LiveVolumeExecutorOKX:
             tp_bps=tp_bps, sl_bps=sl_bps, placed_at=time.time(),
         )
         trade.extras["signal_px"] = entry_req
+        # Carried for the Telegram entry card: margin/leverage actually used.
+        lev_used = float(payload.get("leverage") or 0.0)
+        trade.extras["leverage"] = lev_used
+        trade.extras["margin_usd"] = (notional / lev_used) if lev_used > 0 else 0.0
+        trade.extras["margin_fraction"] = float(payload.get("margin_fraction") or 0.0)
         self._open_trade = trade
         self._attempt_count += 1
 

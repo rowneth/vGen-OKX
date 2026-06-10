@@ -1209,6 +1209,15 @@ def _make_entry_filled_callback(
         sl_bps = float(trade.sl_bps)
         sz = trade.sz_contracts
         ordid = str(trade.ord_id or "—")
+        extras = trade.extras or {}
+        lev = float(extras.get("leverage") or 0.0)
+        margin_usd = float(extras.get("margin_usd") or 0.0)
+        if margin_usd <= 0 and lev > 0:
+            margin_usd = notional / lev
+        margin_line = (
+            f"Margin  `${margin_usd:,.2f}`  ·  Lev `{lev:.0f}×`\n"
+            if lev > 0 else ""
+        )
         text = (
             f"{arrow} *{_esc(side.upper())} FILLED · {_esc(mode_label)}*\n"
             f"{_esc(symbol)} · {_esc(tf)}\n"
@@ -1217,6 +1226,7 @@ def _make_entry_filled_callback(
             f"TP    →  `{tp:,.2f}`   `+{tp_bps:.1f}bps`\n"
             f"SL    →  `{sl:,.2f}`   `-{sl_bps:.1f}bps`\n"
             f"{_SEP}\n"
+            f"{margin_line}"
             f"Size    `${notional:,.2f}`  ·  `{sz:g}` ct\n"
             f"Open fee  `${open_fee:.4f}`\n"
             f"{_SEP}\n"
