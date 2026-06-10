@@ -188,9 +188,14 @@ class OKXClient:
         the whole campaign cost model rests on those two numbers, so they
         must never be trusted from a yaml comment alone.
         """
+        # /account/trade-fee rejects instId for SWAP (HTTP 400 code 50016
+        # "instId and instType don't match" — instId is SPOT/MARGIN-only
+        # there; verified against the real API). Derivatives are queried by
+        # underlying: BTC-USDT-SWAP -> uly BTC-USDT.
+        uly = to_okx_inst_id(symbol).replace("-SWAP", "")
         resp = await self._request(
             "GET", "/api/v5/account/trade-fee",
-            params={"instType": inst_type, "instId": to_okx_inst_id(symbol)},
+            params={"instType": inst_type, "uly": uly},
             auth=True,
         )
         data = resp.get("data") or []

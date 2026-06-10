@@ -343,6 +343,9 @@ class LiveVolumeExecutorOKX:
                 self.demo_realism.sl_slip_bps, self.demo_realism.tp_fill_prob,
                 self.demo_realism.seed,
             )
+        # Restore persisted breaker state (hard halt / anchors survive restarts).
+        if not self.dry_run:
+            self._load_breaker_state()
         self._initialized = True
 
     # ------------------------------------------------------------------
@@ -602,6 +605,7 @@ class LiveVolumeExecutorOKX:
                 n = self._consec_real_losses
                 self._entry_paused_until = time.time() + self.breaker_cooldown_s
                 self._consec_real_losses = 0
+                self._save_breaker_state()
                 await self._fire_breaker(
                     "loss_streak",
                     f"{n} consecutive REAL losing closes — pausing entries "
@@ -640,8 +644,65 @@ class LiveVolumeExecutorOKX:
                         f"(${eq:.2f} from ${self._peak_real_eq:.2f}) — HARD HALT, manual restart required",
                         equity=eq, drawdown_pct=dd,
                     )
+            self._save_breaker_state()
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("breaker update failed (non-fatal): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Breaker persistence. All breaker state used to be memory-only, so any
+    # restart — including the keep-alive supervisor's automatic one — wiped
+    # the 40% hard halt ("manual restart required" was untrue), re-baselined
+    # the peak at the depleted wallet (each crash granted a fresh -40%), and
+    # reset the daily anchor mid-day. Now it survives restarts.
+    # ------------------------------------------------------------------
+    def _breaker_state_file(self) -> pathlib.Path:
+        return self.log_dir / "breaker_state.json"
+
+    def _save_breaker_state(self) -> None:
+        try:
+            state = {
+                "peak_real_eq": self._peak_real_eq,
+                "daily_anchor_eq": self._daily_anchor_eq,
+                "daily_anchor_date": self._daily_anchor_date,
+                "daily_halt_date": self._daily_halt_date,
+                "hard_halted": self._hard_halted,
+                "halt_reason": self._halt_reason,
+                "entry_paused_until": self._entry_paused_until,
+                "consec_real_losses": self._consec_real_losses,
+            }
+            p = self._breaker_state_file()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=1))
+            os.replace(tmp, p)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("breaker state save failed: %s", exc)
+
+    def _load_breaker_state(self) -> None:
+        p = self._breaker_state_file()
+        if not p.exists():
+            return
+        try:
+            s = json.loads(p.read_text())
+            self._peak_real_eq = float(s.get("peak_real_eq", 0.0))
+            self._daily_anchor_eq = float(s.get("daily_anchor_eq", 0.0))
+            self._daily_anchor_date = str(s.get("daily_anchor_date", ""))
+            self._daily_halt_date = str(s.get("daily_halt_date", ""))
+            self._hard_halted = bool(s.get("hard_halted", False))
+            self._halt_reason = str(s.get("halt_reason", ""))
+            self._entry_paused_until = float(s.get("entry_paused_until", 0.0))
+            self._consec_real_losses = int(s.get("consec_real_losses", 0))
+            if self._hard_halted:
+                LOGGER.error(
+                    "BREAKER STATE RESTORED: HARD HALT is ACTIVE (%s). Entries stay "
+                    "blocked — delete %s after funding/reviewing to resume.",
+                    self._halt_reason, p,
+                )
+            else:
+                LOGGER.info("breaker state restored: peak=$%.4f anchor=$%.4f (%s)",
+                            self._peak_real_eq, self._daily_anchor_eq, self._daily_anchor_date)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("breaker state load failed (fresh anchors): %s", exc)
 
     # ------------------------------------------------------------------
     # Hook called by the session's event_callback.
@@ -1021,10 +1082,31 @@ class LiveVolumeExecutorOKX:
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("unswept-entry recovery poll failed: %s", exc)
         LOGGER.error(
-            "unswept entry NOT resolved after recovery window (cid=%s ordId=%s) — "
-            "gate stays held; operator attention needed (/orders, /cancel)",
+            "unswept entry NOT resolved after first recovery window (cid=%s ordId=%s) — "
+            "gate stays held; continuing to poll every 60s (/orders, /cancel to inspect)",
             trade.cl_ord_id, trade.ord_id,
         )
+        # NEVER give up while the gate is held: a silent return left the bot
+        # permanently idle. Slow indefinite polling, same terminal handling.
+        while self._open_trade is trade:
+            await asyncio.sleep(60.0)
+            try:
+                r = await self.client.get_order(
+                    self.symbol, ord_id=trade.ord_id, client_oid=trade.cl_ord_id,
+                )
+                od = (r.get("data") or [{}])[0]
+                if self._adopt_order_fill(trade, od, note="unswept-recovery-slow"):
+                    self._trade_count += 1
+                    self._spawn(self._fire_entry_filled(trade), name="entry_card")
+                    await self._watch_open_position(trade)
+                    return
+                if str(od.get("state", "")) in {"canceled", "mmp_canceled"}:
+                    if self._open_trade is trade:
+                        self._open_trade = None
+                    return
+                await self.client.cancel_order(self.symbol, ord_id=trade.ord_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("unswept-entry slow recovery poll failed: %s", exc)
 
     async def _place_entry_with_repeg(
         self, *, trade: LiveTradeOKX, ok_side: str, pos_side: Optional[str],
@@ -1474,6 +1556,27 @@ class LiveVolumeExecutorOKX:
             await self._safe_callback(
                 self.on_close_confirmed or self.on_real_fill, trade, "on_close_confirmed",
             )
+            return
+
+        # ---- Flat state UNKNOWN (every poll errored — API/network outage,
+        # which correlates with exactly the volatile moments a time-stop
+        # fires). Treating this like "flat" used to RELEASE the entry gate on
+        # a possibly-open position whose protective algos were already
+        # cancelled — an unmanaged naked position while the bot kept entering.
+        # Treat unknown as still-open: hold the gate, arm the recovery watcher
+        # (its first action is a positions poll, so a false alarm self-clears
+        # in ~10s), and say "unknown", not "flat", on the card.
+        if flat is None:
+            trade.extras["still_open"] = True
+            trade.closed = False
+            trade.close_reason = "flat_state_unknown"
+            LOGGER.error(
+                "CLOSE UNVERIFIED — flat state UNKNOWN (API outage) cid=%s; "
+                "holding entries, recovery watcher armed", trade.cl_ord_id,
+            )
+            self._spawn(self._recover_stuck_position(trade), name="recover_stuck")
+            self._log_trade(trade)
+            await self._safe_callback(self.on_close_unverified, trade, "on_close_unverified")
             return
 
         # ---- Close not verified flat. Before declaring it stuck, FORCE it.

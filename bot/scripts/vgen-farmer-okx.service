@@ -16,7 +16,10 @@ ExecStart=/root/vGen-OKX/bot/.venv/bin/python3 /root/vGen-OKX/bot/scripts/run_vo
     --label okx-v3 \
     --demo \
     --duration-days 365
-Restart=always
+# on-failure, NOT always: a clean exit (volume target reached, operator stop)
+# must STAY down — Restart=always looped startup/stop cards forever after the
+# session halted on target (halted=true persists in the state file).
+Restart=on-failure
 RestartSec=15
 StandardOutput=append:/root/vGen-OKX/bot/logs/farmer_okx.log
 StandardError=append:/root/vGen-OKX/bot/logs/farmer_okx.log

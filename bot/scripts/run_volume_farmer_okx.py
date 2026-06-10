@@ -319,6 +319,38 @@ async def _poll_loop(
             LOGGER.info("duration elapsed; stopping")
             break
         if session.halted:
+            # BOUNTY GUARD: the session halts on SIM-counted volume, which
+            # overcounts reality (abandoned entries, breaker-blocked entries
+            # still book sim volume). Stopping on sim 5.1M with real exchange
+            # volume short of 5M would silently forfeit the reward — verify
+            # against OKX's own numbers before honoring a volume-target halt.
+            if (mode_label != "PAPER"
+                    and str(session.halt_reason).startswith("volume_target_reached")):
+                tgt = float((cfg or {}).get("target", {}).get("volume_usd", 0) or 0)
+                stats = None
+                try:
+                    stats = await _fetch_okx_trade_stats(client, symbol)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("real-volume check failed: %s", exc)
+                real_vol = float(stats.get("volume", 0.0)) if stats else None
+                if tgt > 0 and real_vol is not None and real_vol < tgt:
+                    session.halted = False
+                    session.halt_reason = ""
+                    LOGGER.warning(
+                        "sim volume target hit but REAL volume $%.0f < target $%.0f — "
+                        "continuing until the exchange counter agrees", real_vol, tgt,
+                    )
+                    if notifier and notifier.enabled:
+                        _e_ = TelegramNotifier.escape
+                        _bg(notifier.send_raw(
+                            f"⚠️ *Target check · {_e_(mode_label)}*\n{_SEP}\n"
+                            f"Sim counter hit the target, but OKX real volume is "
+                            f"`${real_vol:,.0f}` of `${tgt:,.0f}`\\. Continuing until "
+                            f"the EXCHANGE counter crosses the line — the reward pays "
+                            f"on their number, not ours\\.\n"
+                            f"{_SEP}\n\\[{_e_(bot_label)}\\]"
+                        ))
+                    continue
             LOGGER.warning("session halted: %s", session.halt_reason)
             break
 
@@ -862,6 +894,9 @@ async def _fetch_real_account(client: Any, symbol: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "equity": None, "pos_side": None, "pos_sz": None, "upl": None,
         "avg_px": None, "mark_px": None, "upl_ratio": None,
+        # pos_ok=False means the positions call FAILED: renderers must show
+        # "unavailable", never "flat" (which fabricates zero-exposure).
+        "pos_ok": False,
     }
     # Balance + positions concurrently — these two sequential awaits sat on
     # the critical path of every card and command.
@@ -887,6 +922,7 @@ async def _fetch_real_account(client: Any, symbol: str) -> Dict[str, Any]:
         if isinstance(pos_res, Exception):
             raise pos_res
         pos = pos_res
+        out["pos_ok"] = True
         for p in (pos.get("data") or []):
             sz = float(p.get("pos") or 0.0)
             if sz != 0.0:
@@ -912,7 +948,11 @@ def _real_acct_lines(acct: Dict[str, Any]) -> list:
         lines.append(f"Wallet  `${acct['equity']:,.4f}`")
     else:
         lines.append("Wallet  `unavailable`")
-    if acct.get("pos_side") and acct.get("pos_sz"):
+    if not acct.get("pos_ok", True):
+        # The positions call FAILED. Saying "flat" here fabricated a fact —
+        # hiding live leveraged exposure exactly when the operator must act.
+        lines.append("Open pos  `unavailable` \\(positions API error\\)")
+    elif acct.get("pos_side") and acct.get("pos_sz"):
         upl = acct.get("upl") or 0.0
         lines.append(
             f"Open pos  `{acct['pos_side']} {acct['pos_sz']:g} ct`  uPnL `{upl:+.4f}`"
@@ -927,7 +967,9 @@ def _real_acct_block(acct: Optional[Dict[str, Any]]) -> str:
     if not acct or acct.get("equity") is None:
         return ""
     block = f"Wallet  `${acct['equity']:,.4f}`\n"
-    if acct.get("pos_side") and acct.get("pos_sz"):
+    if not acct.get("pos_ok", True):
+        block += "Open pos   `unavailable` \\(positions API error\\)\n"
+    elif acct.get("pos_side") and acct.get("pos_sz"):
         upl = acct.get("upl") or 0.0
         block += f"Open pos   `{acct['pos_side']} {acct['pos_sz']:g} ct`  uPnL `{upl:+.4f}`\n"
     else:
@@ -1370,7 +1412,10 @@ def _journey_lines(session: Any, cfg: Optional[Dict[str, Any]]) -> list:
     per_1m = float(summ.get("net_cost_per_1m") or 0.0)
     proj_fees = per_1m * tgt / 1_000_000.0
     pace = summ.get("pace") or {}
-    lines = [_SEP, f"📍 *Journey*  `{pct:.1f}%`  ·  `${vol:,.0f}` / `${tgt:,.0f}`"]
+    # The block is built from the SESSION ledger (sim view). In live mode the
+    # real exchange-counted volume lives on /fees; this is pacing guidance and
+    # is labeled as such so it can never be read as an account fact.
+    lines = [_SEP, f"📍 *Journey \\(sim est\\)*  `{pct:.1f}%`  ·  `${vol:,.0f}` / `${tgt:,.0f}`"]
     req = pace.get("required_per_day")
     ach = pace.get("achieved_per_day")
     days_left = pace.get("days_left")
@@ -1499,12 +1544,27 @@ def _build_status_text(
     start_time: datetime,
     real_acct: Optional[Dict[str, Any]] = None,
     real_stats: Optional[Dict[str, Any]] = None,
+    live_executor: Optional[Any] = None,
 ) -> str:
     _esc = TelegramNotifier.escape
     uptime = _fmt_uptime((datetime.now(tz=timezone.utc) - start_time).total_seconds())
     sym = cfg["exchange"]["symbol"]
     tf = cfg["exchange"]["timeframe"]
     status_str = "Halted" if session.halted else "Running"
+    # The EXECUTOR can be hard-halted / daily-halted / cooling down / holding
+    # the gate while the session looks fine — "✅ Running" during a 40% MDD
+    # hard halt hid an idle bot indefinitely. Surface the real gate state.
+    exec_note = ""
+    if live_executor is not None:
+        try:
+            _br = live_executor._entry_blocked_reason()  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            _br = None
+        _ot = getattr(live_executor, "_open_trade", None)
+        if _br:
+            exec_note = f"\n⛔ entries blocked: `{_esc(str(_br))}`"
+        elif _ot is not None and (getattr(_ot, "extras", {}) or {}).get("still_open"):
+            exec_note = "\n⏸ gate held: `close unverified — recovery running`"
     _j = _journey_lines(session, cfg)
     journey_block = ("\n".join(_j) + "\n") if _j else ""
     is_live = mode_label != "PAPER"
@@ -1542,7 +1602,7 @@ def _build_status_text(
             f"W / L     `{rs['wins']}` / `{rs['losses']}`\n"
             f"{exit_line}"
             f"{_SEP}\n"
-            f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`\n"
+            f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`{exec_note}\n"
             f"{journey_block}"
             f"{_SEP}\n"
             f"\\[{_esc(bot_label)}\\]"
@@ -1573,7 +1633,7 @@ def _build_status_text(
         f"W / L     `{session.wins}` / `{session.losses}`\n"
         f"Position  `{_esc(pos_str)}`\n"
         f"{_SEP}\n"
-        f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`\n"
+        f"{'🛑' if session.halted else '✅'} `{_esc(status_str)}`{exec_note}\n"
         f"{journey_block}"
         f"{_SEP}\n"
         f"{_real_acct_block(real_acct)}"
@@ -1597,6 +1657,14 @@ async def _build_position_text(
     # LIVE/DEMO: show the REAL OKX position, not the paper simulation.
     if is_live:
         acct = real_acct if real_acct is not None else await _fetch_real_account(client, symbol)
+        if not acct.get("pos_ok", True):
+            return (
+                f"📈 *Position · {_esc(mode_label)}*\n"
+                f"{_SEP}\n"
+                f"Position state `unavailable` \\(positions API error\\) — check OKX\n"
+                f"{_SEP}\n"
+                f"\\[{_esc(bot_label)}\\]"
+            )
         if not (acct.get("pos_side") and acct.get("pos_sz")):
             return (
                 f"📈 *Position · {_esc(mode_label)}*\n"
@@ -2470,6 +2538,7 @@ async def _dispatch_cmd(
     if data == "cmd_status":
         return _build_status_text(
             session, cfg, mode_label, bot_label, start_time, real_acct, real_stats,
+            live_executor=live_executor,
         )
     if data == "cmd_position":
         return await _build_position_text(
@@ -2793,6 +2862,7 @@ async def _fees_last_24h(client: Any, symbol: str) -> Optional[float]:
     total = 0.0
     after = ""
     ok = False
+    reached_cutoff = False
     try:
         for _ in range(10):                      # ≤1,000 orders, newest first
             params = {"instType": "SWAP", "instId": inst, "limit": "100"}
@@ -2806,26 +2876,49 @@ async def _fees_last_24h(client: Any, symbol: str) -> Optional[float]:
             ok = True
             data = r.get("data") or []
             if not data:
+                reached_cutoff = True
                 break
             page_older_than_cutoff = False
             for o in data:
-                if str(o.get("state", "")) != "filled":
+                # Canceled orders with partial fills carry REAL fees — the
+                # maker-exit ladder produces these every day; skipping them
+                # silently under-counted the rebate ask.
+                try:
+                    acc = float(o.get("accFillSz") or 0.0)
+                except (TypeError, ValueError):
+                    acc = 0.0
+                if str(o.get("state", "")) != "filled" and acc <= 0:
                     continue
                 ft = int(o.get("fillTime") or 0)
                 if ft and ft < cutoff_ms:
                     page_older_than_cutoff = True
                     continue
                 try:
-                    total += abs(float(o.get("fee") or 0.0))
+                    # OKX: fees paid are NEGATIVE; a positive fee is a rebate
+                    # credit and must not be counted as cost.
+                    fee = float(o.get("fee") or 0.0)
                 except (TypeError, ValueError):
                     continue
+                total += max(-fee, 0.0)
             after = data[-1].get("ordId") or ""
-            if page_older_than_cutoff or not after or len(data) < 100:
+            if page_older_than_cutoff:
+                reached_cutoff = True
+                break
+            if not after or len(data) < 100:
+                reached_cutoff = True
                 break
     except Exception as exc:  # noqa: BLE001
+        # A mid-pagination failure would return a PARTIAL sum as fact.
         LOGGER.warning("24h fee fetch failed: %s", exc)
         return None
-    return total if ok else None
+    if not ok:
+        return None
+    if not reached_cutoff:
+        # Page cap exhausted before reaching the 24h boundary: the sum is a
+        # lower bound, not a fact — report unavailable rather than undercount.
+        LOGGER.warning("24h fee window did not reach cutoff within page cap")
+        return None
+    return total
 
 
 async def _verify_fee_tier(client: Any, symbol: str, cfg: Dict[str, Any]) -> str:
@@ -2908,8 +3001,33 @@ async def _live_ops_loop(
     if "@rowneth" not in handles:
         handles.insert(0, "@rowneth")
     _esc = TelegramNotifier.escape
+    # Persisted ops state: the floor ANCHOR must survive restarts — the
+    # keep-alive supervisor restarts after crashes, and crashes correlate
+    # with drawdowns; re-anchoring at the depleted wallet ratcheted the floor
+    # down 15% per crash and muted the campaign's lifeline alert. The daily
+    # dedupe timestamp also persists so each boot doesn't re-ping the team.
+    ops_path = pathlib.Path("data") / f"ops_state_{bot_label}.json"
     anchor: Optional[float] = None
-    daily_sent_for = ""
+    daily_last_sent = 0.0
+    try:
+        if ops_path.exists():
+            _ops = json.loads(ops_path.read_text())
+            anchor = _ops.get("anchor")
+            daily_last_sent = float(_ops.get("daily_last_sent", 0.0))
+            LOGGER.info("ops state restored: anchor=%s", anchor)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("ops state load failed: %s", exc)
+
+    def _save_ops() -> None:
+        try:
+            ops_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = ops_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {"anchor": anchor, "daily_last_sent": daily_last_sent}))
+            os.replace(tmp, ops_path)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("ops state save failed: %s", exc)
+
     low_bal_last = 0.0
     while not stop_evt.is_set():
         low_balance = False
@@ -2920,15 +3038,19 @@ async def _live_ops_loop(
                 anchor = float(wallet)
                 LOGGER.info("ops: campaign wallet anchor $%.4f (floor $%.4f)",
                             anchor, anchor * floor_pct)
+                _save_ops()
+            elif wallet is not None and anchor is not None and wallet > anchor:
+                # Top-ups / growth raise the anchor (floor follows the best
+                # wallet ever seen, never ratchets down).
+                anchor = float(wallet)
+                _save_ops()
             fees24 = await _fees_last_24h(client, symbol)
             rebate24 = fees24 * rebate_pct if fees24 is not None else None
-            now = datetime.now(tz=timezone.utc)
-            today = now.strftime("%Y-%m-%d")
             low_balance = bool(
                 wallet is not None and anchor is not None
                 and wallet < anchor * floor_pct
             )
-            daily_due = (daily_sent_for != today
+            daily_due = (time.time() - daily_last_sent >= 86_400
                          and rebate24 is not None and rebate24 >= min_usd)
             urgent_due = low_balance and (time.time() - low_bal_last) > 6 * 3600
             if daily_due or urgent_due:
@@ -2962,8 +3084,11 @@ async def _live_ops_loop(
                 await notifier.send_raw(
                     f"{mention}\n{head}\n{_SEP}\n{body}\n{_SEP}\n\\[{_esc(bot_label)}\\]"
                 )
-                if daily_due:
-                    daily_sent_for = today
+                if daily_due or urgent_due:
+                    # the urgent card carries the same transfer ask — sending
+                    # both within minutes double-asked for the same rebate
+                    daily_last_sent = time.time()
+                    _save_ops()
                 if urgent_due:
                     low_bal_last = time.time()
         except Exception as exc:  # noqa: BLE001
@@ -2983,6 +3108,8 @@ async def _daily_report_loop(
     mode_label: str,
     bot_label: str,
     stop_evt: asyncio.Event,
+    client: Any = None,
+    symbol_for_report: str = "BTC_USDT",
 ) -> None:
     """Send the daily digest at ``notifications.telegram.daily_report_hour`` UTC.
 
@@ -2997,6 +3124,7 @@ async def _daily_report_loop(
         return
     hour = int(tg_cfg.get("daily_report_hour", 0)) % 24
     _esc = TelegramNotifier.escape
+    is_real = mode_label != "PAPER"
     sent_for = ""
     while not stop_evt.is_set():
         now = datetime.now(tz=timezone.utc)
@@ -3004,17 +3132,41 @@ async def _daily_report_loop(
         if now.hour == hour and sent_for != today_key:
             sent_for = today_key
             try:
-                s = session.summary()
-                pnl = float(s.get("total_pnl") or 0.0)
-                pnl_str = f"+${pnl:.4f}" if pnl >= 0 else f"-${abs(pnl):.4f}"
-                lines = [
-                    f"🗞 *Daily report · {_esc(mode_label)}*",
-                    _SEP,
-                    f"Trades  `{s['round_trips']}`  ·  WR `{s['win_rate_pct']:.1f}%`",
-                    f"Equity  `${s['equity']:.4f}`  ·  PnL `{pnl_str}`",
-                    f"Fees    `${s['fees_gross']:.4f}` gross  ·  `${s['fees_net']:.4f}` net",
-                    f"Rebate  accrued `${s['rebate_accrued']:.4f}`  ·  available `${s['rebate_available']:.4f}`",
-                ]
+                lines = [f"🗞 *Daily report · {_esc(mode_label)}*", _SEP]
+                if is_real and client is not None:
+                    # REAL numbers only: actual wallet + exchange order-history
+                    # stats + real 24h fees. The sim digest under a LIVE header
+                    # read as the real account's daily P&L — exactly the
+                    # fake-fact class this bot must never emit.
+                    acct = await _fetch_real_account(client, symbol_for_report)
+                    stats = await _fetch_okx_trade_stats(client, symbol_for_report)
+                    w = acct.get("equity")
+                    lines.append(f"Wallet  `${w:,.4f}`" if w is not None
+                                 else "Wallet  `unavailable`")
+                    if stats:
+                        net = float(stats.get("net", 0.0))
+                        n_str = f"+${net:.4f}" if net >= 0 else f"-${abs(net):.4f}"
+                        lines += [
+                            f"Real trades  `{stats.get('n', 0)}`  ·  WR `{stats.get('wr', 0.0):.1f}%`",
+                            f"Real volume  `${stats.get('volume', 0.0):,.0f}`",
+                            f"Net PnL  `{n_str}`  ·  fees `${stats.get('fees', 0.0):.4f}`",
+                        ]
+                    else:
+                        lines.append("Trade stats  `unavailable` \\(OKX history error\\)")
+                    fees24 = await _fees_last_24h(client, symbol_for_report)
+                    if fees24 is not None:
+                        reb = fees24 * float((cfg.get("fees", {}) or {}).get("rebate_pct", 0.40))
+                        lines.append(f"Fees 24h  `${fees24:,.4f}`  ·  rebate est `${reb:,.2f}`")
+                else:
+                    s_sum = session.summary()
+                    pnl = float(s_sum.get("total_pnl") or 0.0)
+                    pnl_str = f"+${pnl:.4f}" if pnl >= 0 else f"-${abs(pnl):.4f}"
+                    lines += [
+                        f"Trades  `{s_sum['round_trips']}`  ·  WR `{s_sum['win_rate_pct']:.1f}%`",
+                        f"Equity  `${s_sum['equity']:.4f}`  ·  PnL `{pnl_str}`",
+                        f"Fees    `${s_sum['fees_gross']:.4f}` gross  ·  `${s_sum['fees_net']:.4f}` net",
+                        f"Rebate  accrued `${s_sum['rebate_accrued']:.4f}`  ·  available `${s_sum['rebate_available']:.4f}`",
+                    ]
                 lines.extend(_journey_lines(session, cfg))
                 lines += [_SEP, f"\\[{_esc(bot_label)}\\]"]
                 await notifier.send_raw("\n".join(lines))
@@ -3378,10 +3530,16 @@ async def main_async(args: argparse.Namespace) -> int:
             # Show the REAL OKX wallet in live/demo, not the hardcoded capital_usd.
             cap = cfg["farmer"]["capital_usd"]
             cap_label = "Capital"
+            cap_str = f"${cap:,.2f}"
             if mode_label != "PAPER" and client is not None:
                 _acct = await _fetch_real_account(client, symbol)
+                cap_label = "Wallet "
                 if _acct.get("equity") is not None:
-                    cap = float(_acct["equity"]); cap_label = "Wallet "
+                    cap_str = f"${float(_acct['equity']):,.2f}"
+                else:
+                    # Never print the yaml constant as if it were the real
+                    # balance on the first card of a live run.
+                    cap_str = "unavailable"
             maker_bps = cfg["fees"]["maker"] * 1e4
             taker_bps = cfg["fees"]["taker"] * 1e4
             rebate_pct = cfg["fees"]["rebate_pct"] * 100
@@ -3408,7 +3566,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 f"🚀 *vGen OKX · {_esc(mode_label)}*\n"
                 f"{_esc(symbol)} · {_esc(tf)}\n"
                 f"{_SEP}\n"
-                f"{cap_label}    `${cap:,.2f}`\n"
+                f"{cap_label}    `{cap_str}`\n"
                 f"Lev sizing `{min_lev}-{max_lev}×` \\(dynamic\\){okx_cap_line}\n"
                 f"ATR filter `≥${atr_min:.0f}` \\(Wilder\\-14\\)\n"
                 f"TP `{atr_tp_mult}×` ATR  ·  SL `{atr_sl_mult}×` ATR\n"
@@ -3433,15 +3591,44 @@ async def main_async(args: argparse.Namespace) -> int:
                     acct = {}
                     LOGGER.debug("orphan banner real fetch failed: %s", exc)
                 if acct.get("pos_sz"):
-                    lines = ["♻️ *Resuming · open position on OKX*"]
+                    # CRITICAL SAFEGUARD: a pre-restart position may be NAKED —
+                    # if the process died inside the time-stop window, its
+                    # protective TP/SL algos were already cancelled, and nothing
+                    # in this process watches it. Trading "around" it also lets
+                    # new net-mode entries merge with it, corrupting every
+                    # watcher. The strategy never wants to hold: flatten it for
+                    # a clean slate (~3bps), sweep leftovers, and say so.
+                    flatten_ok = False
+                    try:
+                        resp = await client.close_position_market(
+                            symbol, mgn_mode="isolated", pos_side=None, auto_cxl=True,
+                        )
+                        cdata = (resp.get("data") or [{}])[0]
+                        flatten_ok = str(cdata.get("sCode", "0")) == "0"
+                        if live_executor is not None:
+                            from execution.maker_exit import cancel_attached_algos as _caa
+                            await _caa(client, symbol)
+                        await asyncio.sleep(2.0)
+                        acct2 = await _fetch_real_account(client, symbol)
+                        flatten_ok = flatten_ok and not acct2.get("pos_sz")
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.error("orphan flatten failed: %s", exc)
+                    lines = ["♻️ *Resuming · pre\\-restart position found on OKX*"]
                     lines.extend(_real_acct_lines(acct))
                     lines.append(f"{_SEP}")
-                    lines.append(
-                        _esc_resume(
-                            "Note: the bot is not yet watching this pre-restart "
-                            "position. Manage/close it on OKX; new entries continue."
+                    if flatten_ok:
+                        lines.append(_esc_resume(
+                            "Flattened at market for a clean slate (a pre-restart "
+                            "position may have lost its protective stops). "
+                            "Fresh entries resume from the next signal."
+                        ))
+                    else:
+                        lines.append(
+                            "🚨 " + _esc_resume(
+                                "COULD NOT FLATTEN — this position may have NO "
+                                "stop attached. Close it on OKX now (/close market)."
+                            )
                         )
-                    )
                     lines.append(f"\\[{_esc_resume(_bot_lbl)}\\]")
                     await notifier.send_raw("\n".join(lines))
                 # else: flat on OKX → nothing to resume, no banner.
@@ -3484,6 +3671,7 @@ async def main_async(args: argparse.Namespace) -> int:
         daily_task = asyncio.create_task(_daily_report_loop(
             notifier, session, cfg, mode_label,
             args.label or "okx-paper", stop_evt,
+            client=client, symbol_for_report=symbol,
         ))
         ops_task = asyncio.create_task(_live_ops_loop(
             notifier, client, symbol, cfg, mode_label,

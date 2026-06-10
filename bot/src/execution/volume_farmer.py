@@ -798,6 +798,7 @@ class VolumeFarmerSession:
 					kind="milestone", time=bar_time,
 					payload={
 						"pct": m, "volume": self.total_volume_usd,
+						"volume_target": self._volume_target,
 						"equity": self.equity,
 						"fees_gross": self.total_fees_gross, "pnl": self.total_pnl,
 					},
@@ -1104,7 +1105,13 @@ class VolumeFarmerSession:
 			"saved_at": datetime.now(tz=timezone.utc).isoformat(),
 		}
 		path.parent.mkdir(parents=True, exist_ok=True)
-		path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+		# Atomic swap: a crash/power-cut mid-write must never corrupt the only
+		# copy of campaign volume/equity/pace state (load_state would throw and
+		# the runner would silently "start fresh").
+		tmp = path.with_suffix(path.suffix + ".tmp")
+		tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+		import os as _os
+		_os.replace(tmp, path)
 
 	def load_state(self, path: pathlib.Path) -> None:
 		if not path.exists():
