@@ -56,11 +56,17 @@ farmer:
   working_capital_usd: 1500.0      # live sizing base cap: min(wallet, this)
   leverage: 0                      # 0 = dynamic
 
-  margin_fraction_per_trade: 0.04  # base; the pace controller scales it
+  # Leverage is NOT a risk/return knob here — risk = notional × move, and
+  # notional = base × margin_fraction × leverage. 15× with a doubled margin
+  # fraction gives the SAME $1,800/leg as the old 30×/0.04, but pushes
+  # isolated-margin liquidation from ~2.8% to ~6.2% away — permanently beyond
+  # the 6×ATR disaster stop (which can reach ~210bps in normal vol, worse in
+  # spikes). Locked margin rises $60 → $120/trade: irrelevant at one position.
+  margin_fraction_per_trade: 0.08  # base; the pace controller scales it
   sizing:
-    dynamic_leverage: true
+    dynamic_leverage: true         # formula always exceeds the cap → cap binds
     risk_per_trade_pct: 0.025
-    max_leverage: 30               # liq ~293bps vs ~70bps SL: 4x headroom
+    max_leverage: 15               # liq ~620bps vs ≤210bps SL: 3x headroom
     min_leverage: 5
 
   # Campaign pace controller: margin_fraction is scaled by
@@ -69,8 +75,8 @@ farmer:
   pace:
     enabled: true
     campaign_days: 30
-    min_margin_fraction: 0.02
-    max_margin_fraction: 0.08
+    min_margin_fraction: 0.04
+    max_margin_fraction: 0.16
     warmup_trips: 10
 
   # Fallback fixed TP/SL (used when atr.relative = false)
@@ -150,8 +156,15 @@ risk:
   # real capital protection is the executor's live_breaker_* below.
   daily_loss_limit_pct: 0.50
   max_drawdown_pct: 0.95
-  live_breaker_daily_loss_pct: 0.05    # -5% of day's real wallet -> pause entries
-  live_breaker_max_drawdown_pct: 0.10  # -10% from peak -> hard halt
+  # Breakers retuned to the v3 burn rate (they were sized for the old slow
+  # bot). The campaign's PLANNED spend is ~$750 of net fees over 5M volume —
+  # ~$130/day at full throughput. On a $2.5-3k wallet the old 5%-daily /
+  # 10%-drawdown limits flagged that routine, budgeted bleed as a disaster
+  # (daily pauses, then a mid-campaign hard halt around day 2-3). The new
+  # values ignore the plan and still catch genuine anomalies: 10%/day ≈ 2x
+  # the worst planned day; 40% from peak ≈ a real catastrophe, not budget.
+  live_breaker_daily_loss_pct: 0.10    # -10% of day's real wallet -> pause entries
+  live_breaker_max_drawdown_pct: 0.40  # -40% from peak -> hard halt
   consecutive_losses_limit: 3
   consecutive_losses_cooldown_bars: 12   # 12 x 5m = 1h
   # ONLY these reasons advance the streak (session AND executor breaker).
