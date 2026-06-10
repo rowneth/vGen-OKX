@@ -658,8 +658,15 @@ class LiveVolumeExecutorOKX:
             LOGGER.warning("max_live_trades=%d reached; ignoring entry",
                            self.max_live_trades)
             return
-        if self._entry_pending or (self._open_trade is not None and not self._open_trade.closed):
-            LOGGER.warning("ignoring entry — prior live trade still open/pending: %s",
+        if self._entry_pending or self._open_trade is not None:
+            # Gate on ANY prior trade, including closed-but-not-finalized.
+            # The old `not closed` carve-out reopened the gate the instant a
+            # close was priced — but the prior trade's _confirm_flat was still
+            # polling, and with same-bar re-entry a NEW position could open
+            # inside that window, be read as "old position still open", and
+            # get force-market-closed by the old trade's finalizer. The gate
+            # now stays shut the few seconds until finalize releases it.
+            LOGGER.warning("ignoring entry — prior live trade still open/finalizing: %s",
                            self._open_trade.cl_ord_id if self._open_trade else "<claiming>")
             return
         # Claim the single-position gate SYNCHRONOUSLY — _handle_entry only
@@ -871,9 +878,18 @@ class LiveVolumeExecutorOKX:
                 tp_px_r=tp_px_r, sl_px_r=sl_px_r,
             )
             if not ok:
+                if trade.extras.get("sweep_failed"):
+                    # The cancel could not be CONFIRMED: a full-size bracketed
+                    # order may still rest on the book. Hold the gate and hand
+                    # off to the recovery watcher — releasing here would let a
+                    # second position stack on top of a late fill.
+                    await self._fire_entry_abandoned(trade, "sweep_failed_recovering")
+                    self._log_trade(trade)
+                    self._spawn(self._recover_unswept_entry(trade), name="recover_unswept")
+                    return
                 # entry abandoned (re-pegs exhausted) — no position exists, so
-                # no entry card is sent (silent no-fill); log + release the gate.
-                await self._fire_entry_abandoned(trade, "repeg_exhausted")
+                # the gate is released; the next signal is the next chance.
+                await self._fire_entry_abandoned(trade, trade.cancel_reason or "repeg_exhausted")
                 self._log_trade(trade)
                 self._open_trade = None
                 return
@@ -928,6 +944,83 @@ class LiveVolumeExecutorOKX:
         # Position is open — start the position + time-stop watch.
         await self._watch_open_position(trade)
 
+    def _adopt_order_fill(self, trade: LiveTradeOKX, od: Dict[str, Any], note: str = "") -> bool:
+        """Adopt an order-state read into ``trade`` as the live entry fill.
+
+        Handles BOTH a full fill (state=='filled') and a TERMINAL PARTIAL —
+        canceled with accFillSz>0. The partial contracts are a REAL position
+        on OKX (with the attached TP/SL covering the filled part); treating
+        them as no-fill used to either abandon the entry with an unmanaged
+        position left behind, or re-place a FULL-size order on top (up to 2x
+        intended). Mirrors the same fix this commit applied in maker_exit's
+        taker fallback. On partial adoption the trade is resized to what
+        actually filled so every downstream exit/PnL/volume figure is honest.
+        """
+        state = str(od.get("state", ""))
+        try:
+            acc = float(od.get("accFillSz") or 0.0)
+        except (TypeError, ValueError):
+            acc = 0.0
+        full = state == "filled"
+        partial_terminal = state in {"canceled", "mmp_canceled"} and acc > 0
+        if not (full or partial_terminal):
+            return False
+        if partial_terminal:
+            ratio = (acc / trade.sz_contracts) if trade.sz_contracts > 0 else 1.0
+            trade.extras["partial_entry"] = True
+            trade.extras["requested_sz"] = trade.sz_contracts
+            trade.sz_contracts = acc
+            trade.notional_usd *= ratio
+            note = (note + " partial-adopt").strip()
+        trade.filled = True
+        _raw = float(od.get("avgPx") or trade.entry_px_req)
+        trade.extras["demo_raw_fill_px"] = _raw
+        trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
+        trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
+        trade.real_open_fee = abs(float(od.get("fee") or 0.0))
+        LOGGER.info(
+            "FILL  cid=%s  px=%.2f  sz=%s  fee=%.6f%s",
+            trade.cl_ord_id, trade.fill_px, trade.sz_contracts,
+            trade.real_open_fee, f" ({note})" if note else "",
+        )
+        return True
+
+    async def _recover_unswept_entry(self, trade: LiveTradeOKX) -> None:
+        """Resolve an entry order whose cancel could not be confirmed.
+
+        The order may still be resting (and could fill any moment), may have
+        filled already, or may have actually been canceled. Poll until a
+        terminal state, re-attempting the cancel each round; adopt a fill and
+        run the normal position watch, or release the gate on a clean cancel.
+        The gate stays held the whole time so no second position can stack.
+        """
+        for _ in range(60):                      # ~10 min at 10s
+            await asyncio.sleep(10.0)
+            try:
+                r = await self.client.get_order(
+                    self.symbol, ord_id=trade.ord_id, client_oid=trade.cl_ord_id,
+                )
+                od = (r.get("data") or [{}])[0]
+                if self._adopt_order_fill(trade, od, note="unswept-recovery"):
+                    self._trade_count += 1
+                    self._spawn(self._fire_entry_filled(trade), name="entry_card")
+                    await self._watch_open_position(trade)
+                    return
+                if str(od.get("state", "")) in {"canceled", "mmp_canceled"}:
+                    LOGGER.info("unswept entry resolved: canceled clean (cid=%s)", trade.cl_ord_id)
+                    if self._open_trade is trade:
+                        self._open_trade = None
+                    return
+                # Still live — try the cancel again.
+                await self.client.cancel_order(self.symbol, ord_id=trade.ord_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("unswept-entry recovery poll failed: %s", exc)
+        LOGGER.error(
+            "unswept entry NOT resolved after recovery window (cid=%s ordId=%s) — "
+            "gate stays held; operator attention needed (/orders, /cancel)",
+            trade.cl_ord_id, trade.ord_id,
+        )
+
     async def _place_entry_with_repeg(
         self, *, trade: LiveTradeOKX, ok_side: str, pos_side: Optional[str],
         contracts: float, sz_payload: str, tp_px_r: float, sl_px_r: float,
@@ -955,34 +1048,68 @@ class LiveVolumeExecutorOKX:
         last_px = 0.0
 
         def _capture_fill(od: Dict[str, Any], note: str = "") -> bool:
-            """Adopt a filled order-state read into the trade. True if filled."""
-            if str(od.get("state", "")) != "filled":
-                return False
-            trade.filled = True
-            _raw = float(od.get("avgPx") or trade.entry_px_req)
-            trade.extras["demo_raw_fill_px"] = _raw
-            trade.fill_px = self._apply_demo_entry_slip(trade.side, _raw) if self._demo_on() else _raw
-            trade.fill_ts = int(od.get("fillTime") or int(time.time() * 1000))
-            trade.real_open_fee = abs(float(od.get("fee") or 0.0))
-            self._last_entry_repegs = repegs
-            LOGGER.info(
-                "FILL  cid=%s  px=%.2f  fee=%.6f  repegs=%d%s",
-                trade.cl_ord_id, trade.fill_px, trade.real_open_fee, repegs,
-                f" ({note})" if note else "",
-            )
-            return True
+            """Adopt a fill (full OR terminal partial) into the trade."""
+            if self._adopt_order_fill(trade, od, note=note):
+                self._last_entry_repegs = repegs
+                return True
+            return False
 
         async def _sweep_resting() -> bool:
             """Cancel the resting peg; True if it actually filled in the race
             window. MUST run on every exit path — an order left resting after
-            an 'abandoned' entry would fill later as an unmanaged position."""
+            an 'abandoned' entry would fill later as an unmanaged position.
+
+            A cancel that cannot be CONFIRMED (POSTs are not retried at the
+            client layer, and a 429/timeout here is exactly the transient the
+            rest of this commit hardens against) must NOT clear ``resting`` —
+            doing so let the loop place a second full-size order, or abandon
+            the entry with a live bracketed order still on the book. On
+            persistent failure we set extras['sweep_failed'] and the caller
+            holds the gate + hands off to _recover_unswept_entry.
+            """
             nonlocal resting
             if not resting or not trade.ord_id:
                 return False
-            try:
-                await self.client.cancel_order(self.symbol, ord_id=trade.ord_id)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.debug("entry_repeg: cancel failed: %s", exc)
+            confirmed_off_book = False
+            for attempt in range(4):
+                try:
+                    resp = await self.client.cancel_order(self.symbol, ord_id=trade.ord_id)
+                    cdata = (resp.get("data") or [{}])[0]
+                    cscode = str(cdata.get("sCode", "0"))
+                    # 0 = cancel accepted; 51400/51401/51402/51410 = already
+                    # canceled / completed — either way nothing rests anymore.
+                    if cscode in {"0", "51400", "51401", "51402", "51410"}:
+                        confirmed_off_book = True
+                        break
+                    LOGGER.warning("entry_repeg: cancel rejected sCode=%s (try %d/4)",
+                                   cscode, attempt + 1)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("entry_repeg: cancel failed (try %d/4): %s",
+                                   attempt + 1, exc)
+                await asyncio.sleep(0.4 * (attempt + 1))
+                # Between attempts the order may have reached a terminal state
+                # on its own (filled, or our earlier cancel actually landed).
+                try:
+                    r = await self.client.get_order(
+                        self.symbol, ord_id=trade.ord_id, client_oid=trade.cl_ord_id,
+                    )
+                    od = (r.get("data") or [{}])[0]
+                    if _capture_fill(od, "race-fill"):
+                        resting = False
+                        return True
+                    if str(od.get("state", "")) in {"canceled", "mmp_canceled"}:
+                        confirmed_off_book = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+            if not confirmed_off_book:
+                trade.extras["sweep_failed"] = True
+                LOGGER.error(
+                    "entry_repeg: SWEEP FAILED — order %s may still rest on the "
+                    "book; holding the entry gate (recovery watcher takes over)",
+                    trade.ord_id,
+                )
+                return False
             resting = False
             try:
                 r = await self.client.get_order(
@@ -1156,6 +1283,14 @@ class LiveVolumeExecutorOKX:
         # book could fill later as a completely unmanaged position.
         if await _sweep_resting():
             return True
+        if trade.extras.get("sweep_failed"):
+            # The maker order may STILL be resting — the taker fallback below
+            # would market-fill a second full-size position on top of it.
+            # Bail; the caller hands off to the unswept-entry recovery.
+            trade.canceled = True
+            trade.cancel_reason = "sweep_failed"
+            self._last_entry_repegs = repegs
+            return False
 
         # All pegs exhausted. Optional taker fallback (off by default — we
         # prefer to skip a signal rather than pay taker on entry).
@@ -1608,6 +1743,11 @@ class LiveVolumeExecutorOKX:
                 result.fallback_reason,
             )
         else:
+            # Nothing filled: clear the pre-stamped reason so the eventual
+            # real exit (native TP/SL filling later, force-close, manual) can
+            # label itself honestly instead of inheriting "time_stop".
+            if trade.close_reason == reason and not trade.closed:
+                trade.close_reason = ""
             LOGGER.error(
                 "maker_exit: nothing filled (cid=%s err=%s) — leaving position open",
                 trade.cl_ord_id, result.error,

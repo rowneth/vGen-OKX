@@ -1156,6 +1156,12 @@ class VolumeFarmerSession:
 		if after.empty:
 			LOGGER.info("reconcile: no bars after entry — position stays open")
 			return None
+		# Bars processed BEFORE the restart are already reflected in the
+		# persisted bars_held — the replay window overlaps them (it filters by
+		# entry_time, not by last-processed bar). Re-incrementing for those
+		# would double-count the hold and fire the time-stop prematurely.
+		already_held = max(int(pos.bars_held), 0)
+		seen = 0
 		for _, bar in after.iterrows():
 			if not bar.get("closed", True):
 				continue
@@ -1163,7 +1169,9 @@ class VolumeFarmerSession:
 			lo = float(bar["low"])
 			cl = float(bar["close"])
 			bar_time = bar["open_time"]
-			pos.bars_held += 1
+			seen += 1
+			if seen > already_held:
+				pos.bars_held += 1
 			tp_hit = (pos.side == "long" and hi >= pos.tp) or (pos.side == "short" and lo <= pos.tp)
 			sl_hit = (pos.side == "long" and lo <= pos.sl) or (pos.side == "short" and hi >= pos.sl)
 			# Same rules as the live bar loop: worst-case SL when both levels

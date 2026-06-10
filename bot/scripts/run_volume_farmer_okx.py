@@ -2612,7 +2612,10 @@ async def _command_loop(
     offset = 0
     try:
         discarded = 0
-        while True:
+        # Bounded: each iteration returns up to 100 updates, so 30 rounds
+        # clears any realistic 24h backlog; the bound stops a pathological
+        # spammer (or a buggy peer) from pinning startup in this loop.
+        for _ in range(30):
             stale = await notifier.get_updates(offset=offset, timeout=0)
             if not stale:
                 break
