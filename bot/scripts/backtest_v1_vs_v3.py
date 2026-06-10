@@ -109,10 +109,14 @@ def simulate(df: pd.DataFrame, *, name: str,
              alternate: bool,            # strict long→short→long
              time_stop_bars: int,        # 0 = disabled (hold to TP/SL)
              tp_mode: str,               # "fixed12" (v1) | "atr_floor" (v3)
-             sl_atr_mult: float,         # 1.5 (v1) | 6.0 (v3)
+             sl_atr_mult: float | None,  # None = NO price stop (time-stop+liq only)
              min_range_bps: float,
              atr_min_usd: float,
-             same_bar_reentry: bool) -> dict:
+             same_bar_reentry: bool,
+             tp_atr_mult: float = 1.0,   # TP = clamp(max(6, mult*ATRbps), 6.8, 18)
+             lev: float = 0.0,           # >0 enables intrabar LIQUIDATION modeling
+             mmr_buffer: float = 0.005,  # maintenance margin + fee buffer
+             liq_penalty_bps: float = 2.0) -> dict:
     o = df["open"].values; h = df["high"].values
     l = df["low"].values; c = df["close"].values
     ts = df["ts"].values
@@ -139,19 +143,22 @@ def simulate(df: pd.DataFrame, *, name: str,
         if tp_mode == "fixed12":
             tp_bps = 12.0
         else:  # v3: ATR-relative, fee floor 6.8, cap 18
-            tp_bps = min(max(max(6.0, 1.0 * atr_bps), 6.8), 18.0)
-        sl_bps = max(8.0, sl_atr_mult * atr_bps)
+            tp_bps = min(max(max(6.0, tp_atr_mult * atr_bps), 6.8), 18.0)
         if alternate:
             side = "short" if last_side == "long" else "long"
         else:
             side = "long" if c[i] > o[i] else "short"
         last_side = side
         e = c[i]
-        return {
+        sig = {
             "side": side, "entry": e,
             "tp": e * (1 + tp_bps / 1e4) if side == "long" else e * (1 - tp_bps / 1e4),
-            "sl": e * (1 - sl_bps / 1e4) if side == "long" else e * (1 + sl_bps / 1e4),
+            "sl": None,
         }
+        if sl_atr_mult is not None:
+            sl_bps = max(8.0, sl_atr_mult * atr_bps)
+            sig["sl"] = e * (1 - sl_bps / 1e4) if side == "long" else e * (1 + sl_bps / 1e4)
+        return sig
 
     def close_trade(p: dict, exit_px: float, reason: str, fee_type: str) -> None:
         e = p["entry"]
@@ -187,19 +194,41 @@ def simulate(df: pd.DataFrame, *, name: str,
         closed_this_bar = False
         if pos is not None:
             pos["bars_held"] += 1
-            tp_hit = (h[i] >= pos["tp"]) if pos["side"] == "long" else (l[i] <= pos["tp"])
-            sl_hit = (l[i] <= pos["sl"]) if pos["side"] == "long" else (h[i] >= pos["sl"])
-            if sl_hit:  # worst case: SL first whenever touched
-                slip = pos["sl"] * (SL_SLIP_BPS / 1e4)
-                px = pos["sl"] - slip if pos["side"] == "long" else pos["sl"] + slip
-                close_trade(pos, px, "sl", "taker")
+            long = pos["side"] == "long"
+            tp_hit = (h[i] >= pos["tp"]) if long else (l[i] <= pos["tp"])
+            # Adverse exits: the binding level is whichever sits CLOSER to the
+            # entry — the price reaches it first on the way down/up. With high
+            # leverage the liquidation line can sit INSIDE the stop, in which
+            # case the exchange liquidates before the stop ever fires.
+            adverse: list = []
+            if pos["sl"] is not None:
+                adverse.append(("sl", pos["sl"]))
+            if lev > 0:
+                liq_dist = max(1.0 / lev - mmr_buffer, 0.001)
+                liq_px = pos["entry"] * (1 - liq_dist) if long else pos["entry"] * (1 + liq_dist)
+                adverse.append(("liq", liq_px))
+            adverse_reason = adverse_px = None
+            if adverse:
+                adverse_reason, adverse_px = (max(adverse, key=lambda x: x[1]) if long
+                                              else min(adverse, key=lambda x: x[1]))
+            adverse_hit = adverse_px is not None and (
+                (l[i] <= adverse_px) if long else (h[i] >= adverse_px))
+            if adverse_hit:  # worst case: adverse exit first whenever touched
+                if adverse_reason == "liq":
+                    # whole isolated margin is gone: price at liq line plus
+                    # penalty, taker-fee'd — strictly worse than any stop.
+                    slip = adverse_px * (liq_penalty_bps / 1e4)
+                else:
+                    slip = adverse_px * (SL_SLIP_BPS / 1e4)
+                px = adverse_px - slip if long else adverse_px + slip
+                close_trade(pos, px, adverse_reason, "taker")
                 pos = None; closed_this_bar = True
             elif tp_hit:
                 close_trade(pos, pos["tp"], "tp", "maker")
                 pos = None; closed_this_bar = True
             elif time_stop_bars > 0 and pos["bars_held"] >= time_stop_bars:
                 slip = c[i] * (SCRATCH_SLIP_BPS / 1e4)
-                px = c[i] - slip if pos["side"] == "long" else c[i] + slip
+                px = c[i] - slip if long else c[i] + slip
                 close_trade(pos, px, "time_stop", "maker")
                 pos = None; closed_this_bar = True
 
@@ -271,13 +300,71 @@ def report(rows: list, title: str) -> None:
         print(f"  bleed ${r['cost_per_1M']}/1M → ${r['cost_at_5M']} for 5M  → campaign net ${r['campaign_net']}")
 
 
+V3_BASE = dict(alternate=False, time_stop_bars=1, tp_mode="atr_floor",
+               min_range_bps=1.0, atr_min_usd=0.0, same_bar_reentry=True)
+
+
+def sweep_brackets(df: pd.DataFrame) -> dict:
+    """Phase 1: TP×ATR vs SL×ATR grid at 15× leverage. Decide by cost/1M."""
+    print("\n=== PHASE 1 — bracket sweep (lev 15×, liq modeled) ===")
+    print(f"{'tp×ATR':>7} {'sl×ATR':>7} {'cost/1M':>9} {'net bps/t':>10} "
+          f"{'t/day':>6} {'vol/day':>10} {'tp':>5} {'scratch':>8} {'sl':>4} {'liq':>4} {'worst':>8}")
+    best = None
+    for tp_m in (0.5, 1.0, 1.5, 2.0):
+        for sl_m in (1.5, 3.0, 6.0, 9.0, None):
+            r = simulate(df, name="", **V3_BASE, sl_atr_mult=sl_m,
+                         tp_atr_mult=tp_m, lev=15.0)
+            ex = r["exits"]
+            sl_lbl = f"{sl_m:g}" if sl_m is not None else "none"
+            print(f"{tp_m:>7g} {sl_lbl:>7} {r['cost_per_1M']:>9} {r['net_bps_per_trade']:>10} "
+                  f"{r['trades_per_day']:>6} {r['vol_per_day']:>10,.0f} {ex.get('tp', 0):>5} "
+                  f"{ex.get('time_stop', 0):>8} {ex.get('sl', 0):>4} {ex.get('liq', 0):>4} "
+                  f"{r['worst_trade']:>8}")
+            key = (r["cost_per_1M"], -(r["vol_per_day"]))
+            if best is None or key < best[0]:
+                best = (key, tp_m, sl_m, r)
+    _, tp_m, sl_m, r = best
+    sl_lbl = f"{sl_m:g}×ATR" if sl_m is not None else "NO price stop"
+    print(f"\nPhase-1 winner: TP {tp_m:g}×ATR, SL {sl_lbl} → ${r['cost_per_1M']}/1M")
+    return {"tp_atr_mult": tp_m, "sl_atr_mult": sl_m}
+
+
+def sweep_leverage(df: pd.DataFrame, bracket: dict) -> None:
+    """Phase 2: leverage sweep with the winning bracket. Volume/fees are
+    leverage-independent at fixed notional — what changes is the liquidation
+    line, the margin locked, and (at high lev) liq events replacing the SL."""
+    print("\n=== PHASE 2 — leverage sweep (winning bracket, liq modeled) ===")
+    print(f"{'lev':>5} {'liq dist':>9} {'margin/trade':>13} {'cost/1M':>9} "
+          f"{'sl':>4} {'liq':>4} {'worst':>9} {'campaign net':>13}")
+    for lv in (10.0, 15.0, 20.0, 30.0, 50.0, 100.0):
+        r = simulate(df, name="", **V3_BASE, **bracket, lev=lv)
+        ex = r["exits"]
+        liq_dist = max(1.0 / lv - 0.005, 0.001)
+        print(f"{lv:>5g} {liq_dist*1e4:>7.0f}bp {NOTIONAL/lv:>12,.0f} {r['cost_per_1M']:>9} "
+              f"{ex.get('sl', 0):>4} {ex.get('liq', 0):>4} {r['worst_trade']:>9} "
+              f"{r['campaign_net']:>13}")
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=60)
+    ap.add_argument("--sweep", action="store_true",
+                    help="run the bracket + leverage sweeps instead of v1-vs-v3")
     args = ap.parse_args()
     df = await fetch_bars(args.days)
     print(f"bars: {len(df)}  span: {pd.Timestamp(df['ts'].iloc[0], unit='ms')} → "
           f"{pd.Timestamp(df['ts'].iloc[-1], unit='ms')}")
+
+    if args.sweep:
+        bracket = sweep_brackets(df)
+        sweep_leverage(df, bracket)
+        # robustness: re-run the winning bracket on each half
+        half = len(df) // 2
+        for label, part in (("FIRST HALF", df.iloc[:half]), ("SECOND HALF", df.iloc[half:])):
+            r = simulate(part.reset_index(drop=True), name="", **V3_BASE, **bracket, lev=15.0)
+            print(f"{label}: cost ${r['cost_per_1M']}/1M  liq {r['exits'].get('liq', 0)}  "
+                  f"sl {r['exits'].get('sl', 0)}  vol/day ${r['vol_per_day']:,.0f}")
+        return 0
 
     full = [simulate(df, **v) for v in VARIANTS]
     report(full, f"FULL SAMPLE ({args.days} days)")

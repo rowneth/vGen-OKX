@@ -136,9 +136,15 @@ farmer:
   atr:
     period: 14
     relative: true
-    tp_mult: 1.0
-    sl_mult: 6.0                   # SL is a catastrophic floor; time-stop is
-                                   # the real risk control (maker-fill ~100%)
+    tp_mult: 1.0                   # sweep-validated 2026-06-10: 0.5–2.0×ATR all
+                                   # within $1.3/1M — the fee floor/cap dominate;
+                                   # 1.0 is at the optimum
+    sl_mult: 9.0                   # sweep: 1.5×ATR = 576 taker SL hits (+$9.5/1M);
+                                   # 6× = 3 hits; 9× = ZERO in 60d — the time-stop
+                                   # is the real exit, this is a disaster floor
+                                   # only (kept, never removed: it also protects
+                                   # against bot death mid-hold). At 15× lev the
+                                   # 9×ATR stop stays inside the ~617bp liq line.
     tp_bps_min: 6.0
     sl_bps_min: 8.0
     min_usd: 0.0                   # quiet markets are the cheapest volume
