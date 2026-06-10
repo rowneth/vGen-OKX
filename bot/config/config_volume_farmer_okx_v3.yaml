@@ -80,7 +80,11 @@ farmer:
   # is low burn rate + automatic catch-up, instead of rushing at max size.
   pace:
     enabled: true
-    campaign_days: 20
+    # 25 days is matched to the ~$471 starting wallet: required ≈ $200k/day →
+    # ~$42/day gross fee outflow, inside the 10% daily breaker ($47/day) with
+    # margin. At a 20-day pace the gross burn (~$52/day) exceeds the breaker
+    # and triggers daily pauses. Top the wallet up to $800+ and 20 is safe.
+    campaign_days: 25
     min_margin_fraction: 0.04      # $900/leg when ahead of schedule
     max_margin_fraction: 0.20      # $4,500/leg catch-up ceiling (lev stays 15x:
                                    # notional never moves the liquidation line)
