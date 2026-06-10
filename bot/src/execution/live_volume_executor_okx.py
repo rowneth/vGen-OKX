@@ -1748,14 +1748,16 @@ class LiveVolumeExecutorOKX:
                 result.fallback_reason,
             )
         else:
-            # Nothing filled: clear the pre-stamped reason so the eventual
-            # real exit (native TP/SL filling later, force-close, manual) can
-            # label itself honestly instead of inheriting "time_stop".
-            if trade.close_reason == reason and not trade.closed:
-                trade.close_reason = ""
+            # Nothing filled. The native TP/SL were already cancelled before
+            # this maker exit ran, so the ONLY remaining actor is the
+            # finalizer's force-close — which is still flattening for THIS
+            # reason (e.g. time_stop). Keep the pre-stamped reason so the
+            # forced close is labelled honestly; do NOT blank it (blanking
+            # let the proximity matcher relabel a losing time-stop as "tp").
             LOGGER.error(
-                "maker_exit: nothing filled (cid=%s err=%s) — leaving position open",
-                trade.cl_ord_id, result.error,
+                "maker_exit: nothing filled (cid=%s err=%s) — leaving position "
+                "open for force-close (reason stays %s)",
+                trade.cl_ord_id, result.error, trade.close_reason or reason,
             )
 
     async def _watch_position(self, trade: LiveTradeOKX) -> None:
@@ -1857,9 +1859,24 @@ class LiveVolumeExecutorOKX:
                     "manual", "time_stop", "trend_break",
                     "watch_timeout", "unmatched_close",
                 ):
-                    d_tp = abs(trade.close_px - trade.tp_px)
-                    d_sl = abs(trade.close_px - trade.sl_px)
-                    trade.close_reason = "tp" if d_tp < d_sl else "sl"
+                    # PnL-aware label. A real TP is a profit by construction
+                    # (the limit sits at a fee-cleared profit); an SL is a
+                    # loss. So the sign of realized PnL is the GROUND TRUTH —
+                    # proximity only breaks ties within the correct sign. This
+                    # stops a forced/drifted close from being called "TP HIT"
+                    # while it lost money (or "SL" while it won).
+                    if trade.side == "long":
+                        gross_now = (trade.close_px - trade.fill_px)
+                    else:
+                        gross_now = (trade.fill_px - trade.close_px)
+                    if gross_now > 0:
+                        trade.close_reason = "tp"
+                    elif gross_now < 0:
+                        trade.close_reason = "sl"
+                    else:
+                        d_tp = abs(trade.close_px - trade.tp_px)
+                        d_sl = abs(trade.close_px - trade.sl_px)
+                        trade.close_reason = "tp" if d_tp < d_sl else "sl"
                 break
 
             if trade.close_px != 0.0:

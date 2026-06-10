@@ -351,7 +351,13 @@ async def close_position_maker(
         for attempt in range(taker_attempts):
             if remaining <= 0:
                 break
-            cl_ord = cl_ord_prefix + "_tk_" + uuid.uuid4().hex[:10]
+            # OKX clOrdId accepts ONLY letters and digits (max 32) — an
+            # underscore here returned sCode 51000 "Parameter clOrdId error"
+            # on EVERY taker-fallback attempt, so a time-stop that drifted
+            # past max_adverse_bps could never flatten and the position rode
+            # on until the executor's force-close backstop caught it minutes
+            # later. Keep it alphanumeric.
+            cl_ord = cl_ord_prefix + "tk" + uuid.uuid4().hex[:10]
             sz_str = _fmt_size(remaining, lot_sz) if lot_sz > 0 else str(remaining)
             try:
                 resp = await client.place_order(

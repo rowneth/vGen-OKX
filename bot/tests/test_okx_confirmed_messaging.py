@@ -491,3 +491,56 @@ def test_resolve_close_no_match_returns_false_without_closing(tmp_path):
     assert trade.close_px == 0.0
     # No fabricated close_reason of "history_fetch_failed"/"unmatched_close" set
     assert trade.close_reason in ("", None)
+
+
+# --------------------------------------------------------------------------
+# PnL-aware exit labelling (regression for the "losing trade shown as TP HIT"
+# bug). A real TP is a profit by construction; an SL is a loss. The proximity
+# matcher must obey the realized-PnL sign, and a pre-stamped reason
+# (time_stop / forced close) must be preserved.
+# --------------------------------------------------------------------------
+def _close_hist_short(px: str, pnl: str = "0", fee: str = "-0.02",
+                      fill_time: str = "2000") -> Dict[str, Any]:
+    """Closing BUY fill (closes a short), after entry."""
+    return {"data": [{"state": "filled", "side": "buy", "fillTime": fill_time,
+                      "avgPx": px, "fee": fee, "pnl": pnl}]}
+
+
+def test_losing_short_close_is_labelled_sl_not_tp(tmp_path):
+    # SHORT entered at 100, closes at 100.3 → price moved UP = a LOSS. The
+    # close (100.3) is nearer tp_px(99.0) than sl_px(103.0) by raw distance,
+    # so the OLD proximity-only matcher mislabelled it "tp". PnL sign must win.
+    client = FakeClient(positions=_flat(), history=_close_hist_short("100.3"))
+    ex, _ = _make_executor(client, tmp_path)
+    trade = _make_trade(side="short", closed=False, close_px=0.0)
+    trade.tp_px = 99.0
+    trade.sl_px = 103.0
+    ok = _run(ex._resolve_close(trade))
+    assert ok is True
+    assert trade.close_px == 100.3
+    assert trade.close_reason == "sl"          # a loss is never "tp"
+
+
+def test_winning_long_close_is_labelled_tp(tmp_path):
+    client = FakeClient(positions=_flat(), history=_close_hist_long(px="101.0", pnl="0"))
+    ex, _ = _make_executor(client, tmp_path)
+    trade = _make_trade(side="long", closed=False, close_px=0.0)
+    trade.tp_px = 101.0
+    trade.sl_px = 98.0
+    ok = _run(ex._resolve_close(trade))
+    assert ok is True
+    assert trade.close_reason == "tp"          # a profit is never "sl"
+
+
+def test_time_stop_reason_preserved_through_resolve(tmp_path):
+    # A forced/time-stop close that happens to land near tp_px must keep its
+    # honest reason, not be relabelled "tp".
+    client = FakeClient(positions=_flat(), history=_close_hist_short("99.1"))
+    ex, _ = _make_executor(client, tmp_path)
+    trade = _make_trade(side="short", closed=False, close_px=0.0)
+    trade.tp_px = 99.0
+    trade.sl_px = 103.0
+    trade.close_reason = "time_stop"           # pre-stamped by _maker_close
+    ok = _run(ex._resolve_close(trade))
+    assert ok is True
+    assert trade.close_reason == "time_stop"   # preserved, not proximity-matched

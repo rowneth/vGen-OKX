@@ -1406,25 +1406,32 @@ def _make_real_fill_callback(
             return
         reason = trade.close_reason or "closed"
         is_manual = reason == "manual"
-        emoji = {
-            "tp": "✅", "sl": "❌", "sl_ambiguous": "❌", "time_stop": "⏱",
-            "trend_break": "✂️", "manual": "📤",
-            "watch_timeout": "⚠️", "unmatched_close": "⚠️",
-        }.get(reason, "📤")
-        # Spell the exit out so TP vs SL is unmistakable at a glance — OKX's own
-        # email just says "stop order triggered" for every attached TP/SL leg.
-        _REASON_TITLE = {
-            "tp": "TP HIT", "sl": "SL HIT", "sl_ambiguous": "SL HIT (worst case)",
-            "time_stop": "TIME STOP", "trend_break": "TREND EXIT",
-            "manual": "MANUAL CLOSE", "watch_timeout": "CLOSED (watch timeout)",
-            "unmatched_close": "CLOSED (unmatched)",
-        }
-        label = _REASON_TITLE.get(reason, reason.upper())
-        title = label if is_manual else f"REAL FILL · {_esc(label)}"
         gross = float(trade.real_gross_pnl)
         open_fee = float(trade.real_open_fee)
         close_fee = float(trade.real_close_fee)
         net = gross - open_fee - close_fee
+        # The leading emoji reflects the actual money outcome, NOT the exit
+        # reason: a time-stop / forced close that LOST must never wear a green
+        # ✅. WIN = net > 0, LOSS = net < 0, scratch ≈ 0. The reason is still
+        # named in the title so you can tell a TP from a time-stop.
+        if net > 0.0001:
+            emoji = "🟢"          # WIN
+        elif net < -0.0001:
+            emoji = "🔴"          # LOSS
+        else:
+            emoji = "⚪"          # flat scratch
+        # Name the exit. A "tp"/"sl" label is only honest now that _resolve_close
+        # is PnL-aware (a profitable close is tp, a losing close is sl); a
+        # time-stop/forced close keeps its own descriptive label.
+        _REASON_TITLE = {
+            "tp": "TP", "sl": "SL", "sl_ambiguous": "SL (worst case)",
+            "time_stop": "TIME STOP", "trend_break": "TREND EXIT",
+            "manual": "MANUAL CLOSE", "watch_timeout": "FORCED CLOSE",
+            "unmatched_close": "FORCED CLOSE", "closed": "CLOSED",
+        }
+        outcome = "WIN" if net > 0.0001 else ("LOSS" if net < -0.0001 else "SCRATCH")
+        label = _REASON_TITLE.get(reason, reason.upper())
+        title = label if is_manual else f"{outcome} · {_esc(label)}"
         g_str = f"+${abs(gross):.4f}" if gross >= 0 else f"-${abs(gross):.4f}"
         n_str = f"+${abs(net):.4f}" if net >= 0 else f"-${abs(net):.4f}"
         # Per-side bps slip vs the paper TP/SL (positive = we got a worse fill).
