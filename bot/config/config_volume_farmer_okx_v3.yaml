@@ -72,11 +72,18 @@ farmer:
   # Campaign pace controller: margin_fraction is scaled by
   # (required volume/day) / (achieved volume/day), clamped to
   # [min_margin_fraction, max_margin_fraction], after warmup_trips.
+  # Smart-middle pacing: target day 20, not day 30 — a 10-day buffer for
+  # outages/regime changes before the real deadline. The controller runs the
+  # SMALLEST size that holds the 20-day schedule (low daily bleed, small
+  # per-trade tail) and only sizes up toward max when actually behind.
+  # Total campaign cost is volume-fixed (~$735) either way; what this buys
+  # is low burn rate + automatic catch-up, instead of rushing at max size.
   pace:
     enabled: true
-    campaign_days: 30
-    min_margin_fraction: 0.04
-    max_margin_fraction: 0.16
+    campaign_days: 20
+    min_margin_fraction: 0.04      # $900/leg when ahead of schedule
+    max_margin_fraction: 0.20      # $4,500/leg catch-up ceiling (lev stays 15x:
+                                   # notional never moves the liquidation line)
     warmup_trips: 10
 
   # Fallback fixed TP/SL (used when atr.relative = false)
