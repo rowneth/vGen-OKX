@@ -210,7 +210,14 @@ notifications:
     send_daily: true               # now actually implemented (daily digest)
     send_errors: true
     send_milestones: true
-    daily_report_hour: 0           # UTC
+    daily_report_hour: 4           # 04:00 UTC = 09:30 Sri Lanka (active hour)
+    # Team-mention alerts (rebate recycle / top-up needed) only fire inside
+    # this local window so they're not sent — and missed — overnight. Times
+    # are in BOT_TIMEZONE (Asia/Colombo). The hourly ops loop holds an
+    # overnight-due alert and sends it at the next active hour.
+    active_hours:
+      start_hour: 8                # 08:00 Sri Lanka
+      end_hour: 22                 # 22:00 Sri Lanka
     rebate_reminder:
       enabled: true
       equity_floor_pct: 0.85

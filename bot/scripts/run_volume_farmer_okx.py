@@ -71,6 +71,7 @@ _MENU_BUTTONS = [
         {"text": "📋 Trades",    "callback_data": "cmd_trades"},
     ],
     [
+        {"text": "🗺 Plan",      "callback_data": "cmd_plan"},
         {"text": "❓ Help",      "callback_data": "cmd_help"},
     ],
 ]
@@ -2442,6 +2443,8 @@ async def _handle_command(
     actions are live/demo only (no real OKX position exists in paper mode).
     """
     _esc = TelegramNotifier.escape
+    if action == "roadmap":
+        action = "plan"
     is_live = mode_label != "PAPER"
     mgn_mode = getattr(live_executor, "mgn_mode", "isolated") if live_executor is not None else "isolated"
     lot_sz = float(getattr(live_executor, "_lot_sz", 0.01)) if live_executor is not None else 0.01
@@ -2549,7 +2552,84 @@ async def _dispatch_cmd(
         return _build_fees_text(session, cfg, bot_label, real_stats, real_acct, mode_label)
     if data == "cmd_trades":
         return _build_trades_text(session, bot_label, real_stats, mode_label)
+    if data == "cmd_plan":
+        return _build_plan_text(session, cfg, bot_label, mode_label,
+                                real_acct, real_stats, live_executor)
     return None
+
+
+def _build_plan_text(
+    session: "VolumeFarmerSession",
+    cfg: Dict[str, Any],
+    bot_label: str,
+    mode_label: str,
+    real_acct: Optional[Dict[str, Any]],
+    real_stats: Optional[Dict[str, Any]],
+    live_executor: Optional[Any] = None,
+) -> str:
+    """Roadmap-to-5M card: real progress, top-up needed vs the breaker, and the
+    safety-net checklist — all from real numbers (or 'unavailable')."""
+    _esc = TelegramNotifier.escape
+    fees = cfg.get("fees", {}) or {}
+    maker = float(fees.get("maker", 0.0002))
+    rebate = float(fees.get("rebate_pct", 0.20))
+    target = float((cfg.get("target", {}) or {}).get("volume_usd", 5_000_000))
+    reward = float((cfg.get("target", {}) or {}).get("reward_usd", 1500))
+    risk = cfg.get("risk", {}) or {}
+    mdd = float(risk.get("live_breaker_max_drawdown_pct", 0.40))
+    # net $/1M ≈ all-maker floor = maker×(1-rebate)×1e6, +5% for taker reality
+    net_per_1m = maker * (1 - rebate) * 1e6 * 1.05
+    gross_per_1m = maker * 1e6 * 1.05
+
+    is_real = mode_label != "PAPER"
+    real_vol = float(real_stats.get("volume", 0.0)) if (is_real and real_stats) else session.total_volume_usd
+    wallet = real_acct.get("equity") if (is_real and real_acct) else session.equity
+    pct = real_vol / target * 100 if target else 0
+    remaining = max(target - real_vol, 0.0)
+    remaining_net = remaining / 1e6 * net_per_1m
+
+    lines = [
+        f"🗺 *Roadmap to 5M · {_esc(mode_label)}*",
+        _SEP,
+        f"Volume   `${real_vol:,.0f}` / `${target:,.0f}`  \\(`{pct:.1f}%`\\)",
+        f"Cost so far  ≈ `${real_vol/1e6*net_per_1m:,.0f}` net",
+        f"Remaining    ≈ `${remaining_net:,.0f}` net  \\(`${net_per_1m:.0f}/1M`\\)",
+        _SEP,
+    ]
+    if wallet is not None:
+        # The 40% MDD breaker halts when wallet < (1-mdd)×peak. Approximating
+        # peak≈current wallet, the wallet can absorb mdd×wallet of bleed.
+        absorb = mdd * float(wallet)
+        topup = max(0.0, remaining_net - absorb)
+        lines.append(f"Wallet   `${float(wallet):,.2f}`")
+        if topup <= 0:
+            lines.append(f"Top\\-up needed  `none` ✅  \\(wallet funds the rest\\)")
+        else:
+            lines.append(
+                f"⚠️ Top\\-up needed  ≈ `${topup:,.0f}`  before the {int(mdd*100)}% "
+                f"halt \\(at ≈ `${float(wallet)*(1-mdd):,.2f}`\\)"
+            )
+        lines.append(f"Reward at 5M  `${reward:,.0f}`  → net ≈ `${reward - remaining_net:,.0f}`")
+    else:
+        lines.append("Wallet   `unavailable` \\(API\\) — top\\-up calc paused")
+    # pace / ETA from the session controller
+    pace = (session.summary().get("pace") or {})
+    if pace.get("achieved_per_day"):
+        ach = float(pace["achieved_per_day"])
+        if ach > 0:
+            lines.append(f"Pace `${ach:,.0f}/day` → ETA ≈ `{remaining/ach:.1f}d`")
+    lines += [
+        _SEP,
+        "*Safety nets*",
+        f"• Hard halt at `{int(mdd*100)}%` drawdown \\(persisted\\)",
+        f"• Daily pause at `{int(float(risk.get('live_breaker_daily_loss_pct',0.10))*100)}%`",
+        "• 1\\-bar time\\-stop · maker exits · 15× \\(liq `6.2%` ≫ stop\\)",
+        "• Naked\\-position flatten on restart · keep\\-alive supervisor",
+        "• Top\\-up asks in active hours only · deposit alerts on",
+        _SEP,
+        f"\\[{_esc(bot_label)}\\]",
+    ]
+    return "\n".join(lines)
 
 
 def _build_rebate_text(
@@ -2848,7 +2928,7 @@ async def _command_loop(
                     _spawn(_dispatch(action, raw_text, reply_to))
                 elif cmd in (
                     "status", "position", "fees", "trades",
-                    "orders", "cancel", "help",
+                    "orders", "cancel", "help", "plan", "roadmap",
                 ):
                     _spawn(_dispatch(cmd, raw_text, reply_to))
 
@@ -2961,6 +3041,23 @@ async def _verify_fee_tier(client: Any, symbol: str, cfg: Dict[str, Any]) -> str
                  cfg_m, cfg_t, real_maker, real_taker)
     return (f"⚠️ fee tier MISMATCH: config `{cfg_m*1e4:.1f}`/`{cfg_t*1e4:.1f}bps` "
             f"but account pays `{real_maker*1e4:.1f}`/`{real_taker*1e4:.1f}bps`")
+
+
+def _in_active_hours(tg_cfg: Dict[str, Any]) -> bool:
+    """True when local time is within the team's waking window — top-up asks
+    sent at 3am get missed, so the lifeline reminders are queued to the next
+    active hour (the ops loop re-checks hourly). Defaults 08:00-22:00 in the
+    bot's timezone (BOT_TIMEZONE / Asia/Colombo)."""
+    ah = (tg_cfg.get("active_hours") or {})
+    start = int(ah.get("start_hour", 8))
+    end = int(ah.get("end_hour", 22))
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(os.environ.get("BOT_TIMEZONE", "Asia/Colombo"))
+        hr = datetime.now(tz=tz).hour
+    except Exception:  # noqa: BLE001
+        hr = datetime.now(tz=timezone.utc).hour
+    return start <= hr < end if start <= end else (hr >= start or hr < end)
 
 
 async def _live_ops_loop(
@@ -3078,6 +3175,13 @@ async def _live_ops_loop(
             daily_due = (time.time() - daily_last_sent >= 86_400
                          and rebate24 is not None and rebate24 >= min_usd)
             urgent_due = low_balance and (time.time() - low_bal_last) > 6 * 3600
+            # Hold the team-mention alerts to active hours so they're not sent
+            # while everyone's asleep (and missed). Re-checked hourly; the
+            # dedupe/cooldown only advance on an actual send, so a reminder
+            # that comes due overnight fires at the next active hour instead.
+            if (daily_due or urgent_due) and not _in_active_hours(tg_cfg):
+                LOGGER.info("rebate/topup alert due but outside active hours — holding")
+                daily_due = urgent_due = False
             if daily_due or urgent_due:
                 mention = " ".join(_esc(h) for h in handles)
                 w_str = f"${wallet:,.4f}" if wallet is not None else "unavailable"
