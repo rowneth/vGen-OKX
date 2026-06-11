@@ -3009,12 +3009,14 @@ async def _live_ops_loop(
     ops_path = pathlib.Path("data") / f"ops_state_{bot_label}.json"
     anchor: Optional[float] = None
     daily_last_sent = 0.0
+    last_wallet: Optional[float] = None
     try:
         if ops_path.exists():
             _ops = json.loads(ops_path.read_text())
             anchor = _ops.get("anchor")
             daily_last_sent = float(_ops.get("daily_last_sent", 0.0))
-            LOGGER.info("ops state restored: anchor=%s", anchor)
+            last_wallet = _ops.get("last_wallet")
+            LOGGER.info("ops state restored: anchor=%s last_wallet=%s", anchor, last_wallet)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("ops state load failed: %s", exc)
 
@@ -3023,7 +3025,8 @@ async def _live_ops_loop(
             ops_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = ops_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(
-                {"anchor": anchor, "daily_last_sent": daily_last_sent}))
+                {"anchor": anchor, "daily_last_sent": daily_last_sent,
+                 "last_wallet": last_wallet}))
             os.replace(tmp, ops_path)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("ops state save failed: %s", exc)
@@ -3043,6 +3046,28 @@ async def _live_ops_loop(
                 # Top-ups / growth raise the anchor (floor follows the best
                 # wallet ever seen, never ratchets down).
                 anchor = float(wallet)
+                _save_ops()
+            # Deposit / reload detection — REAL balance jump vs the last
+            # observed wallet (rebate transfer landing, manual top-up).
+            # Threshold $5 keeps ordinary hourly PnL wiggle from pinging.
+            if (wallet is not None and last_wallet is not None
+                    and (wallet - last_wallet) >= 5.0):
+                inc = wallet - last_wallet
+                try:
+                    await notifier.send_raw(
+                        f"{_esc('@rowneth')}\n"
+                        f"📥 *Wallet reloaded · {_esc(mode_label)}*\n{_SEP}\n"
+                        f"Balance  `${last_wallet:,.4f}` → `${wallet:,.4f}`"
+                        f"  \\(\\+`${inc:,.2f}`\\)\n"
+                        f"Deposit received — campaign runway extended\\.\n"
+                        f"{_SEP}\n\\[{_esc(bot_label)}\\]"
+                    )
+                    LOGGER.info("deposit detected: +$%.2f (%.4f -> %.4f)",
+                                inc, last_wallet, wallet)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("deposit alert send failed: %s", exc)
+            if wallet is not None:
+                last_wallet = float(wallet)
                 _save_ops()
             fees24 = await _fees_last_24h(client, symbol)
             rebate24 = fees24 * rebate_pct if fees24 is not None else None
