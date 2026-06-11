@@ -3911,6 +3911,8 @@ async def main_async(args: argparse.Namespace) -> int:
                 cfg2["farmer"].setdefault("entry", {})["max_bar_range_bps"] = float(ov["max_bar_range_bps"])
             if "min_vol_ratio" in ov:
                 cfg2["farmer"].setdefault("entry", {})["min_vol_ratio"] = float(ov["min_vol_ratio"])
+            if "alternate_direction" in ov:
+                cfg2["farmer"]["alternate_direction"] = bool(ov["alternate_direction"])
             # The PRIMARY owns campaign pacing and the target halt; secondaries
             # trade at base size and never halt the process on their sim book.
             cfg2.setdefault("farmer", {}).setdefault("pace", {})["enabled"] = False

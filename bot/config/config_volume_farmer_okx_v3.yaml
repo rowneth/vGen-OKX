@@ -53,6 +53,8 @@ exchange:
       overrides:
         tp_mult: 0.5               # DOGE ATR runs ~23bps; 0.5x lands mid-band
         max_bar_range_bps: 80.0    # DOGE bars are bigger; 40 would gate most
+        alternate_direction: false # DOGE direction carries real signal: keep
+                                   # momentum (mom beats forced-alt both halves)
 
 fees:
   # CORRECTED 2026-06-11 from the live startup fee-tier check: OKX charges this
@@ -168,7 +170,14 @@ farmer:
   # Re-enter on the same bar a position closed (cycle floor 1 bar, not 2).
   reentry_same_bar: true
 
-  alternate_direction: false
+  # PRIMARY (BTC) trades forced L/S/L alternation — pattern-tested 2026-06-11
+  # on 60d + both 30d halves, single AND joint book: BTC alternation beats
+  # BTC momentum by $6-9/1M consistently (direction-balance cuts the maker
+  # entry's adverse-selection drift; BTC's candle direction carries no info).
+  # DOGE keeps momentum via its override below — its direction DOES carry
+  # signal (mom beats alt by $5-32/1M in both halves). Joint book improves
+  # $141.7 -> $135.1/1M (net@5M +$33).
+  alternate_direction: true
 
   limit_tp: true
 
