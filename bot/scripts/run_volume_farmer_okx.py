@@ -3546,6 +3546,45 @@ async def main_async(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("live executor init failed: %s", exc)
                 return 2
+
+            # PRE-FLIGHT AUTH GATE: prove the keys actually authenticate against
+            # the chosen endpoint BEFORE the loops start placing orders. A demo
+            # key on --live (code 50119), an un-whitelisted droplet IP (50110),
+            # or clock drift (50102) otherwise let the bot churn failed entries
+            # forever, posting confusing "Entry missed" cards and fabricating
+            # progress from stale logs. Fail loud and fast instead.
+            try:
+                _bal = await client.get_balance("USDT")
+                _acode = str(_bal.get("code", "?"))
+            except Exception as exc:  # noqa: BLE001
+                _acode, _bal = "EXC", {}
+                LOGGER.error("pre-flight balance call raised: %s", exc)
+                _bal = {"msg": str(exc)[:160]}
+            if _acode != "0":
+                _causes = {
+                    "50119": "API key doesn't exist — a DEMO key is set in OKX_API_KEY, "
+                             "or the key was deleted. Create a real-trading key.",
+                    "50110": "This server's IP is not whitelisted on the API key.",
+                    "50102": "Clock drift > 30s — fix NTP on the host.",
+                    "50101": "Wrong passphrase for this key.",
+                }
+                _why = _causes.get(_acode, _bal.get("msg", "see OKX docs"))
+                LOGGER.error("PRE-FLIGHT AUTH FAILED (%s): %s — NOT starting the trade loop", _acode, _why)
+                if notifier.enabled:
+                    _e = TelegramNotifier.escape
+                    try:
+                        await notifier.send_and_get_id(
+                            f"⛔ *LIVE AUTH FAILED — not trading · {_e(mode_label)}*\n{_SEP}\n"
+                            f"OKX rejected the keys: code `{_e(_acode)}`\n"
+                            f"`{_e(_why)}`\n{_SEP}\n"
+                            f"Fix the API key in `.env` \\(real\\-trading key, IP whitelisted\\), "
+                            f"then redeploy\\. Run `scripts/diag_live.py` to confirm `code=0`\\.\n"
+                            f"{_SEP}\n\\[{_e(args.label or 'okx-paper')}\\]"
+                        )
+                        await notifier.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return 2
             # OKX-confirmed lifecycle cards: every trade message is emitted by the
             # executor at a real exchange confirmation point, not the simulation.
             _exec_mode = "LIVE" if args.live else "DEMO"
