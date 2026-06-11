@@ -40,9 +40,9 @@ from exchange.okx_client import OKXClient  # noqa: E402
 
 MAKER = 0.0002
 TAKER = 0.0005
-REBATE = 0.40
-MAKER_NET = MAKER * (1 - REBATE)          # 1.2 bps
-TAKER_NET = TAKER * (1 - REBATE)          # 3.0 bps
+REBATE = 0.20   # current live deal (conservative reading)
+MAKER_NET = MAKER * (1 - REBATE)
+TAKER_NET = TAKER * (1 - REBATE)
 NOTIONAL = 1_800.0                        # $/leg, fixed for all variants
 SL_SLIP_BPS = 3.0                         # taker stop slips through trigger
 TAKER_ENTRY_SLIP_BPS = 0.4                # entry taker-fallback slip
@@ -113,7 +113,9 @@ def simulate(df: pd.DataFrame, *, name: str,
              min_range_bps: float,
              atr_min_usd: float,
              same_bar_reentry: bool,
-             tp_atr_mult: float = 1.0,   # TP = clamp(max(6, mult*ATRbps), 6.8, 18)
+             tp_atr_mult: float = 1.0,   # TP = clamp(max(6, mult*ATRbps), floor, 18)
+             be_seek_bars: int = 0,      # bars AFTER bar1 hunting breakeven+fees
+             be_exit_bps: float = 0.0,   # the collapsed target (maker close)
              lev: float = 0.0,           # >0 enables intrabar LIQUIDATION modeling
              mmr_buffer: float = 0.005,  # maintenance margin + fee buffer
              liq_penalty_bps: float = 2.0) -> dict:
@@ -142,8 +144,9 @@ def simulate(df: pd.DataFrame, *, name: str,
         atr_bps = atr[i] / c[i] * 1e4
         if tp_mode == "fixed12":
             tp_bps = 12.0
-        else:  # v3: ATR-relative, fee floor 6.8, cap 18
-            tp_bps = min(max(max(6.0, tp_atr_mult * atr_bps), 6.8), 18.0)
+        else:  # v3: ATR-relative, fee floor = 2*round_trip+2, cap 18
+            rt_bps = MAKER_NET * 2 * 1e4
+            tp_bps = min(max(max(6.0, tp_atr_mult * atr_bps), 2*rt_bps + 2.0), 18.0)
         if alternate:
             side = "short" if last_side == "long" else "long"
         else:
@@ -195,7 +198,16 @@ def simulate(df: pd.DataFrame, *, name: str,
         if pos is not None:
             pos["bars_held"] += 1
             long = pos["side"] == "long"
-            tp_hit = (h[i] >= pos["tp"]) if long else (l[i] <= pos["tp"])
+            # Two-phase favorable exit (user proposal): after bar 1 the resting
+            # TP limit is amended DOWN to breakeven+fees; first touch closes.
+            if be_seek_bars > 0 and pos["bars_held"] >= 2:
+                fav_px = (pos["entry"] * (1 + be_exit_bps / 1e4) if long
+                          else pos["entry"] * (1 - be_exit_bps / 1e4))
+                fav_reason = "be_exit"
+            else:
+                fav_px = pos["tp"]
+                fav_reason = "tp"
+            tp_hit = (h[i] >= fav_px) if long else (l[i] <= fav_px)
             # Adverse exits: the binding level is whichever sits CLOSER to the
             # entry — the price reaches it first on the way down/up. With high
             # leverage the liquidation line can sit INSIDE the stop, in which
@@ -224,9 +236,10 @@ def simulate(df: pd.DataFrame, *, name: str,
                 close_trade(pos, px, adverse_reason, "taker")
                 pos = None; closed_this_bar = True
             elif tp_hit:
-                close_trade(pos, pos["tp"], "tp", "maker")
+                close_trade(pos, fav_px, fav_reason, "maker")
                 pos = None; closed_this_bar = True
-            elif time_stop_bars > 0 and pos["bars_held"] >= time_stop_bars:
+            elif (be_seek_bars > 0 and pos["bars_held"] >= 1 + be_seek_bars) or \
+                 (be_seek_bars == 0 and time_stop_bars > 0 and pos["bars_held"] >= time_stop_bars):
                 slip = c[i] * (SCRATCH_SLIP_BPS / 1e4)
                 px = c[i] - slip if long else c[i] + slip
                 close_trade(pos, px, "time_stop", "maker")
