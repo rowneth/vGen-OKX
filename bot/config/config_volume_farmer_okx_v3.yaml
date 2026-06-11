@@ -66,7 +66,8 @@ fees:
   # at 40%: ~$126/1M.
   maker: 0.0002                    # 0.020% — what OKX actually charges (verified)
   taker: 0.0005                    # 0.050% — what OKX actually charges (verified)
-  rebate_pct: 0.20                 # portion recovered (see note above)
+  rebate_pct: 0.40                 # user-confirmed 2026-06-11: 40% of fees come back
+                                   # (20%-off deal pays as cashback + 20% rebate)
   rebate_all_legs: true            # rebate applies to maker AND taker legs
 
 farmer:
@@ -127,9 +128,14 @@ farmer:
   maker_exit:
     enabled: true
     repeg_ms: 750
-    max_repegs: 8
-    max_exit_seconds: 20.0
-    max_adverse_bps: 15.0
+    max_repegs: 10
+    # Tuned from LIVE day-1 data (2026-06-11): 31 of 69 closes were dumped at
+    # market — the 15bps adverse trigger + 20s budget bailed to taker far more
+    # often than the demo ever did, costing ~3bps extra on 23% of volume. The
+    # 9xATR stop sits 100-200bps away, so letting the maker ladder keep
+    # working to 25bps / 30s is safe and converts most of those to maker.
+    max_exit_seconds: 30.0
+    max_adverse_bps: 25.0
     poll_ms: 120
     ladder: true
     ladder_max_frac: 1.0
