@@ -255,6 +255,13 @@ class LiveVolumeExecutorOKX:
     # is race-safe because consume_session_event is synchronous and sets
     # _entry_pending before returning control to the event loop.
     peer_executors: List["LiveVolumeExecutorOKX"] = field(default_factory=list)
+    # Breaker DELEGATION: all executors trade ONE wallet, so wallet-level risk
+    # state (daily anchor, peak, loss streak, halts) must live in ONE place.
+    # Secondaries point here at the primary; their closes feed the primary's
+    # breaker and their entry gate asks the primary. Without this, per-symbol
+    # anchors diluted the daily/MDD limits up to ~2x and an alternating
+    # BTC/DOGE loss streak never tripped the cooldown.
+    breaker_delegate: Optional["LiveVolumeExecutorOKX"] = None
 
     # ------------------------------------------------------------------
     # REAL-WALLET circuit breaker. Unlike the session's paper-equity guards,
@@ -559,6 +566,8 @@ class LiveVolumeExecutorOKX:
         Sync (called from the sync entry hook). Reads only local breaker state;
         the state itself is refreshed from the live wallet on each close.
         """
+        if self.breaker_delegate is not None and self.breaker_delegate is not self:
+            return self.breaker_delegate._entry_blocked_reason()  # noqa: SLF001
         if self._hard_halted:
             return f"hard_halt:{self._halt_reason}"
         now = time.time()
@@ -582,6 +591,9 @@ class LiveVolumeExecutorOKX:
     async def _update_breaker_on_close(self, trade: LiveTradeOKX) -> None:
         """Update the real-wallet breaker after a VERIFIED, priced close.
 
+        With a breaker_delegate set (multi-instrument), the close feeds the
+        DELEGATE's wallet-level state instead of a per-symbol copy.
+
         Counts consecutive real losing closes (loss-streak cooldown), and reads
         the live wallet to enforce the daily-loss and max-drawdown halts. Runs at
         most once per trade. Never raises — risk gating must not wedge the close.
@@ -589,6 +601,10 @@ class LiveVolumeExecutorOKX:
         if trade.extras.get("breaker_counted"):
             return
         trade.extras["breaker_counted"] = True
+        if self.breaker_delegate is not None and self.breaker_delegate is not self:
+            trade.extras.pop("breaker_counted", None)
+            await self.breaker_delegate._update_breaker_on_close(trade)  # noqa: SLF001
+            return
         try:
             net = trade.real_gross_pnl - trade.real_open_fee - trade.real_close_fee
             reason = (trade.close_reason or "").lower()
@@ -690,7 +706,17 @@ class LiveVolumeExecutorOKX:
     def _load_breaker_state(self) -> None:
         p = self._breaker_state_file()
         if not p.exists():
-            return
+            # Migrate the pre-multi-symbol file so a persisted HARD HALT or
+            # real anchors survive this upgrade instead of silently resetting.
+            legacy = self.log_dir / "breaker_state.json"
+            if legacy.exists():
+                try:
+                    os.replace(legacy, p)
+                    LOGGER.info("migrated legacy breaker state -> %s", p.name)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("legacy breaker migration failed: %s", exc)
+            if not p.exists():
+                return
         try:
             s = json.loads(p.read_text())
             self._peak_real_eq = float(s.get("peak_real_eq", 0.0))

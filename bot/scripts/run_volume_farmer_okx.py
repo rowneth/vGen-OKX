@@ -481,13 +481,18 @@ async def _poll_loop(
             sleep_s = float(poll_sec)
         else:
             next_close = last_bar_ts + pd.Timedelta(seconds=2 * bar_seconds)
-            wait = (next_close - pd.Timestamp.now(tz="UTC")).total_seconds() + 1.0
+            # initial_delay is added to EVERY wake, not just the first sleep:
+            # all symbols share 5m bar boundaries, so without a persistent
+            # offset the secondary re-aligns to the same wake instant after
+            # one bar and the primary's priority becomes a coin flip.
+            wait = ((next_close - pd.Timestamp.now(tz="UTC")).total_seconds()
+                    + 1.0 + initial_delay)
             if wait <= 0:
                 wait = 2.0
             if mode_label == "PAPER":
                 sleep_s = min(float(poll_sec), wait)
             else:
-                sleep_s = min(wait, bar_seconds + 5.0)
+                sleep_s = min(wait, bar_seconds + 5.0 + initial_delay)
         await asyncio.sleep(sleep_s)
 
 
@@ -515,6 +520,8 @@ def _make_event_handler(
     intrabar: Optional[Dict[str, Any]] = None,
     state_path: Optional[pathlib.Path] = None,
     cfg: Optional[Dict[str, Any]] = None,
+    campaign_symbols: Optional[list] = None,
+    all_sessions: Optional[list] = None,
 ):
     _pending: Dict[str, Any] = {}
     _esc = TelegramNotifier.escape
@@ -606,7 +613,10 @@ def _make_event_handler(
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("auto-card real acct fetch failed: %s", exc)
             try:
-                stats = await _fetch_okx_trade_stats(client, symbol)
+                if campaign_symbols and len(campaign_symbols) > 1:
+                    stats = await _fetch_okx_trade_stats_multi(client, campaign_symbols)
+                else:
+                    stats = await _fetch_okx_trade_stats(client, symbol)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("auto-card real stats fetch failed: %s", exc)
         eq = acct.get("equity") if isinstance(acct, dict) else None
@@ -806,7 +816,7 @@ def _make_event_handler(
                     f"{_SEP}\n"
                     f"Balance  `${equity:.4f}`"
                 )
-                text = text + "\n" + "\n".join(_journey_lines(session, cfg))
+                text = text + "\n" + "\n".join(_journey_lines(all_sessions or session, cfg))
                 entry_msg_id = _pending.get("msg_id") or entry_msg_threaded
                 _bg(_send_exit(text, entry_msg_id))
             _pending.clear()
@@ -929,10 +939,12 @@ async def _fetch_real_account(client: Any, symbol: str) -> Dict[str, Any]:
             raise pos_res
         pos = pos_res
         out["pos_ok"] = True
+        out["pos_inst"] = None
         for p in (pos.get("data") or []):
             sz = float(p.get("pos") or 0.0)
             if sz != 0.0:
                 out["pos_side"] = p.get("posSide")
+                out["pos_inst"] = p.get("instId")
                 out["pos_sz"] = sz
                 out["upl"] = float(p.get("upl") or 0.0)
                 out["avg_px"] = float(p.get("avgPx") or 0.0) or None
@@ -1106,7 +1118,7 @@ def _format_exit_breakdown(by_reason: Dict[str, Any]) -> str:
 # authenticated GETs per call, previously re-run from scratch on EVERY
 # /status //fees //trades command AND every live halt/milestone/rebate card —
 # burning auth rate limit exactly when an EXIT-FAILED flurry needs headroom.
-_STATS_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "val": None}
+_STATS_CACHE: Dict[str, Dict[str, Any]] = {}   # inst -> {ts, val}
 _STATS_CACHE_TTL_S = 30.0
 # Instrument ctVal cache (was hardcoded 0.01 = BTC-only; wrong stats for any
 # other instrument).
@@ -1134,13 +1146,27 @@ def _merge_stats(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Op
     if b is None:
         return a
     out = dict(a)
-    for k in ("n", "wins", "losses", "volume", "fees", "gross", "net"):
+    for k in ("n", "wins", "losses", "volume", "fees", "gross", "net",
+              "open_fees", "close_fees"):
         out[k] = (a.get(k) or 0) + (b.get(k) or 0)
     n = out.get("n") or 0
     out["wr"] = (out.get("wins", 0) / n * 100.0) if n else 0.0
-    br = dict(a.get("by_reason") or {})
-    for k, v in (b.get("by_reason") or {}).items():
-        br[k] = br.get(k, 0) + v
+    # closed-trade records from BOTH books, newest-last (the /trades card
+    # otherwise listed primary-only rows under combined totals)
+    merged_closed = list(a.get("closed") or []) + list(b.get("closed") or [])
+    try:
+        merged_closed.sort(key=lambda r: r.get("close_ts") or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    out["closed"] = merged_closed
+    # by_reason values are dicts {n, net, wins} — merge per field
+    br: Dict[str, Any] = {}
+    for src in (a.get("by_reason") or {}, b.get("by_reason") or {}):
+        for k, v in src.items():
+            cur = br.setdefault(k, {"n": 0, "net": 0.0, "wins": 0})
+            cur["n"] += v.get("n", 0)
+            cur["net"] += v.get("net", 0.0)
+            cur["wins"] += v.get("wins", 0)
     out["by_reason"] = br
     return out
 
@@ -1173,12 +1199,9 @@ async def _fetch_okx_trade_stats(
     """
     now = time.time()
     cache_key = to_okx_inst_id(symbol)
-    if (
-        _STATS_CACHE["val"] is not None
-        and _STATS_CACHE["key"] == cache_key
-        and now - _STATS_CACHE["ts"] < _STATS_CACHE_TTL_S
-    ):
-        return _STATS_CACHE["val"]
+    hit = _STATS_CACHE.get(cache_key)
+    if hit is not None and hit.get("val") is not None and now - hit["ts"] < _STATS_CACHE_TTL_S:
+        return hit["val"]
     inst = to_okx_inst_id(symbol)
     ct_val = await _instrument_ct_val(client, symbol)
     merged: Dict[str, Any] = {}
@@ -1251,7 +1274,7 @@ async def _fetch_okx_trade_stats(
             "real_close_fee": close_fee,
         })
     stats = _real_trade_stats(records)
-    _STATS_CACHE.update({"ts": time.time(), "key": cache_key, "val": stats})
+    _STATS_CACHE[cache_key] = {"ts": time.time(), "val": stats}
     return stats
 
 
@@ -1718,6 +1741,9 @@ async def _build_position_text(
             )
         side = str(acct.get("pos_side") or "")
         sz = float(acct.get("pos_sz") or 0.0)
+        if acct.get("pos_inst"):
+            # the open position may be on a SECONDARY instrument
+            symbol = str(acct["pos_inst"]).replace("-SWAP", "").replace("-", "_")
         avg = acct.get("avg_px")
         current = acct.get("mark_px")
         if current is None:
@@ -2462,6 +2488,35 @@ def _parse_close_price(raw_text: str) -> tuple:
         return ("bad", None)
 
 
+async def _resolve_manage_target(
+    client: Any, default_symbol: str,
+    executors: Optional[Dict[str, Any]] = None,
+) -> tuple:
+    """(symbol, executor) for position-management commands.
+
+    With multiple instruments the open position may be on a SECONDARY —
+    hardwiring the primary made `/close` report "Already flat" while a
+    leveraged DOGE position sat open (a fabricated fact in the exact
+    emergency the command exists for). Resolve from the ACTUAL open
+    position; fall back to the primary when flat.
+    """
+    sym = default_symbol
+    try:
+        r = await client.get_positions(None)
+        for p_ in r.get("data") or []:
+            try:
+                qty = float(p_.get("pos") or 0.0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty != 0.0 and p_.get("instId"):
+                sym = str(p_["instId"]).replace("-SWAP", "").replace("-", "_")
+                break
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("manage-target resolve failed (using primary): %s", exc)
+    ex = (executors or {}).get(sym)
+    return sym, ex
+
+
 async def _handle_command(
     action: str,
     raw_text: str,
@@ -2479,6 +2534,7 @@ async def _handle_command(
     pos_mode: str,
     symbols: Optional[list] = None,
     sessions: Optional[list] = None,
+    executors: Optional[Dict[str, Any]] = None,
 ) -> tuple:
     """Resolve an action to ``(text, buttons)``. ``buttons`` is None for plain cards.
 
@@ -2500,6 +2556,13 @@ async def _handle_command(
         return None, None
 
     _MANAGE = {"orders", "close", "close_market", "close_limit", "cancel"}
+    if action in _MANAGE and is_live and symbols and len(symbols) > 1:
+        symbol, _mex = await _resolve_manage_target(client, symbol, executors)
+        if _mex is not None:
+            live_executor = _mex
+            mgn_mode = getattr(live_executor, "mgn_mode", mgn_mode)
+            lot_sz = float(getattr(live_executor, "_lot_sz", lot_sz))
+            tick_sz = float(getattr(live_executor, "_tick_sz", tick_sz))
     if action in _MANAGE and not is_live:
         return (
             f"ℹ️ *{_esc(action.replace('_', ' '))}*\n{_SEP}\n"
@@ -2818,6 +2881,7 @@ async def _command_loop(
     pos_mode: str = "net",
     symbols: Optional[list] = None,
     sessions: Optional[list] = None,
+    executors: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not notifier.enabled:
         # CRITICAL: returning here used to end this task, which unblocked
@@ -2867,7 +2931,7 @@ async def _command_loop(
         session=session, client=client, symbol=symbol, tf=tf, cfg=cfg,
         mode_label=mode_label, bot_label=bot_label, start_time=start_time,
         log_dir=log_dir, live_executor=live_executor, pos_mode=pos_mode,
-        symbols=symbols, sessions=sessions,
+        symbols=symbols, sessions=sessions, executors=executors,
     )
 
     async def _reply(text: Optional[str], buttons: Optional[list], reply_to: Optional[int]) -> None:
@@ -3482,6 +3546,16 @@ async def main_async(args: argparse.Namespace) -> int:
     _intrabar: Dict[str, Any] = {}  # shared state: poll loop ↔ event handler
 
     session = VolumeFarmerSession(config=cfg)
+    # Campaign instrument list is known from config up front; the session list
+    # is a MUTABLE reference shared with every closure built later, so
+    # secondaries appended during startup are visible everywhere.
+    all_symbols = [symbol] + [
+        str(sec.get("symbol", "")).strip()
+        for sec in (cfg.get("exchange", {}).get("secondary_symbols") or [])
+        if str(sec.get("symbol", "")).strip()
+        and str(sec.get("symbol", "")).strip() != symbol
+    ]
+    all_sessions: list = [session]
     # Provisional handler — replaced below once execution mode is decided.
     handler = _make_event_handler(log_dir, symbol, session, notifier=notifier, mode_label="PAPER", tf=tf,
                                    bot_label=args.label or "okx-paper", intrabar=_intrabar,
@@ -3718,9 +3792,10 @@ async def main_async(args: argparse.Namespace) -> int:
                 tf=tf, client=client,
             )
             # The confirmed close card (real avgPx + exchange fees + OKX pnl).
+            # session=list → the journey block sums the whole campaign book.
             live_executor.on_close_confirmed = _make_real_fill_callback(
                 notifier, symbol, mode_label=_exec_mode, bot_label=_exec_lbl,
-                client=client, session=session, cfg=cfg,
+                client=client, session=all_sessions, cfg=cfg,
             )
             # Honest alert when a close can't be priced or the position is still
             # open — never a fabricated "$0.00 REAL FILL".
@@ -3792,7 +3867,8 @@ async def main_async(args: argparse.Namespace) -> int:
         handler = _make_event_handler(log_dir, symbol, session, live_executor,
                                       notifier=notifier, mode_label=mode_label,
                                       client=client, tf=tf, bot_label=args.label or "okx-paper",
-                                      intrabar=_intrabar, state_path=state_path, cfg=cfg)
+                                      intrabar=_intrabar, state_path=state_path, cfg=cfg,
+                                      campaign_symbols=all_symbols, all_sessions=all_sessions)
         session.event_callback = handler
 
         # Load persisted state and reconcile any orphan position.
@@ -3823,8 +3899,6 @@ async def main_async(args: argparse.Namespace) -> int:
         import copy as _copy
         from dataclasses import replace as _dc_replace
         sec_stacks: list = []
-        all_sessions = [session]
-        all_symbols = [symbol]
         for sec in (cfg.get("exchange", {}).get("secondary_symbols") or []):
             sym2 = str(sec.get("symbol", "")).strip()
             if not sym2 or sym2 == symbol:
@@ -3863,7 +3937,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 )
                 ex2.on_close_confirmed = _make_real_fill_callback(
                     notifier, sym2, mode_label=_exec_mode, bot_label=_exec_lbl,
-                    client=client, session=sess2, cfg=cfg2,
+                    client=client, session=all_sessions, cfg=cfg2,
                 )
                 ex2.on_close_unverified = _make_close_unverified_callback(
                     notifier, sym2, mode_label=_exec_mode, bot_label=_exec_lbl,
@@ -3884,13 +3958,14 @@ async def main_async(args: argparse.Namespace) -> int:
                                            client=client, tf=tf,
                                            bot_label=args.label or "okx-paper",
                                            intrabar=intrabar2, state_path=state2,
-                                           cfg=cfg2)
+                                           cfg=cfg2,
+                                           campaign_symbols=all_symbols,
+                                           all_sessions=all_sessions)
             sess2.event_callback = handler2
             sec_stacks.append(dict(symbol=sym2, session=sess2, executor=ex2,
                                    handler=handler2, intrabar=intrabar2,
                                    state_path=state2, history=hist2))
             all_sessions.append(sess2)
-            all_symbols.append(sym2)
             LOGGER.info("secondary instrument armed: %s (tp_mult=%s max_range=%s)",
                         sym2, cfg2["farmer"]["atr"]["tp_mult"],
                         cfg2["farmer"]["entry"].get("max_bar_range_bps"))
@@ -3899,6 +3974,9 @@ async def main_async(args: argparse.Namespace) -> int:
             peers = [live_executor] + [st["executor"] for st in sec_stacks if st["executor"] is not None]
             for e in peers:
                 e.peer_executors = peers
+                # ONE wallet → ONE breaker: secondaries feed the primary's
+                # wallet-level risk state instead of keeping diluted copies.
+                e.breaker_delegate = live_executor
 
         # STARTUP message.
         if notifier.enabled:
@@ -4054,6 +4132,8 @@ async def main_async(args: argparse.Namespace) -> int:
             log_dir=log_dir, live_executor=live_executor,
             pos_mode=args.pos_mode,
             symbols=all_symbols, sessions=all_sessions,
+            executors={symbol: live_executor,
+                       **{st["symbol"]: st["executor"] for st in sec_stacks}},
         ))
         daily_task = asyncio.create_task(_daily_report_loop(
             notifier, session, cfg, mode_label,
@@ -4100,6 +4180,8 @@ async def main_async(args: argparse.Namespace) -> int:
             LOGGER.error("FATAL: task crashed", exc_info=crash_exc)
             try:
                 session.save_state(state_path)
+                for st in sec_stacks:
+                    st["session"].save_state(st["state_path"])
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("state save after crash failed: %s", exc)
             if notifier.enabled:
