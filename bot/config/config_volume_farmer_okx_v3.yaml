@@ -46,17 +46,18 @@ exchange:
   timeframe: 5m
 
 fees:
-  # DEAL B (chosen 2026-06-11): 20% fee discount + 20% rebate.
-  # Net cost factor 0.8 x 0.8 = 0.64 of base (~$134/1M fully recycled) vs the
-  # old 40%-rebate deal's 0.60 (~$126/1M) — slightly costlier when recycling
-  # is perfect, but far less dependent on the manual rebate transfers (worst
-  # case $168/1M vs $210/1M) — the right trade for a thin starting wallet.
-  # The startup fee-tier check verifies whether the discount is account-level:
-  # if OKX still reports 2.0/5.0bps, the discount is EXTERNAL and these rates
-  # must be reverted to 0.0002/0.0005 with the discount folded into rebate_pct.
-  maker: 0.00016                   # 0.016% (2.0bps - 20%)
-  taker: 0.00040                   # 0.040% (5.0bps - 20%)
-  rebate_pct: 0.20                 # 20% rebate on fees
+  # CORRECTED 2026-06-11 from the live startup fee-tier check: OKX charges this
+  # account the FULL standard rates (2.0/5.0 bps) — the negotiated "20% off" is
+  # NOT an account-level tier cut, so gross fees MUST be the real rates here or
+  # the TP fee-floor and cost model are wrong. The "20% off" + "20% rebate" are
+  # external cashback (come back separately); rebate_pct models only the
+  # portion we actually recover. Set to 0.20 (the explicit rebate) — CONSERVATIVE:
+  # if the 20%-off is also cashed back (40% total), bump this to 0.40 so the
+  # cost display and the recycle-ask amounts are exact. Net at 20%: ~$160/1M;
+  # at 40%: ~$126/1M.
+  maker: 0.0002                    # 0.020% — what OKX actually charges (verified)
+  taker: 0.0005                    # 0.050% — what OKX actually charges (verified)
+  rebate_pct: 0.20                 # portion recovered (see note above)
   rebate_all_legs: true            # rebate applies to maker AND taker legs
 
 farmer:
