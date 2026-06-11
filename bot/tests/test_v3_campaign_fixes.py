@@ -280,3 +280,78 @@ def test_orphan_reconcile_time_stops():
 	assert result == "time_stop"
 	assert s.position is None
 	assert s.ledger[-1]["reason"] == "time_stop"
+
+
+# ---------------------------------------------------------------------------
+# relative volume gate
+# ---------------------------------------------------------------------------
+
+def test_volume_gate_skips_thin_bars():
+	cfg = _make_config()
+	cfg["farmer"]["entry"]["min_vol_ratio"] = 0.7
+	s = VolumeFarmerSession(config=cfg)
+	bars = []
+	t0 = pd.Timestamp("2026-04-01T00:00:00Z")
+	# 12 normal-volume bars to build the median, then one thin bar
+	for i in range(12):
+		bars.append({"open_time": t0 + pd.Timedelta(minutes=5*i),
+					 "open": 100.0, "high": 100.06, "low": 99.97,
+					 "close": 100.05, "volume": 1000.0})
+	hist = pd.DataFrame(bars[:1])
+	s.on_new_candle(hist)
+	for b in bars[1:]:
+		if s.position is not None:          # keep it flat: close instantly
+			s.position = None
+		hist = pd.concat([hist, pd.DataFrame([b])], ignore_index=True)
+		s.on_new_candle(hist)
+	s.position = None
+	thin = {"open_time": t0 + pd.Timedelta(minutes=60),
+			"open": 100.0, "high": 100.06, "low": 99.97,
+			"close": 100.05, "volume": 100.0}      # 10% of median → gated
+	hist = pd.concat([hist, pd.DataFrame([thin])], ignore_index=True)
+	s.on_new_candle(hist)
+	assert s.position is None              # thin bar must NOT open a trade
+	fat = {"open_time": t0 + pd.Timedelta(minutes=65),
+		   "open": 100.0, "high": 100.06, "low": 99.97,
+		   "close": 100.05, "volume": 1200.0}
+	hist = pd.concat([hist, pd.DataFrame([fat])], ignore_index=True)
+	s.on_new_candle(hist)
+	assert s.position is not None          # normal volume trades again
+
+
+# ---------------------------------------------------------------------------
+# global single-position gate across instruments
+# ---------------------------------------------------------------------------
+
+def test_peer_gate_blocks_second_instrument():
+	import asyncio
+	from execution.live_volume_executor_okx import LiveVolumeExecutorOKX
+
+	class _Evt:
+		kind = "entry"
+		payload = {"side": "long", "price": 100.0, "notional": 50.0,
+				   "tp": 101.0, "sl": 98.0, "tp_bps": 8.0, "sl_bps": 50.0,
+				   "leverage": 15.0}
+
+	async def go():
+		a = LiveVolumeExecutorOKX(client=None, symbol="BTC_USDT", dry_run=True)
+		b = LiveVolumeExecutorOKX(client=None, symbol="DOGE_USDT", dry_run=True)
+		peers = [a, b]
+		a.peer_executors = peers
+		b.peer_executors = peers
+		# A claims the gate synchronously…
+		a._entry_pending = True
+		# …so B must refuse the entry: no task scheduled, no pending claim.
+		b.consume_session_event(_Evt())
+		assert b._entry_pending is False
+		assert b._open_trade is None
+		# Gate released → B may trade.
+		a._entry_pending = False
+		b.consume_session_event(_Evt())
+		assert b._entry_pending is True
+		# cancel the scheduled dry-run task cleanly
+		for t in list(b._bg_tasks):
+			t.cancel()
+		await asyncio.sleep(0)
+
+	asyncio.run(go())

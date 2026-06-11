@@ -248,6 +248,13 @@ class LiveVolumeExecutorOKX:
     # Backoff base for the last-resort retried market close (_force_market_close);
     # attempts sleep base, 2×base, 4×base … capped at 4s. Small in tests.
     force_close_base_delay_s: float = 0.5
+    # GLOBAL single-position gate across instruments: when the runner trades
+    # multiple symbols, every executor gets the SAME list (itself included).
+    # An entry is skipped while ANY peer has a pending claim or an open trade —
+    # strictly one position at a time account-wide, by construction. The check
+    # is race-safe because consume_session_event is synchronous and sets
+    # _entry_pending before returning control to the event loop.
+    peer_executors: List["LiveVolumeExecutorOKX"] = field(default_factory=list)
 
     # ------------------------------------------------------------------
     # REAL-WALLET circuit breaker. Unlike the session's paper-equity guards,
@@ -656,7 +663,9 @@ class LiveVolumeExecutorOKX:
     # reset the daily anchor mid-day. Now it survives restarts.
     # ------------------------------------------------------------------
     def _breaker_state_file(self) -> pathlib.Path:
-        return self.log_dir / "breaker_state.json"
+        # Per-symbol: with multiple instruments, two executors sharing one
+        # file would clobber each other's anchors.
+        return self.log_dir / f"breaker_state_{to_okx_inst_id(self.symbol)}.json"
 
     def _save_breaker_state(self) -> None:
         try:
@@ -719,6 +728,15 @@ class LiveVolumeExecutorOKX:
             LOGGER.warning("max_live_trades=%d reached; ignoring entry",
                            self.max_live_trades)
             return
+        for peer in self.peer_executors:
+            if peer is self:
+                continue
+            if peer._entry_pending or peer._open_trade is not None:  # noqa: SLF001
+                LOGGER.info(
+                    "entry skipped on %s — global gate held by %s",
+                    self.symbol, peer.symbol,
+                )
+                return
         if self._entry_pending or self._open_trade is not None:
             # Gate on ANY prior trade, including closed-but-not-finalized.
             # The old `not closed` carve-out reopened the gate the instant a

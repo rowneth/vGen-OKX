@@ -120,6 +120,10 @@ class VolumeFarmerSession:
 		self._entry_mode = str(entry_cfg.get("mode", "micro_momentum"))
 		self._min_range_bps = float(entry_cfg.get("min_bar_range_bps", 0.0))
 		self._max_range_bps = float(entry_cfg.get("max_bar_range_bps", 1_000.0))
+		# Relative volume gate: skip bars whose traded volume is below
+		# ratio x rolling-median(50). Backtested 2026-06-11: hurts BTC slightly
+		# but helps thin-tick pairs (DOGE) and the joint two-pair book; 0 = off.
+		self._min_vol_ratio = float(entry_cfg.get("min_vol_ratio", 0.0))
 		# RSI / WaveTrend params (used when entry_mode == 'rsi_wt')
 		rsi_cfg = entry_cfg.get("rsi", {})
 		self._rsi_period = int(rsi_cfg.get("period", 14))
@@ -408,6 +412,14 @@ class VolumeFarmerSession:
 			return None
 		if bar_range_bps > self._max_range_bps:
 			return None
+		if self._min_vol_ratio > 0 and "volume" in history.columns and len(history) >= 10:
+			try:
+				vol_now = float(last["volume"])
+				med = float(history["volume"].tail(50).median())
+				if med > 0 and vol_now < self._min_vol_ratio * med:
+					return None  # dead-volume bar: thin book, poor maker fills
+			except (TypeError, ValueError):
+				pass
 
 		# ATR session filter + ATR-relative pending TP/SL
 		atr_val = self._compute_atr(history)

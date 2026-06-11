@@ -306,8 +306,13 @@ async def _poll_loop(
     bot_label: str = "",
     cfg: Optional[Dict[str, Any]] = None,
     intrabar: Optional[Dict[str, Any]] = None,
+    initial_delay: float = 0.0,
 ) -> None:
     bar_seconds = _parse_timeframe_seconds(tf)
+    if initial_delay > 0:
+        # Secondary symbols start their poll a few seconds later so that on a
+        # shared 5m boundary the PRIMARY signal reaches the global gate first.
+        await asyncio.sleep(initial_delay)
     last_bar_ts: Optional[pd.Timestamp] = (
         history["open_time"].iloc[-1] if not history.empty else None
     )
@@ -1122,6 +1127,33 @@ async def _instrument_ct_val(client: Any, symbol: str) -> float:
     return ct
 
 
+def _merge_stats(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Merge two _real_trade_stats dicts (multi-symbol campaign totals)."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    out = dict(a)
+    for k in ("n", "wins", "losses", "volume", "fees", "gross", "net"):
+        out[k] = (a.get(k) or 0) + (b.get(k) or 0)
+    n = out.get("n") or 0
+    out["wr"] = (out.get("wins", 0) / n * 100.0) if n else 0.0
+    br = dict(a.get("by_reason") or {})
+    for k, v in (b.get("by_reason") or {}).items():
+        br[k] = br.get(k, 0) + v
+    out["by_reason"] = br
+    return out
+
+
+async def _fetch_okx_trade_stats_multi(client: Any, symbols: list) -> Optional[Dict[str, Any]]:
+    """Exchange-truth stats summed across every campaign instrument."""
+    total: Optional[Dict[str, Any]] = None
+    for sym in symbols:
+        st = await _fetch_okx_trade_stats(client, sym)
+        total = _merge_stats(total, st)
+    return total
+
+
 async def _fetch_okx_trade_stats(
     client: Any, symbol: str, max_pages: int = 25,
 ) -> Optional[Dict[str, Any]]:
@@ -1399,7 +1431,16 @@ def _journey_lines(session: Any, cfg: Optional[Dict[str, Any]]) -> list:
     realized net cost per 1M, and projected total fees vs the reward.
     """
     try:
-        summ = session.summary()
+        if isinstance(session, (list, tuple)):
+            summs = [s_.summary() for s_ in session]
+            summ = dict(summs[0])
+            for k in ("volume_usd", "fees_net", "fees_gross", "total_pnl"):
+                summ[k] = sum(float(x.get(k) or 0.0) for x in summs)
+            vol = summ["volume_usd"]
+            summ["net_cost_per_1m"] = (summ["fees_net"] / vol * 1e6) if vol > 0 else 0.0
+            # pace comes from the primary (first) session's controller
+        else:
+            summ = session.summary()
     except Exception:  # noqa: BLE001
         return []
     vol = float(summ.get("volume_usd") or 0.0)
@@ -1546,6 +1587,7 @@ def _build_status_text(
     real_acct: Optional[Dict[str, Any]] = None,
     real_stats: Optional[Dict[str, Any]] = None,
     live_executor: Optional[Any] = None,
+    all_sessions: Optional[list] = None,
 ) -> str:
     _esc = TelegramNotifier.escape
     uptime = _fmt_uptime((datetime.now(tz=timezone.utc) - start_time).total_seconds())
@@ -1566,7 +1608,7 @@ def _build_status_text(
             exec_note = f"\n⛔ entries blocked: `{_esc(str(_br))}`"
         elif _ot is not None and (getattr(_ot, "extras", {}) or {}).get("still_open"):
             exec_note = "\n⏸ gate held: `close unverified — recovery running`"
-    _j = _journey_lines(session, cfg)
+    _j = _journey_lines(all_sessions or session, cfg)
     journey_block = ("\n".join(_j) + "\n") if _j else ""
     is_live = mode_label != "PAPER"
 
@@ -2435,6 +2477,8 @@ async def _handle_command(
     log_dir: Optional[pathlib.Path],
     live_executor: Optional[Any],
     pos_mode: str,
+    symbols: Optional[list] = None,
+    sessions: Optional[list] = None,
 ) -> tuple:
     """Resolve an action to ``(text, buttons)``. ``buttons`` is None for plain cards.
 
@@ -2500,6 +2544,7 @@ async def _handle_command(
     text = await _dispatch_cmd(
         f"cmd_{action}", session, client, symbol, tf, cfg,
         mode_label, bot_label, start_time, log_dir, live_executor,
+        symbols=symbols, sessions=sessions,
     )
     return text, None
 
@@ -2516,16 +2561,21 @@ async def _dispatch_cmd(
     start_time: datetime,
     log_dir: Optional[pathlib.Path] = None,
     live_executor: Optional[Any] = None,
+    symbols: Optional[list] = None,
+    sessions: Optional[list] = None,
 ) -> Optional[str]:
     # In LIVE/DEMO, every card is sourced from the REAL account + real-fill log,
     # fetched once here and threaded into the builders (no paper numbers leak).
     is_live = mode_label != "PAPER"
-    real_acct = await _fetch_real_account(client, symbol) if is_live else None
+    multi = bool(symbols and len(symbols) > 1)
+    # symbol=None → positions across ALL campaign instruments
+    real_acct = await _fetch_real_account(client, None if multi else symbol) if is_live else None
     # Source the trade stats from OKX's own order history (exchange truth);
     # only if that API call fails do we fall back to the local jsonl log.
     real_stats = None
     if is_live:
-        real_stats = await _fetch_okx_trade_stats(client, symbol)
+        real_stats = (await _fetch_okx_trade_stats_multi(client, symbols)
+                      if multi else await _fetch_okx_trade_stats(client, symbol))
         # Read the local jsonl ONCE (it grows for months over a campaign and
         # used to be parsed twice per command): it is both the fallback for
         # the headline stats and the only source of the exit-reason breakdown
@@ -2541,7 +2591,7 @@ async def _dispatch_cmd(
     if data == "cmd_status":
         return _build_status_text(
             session, cfg, mode_label, bot_label, start_time, real_acct, real_stats,
-            live_executor=live_executor,
+            live_executor=live_executor, all_sessions=sessions,
         )
     if data == "cmd_position":
         return await _build_position_text(
@@ -2554,7 +2604,8 @@ async def _dispatch_cmd(
         return _build_trades_text(session, bot_label, real_stats, mode_label)
     if data == "cmd_plan":
         return _build_plan_text(session, cfg, bot_label, mode_label,
-                                real_acct, real_stats, live_executor)
+                                real_acct, real_stats, live_executor,
+                                all_sessions=sessions)
     return None
 
 
@@ -2566,6 +2617,7 @@ def _build_plan_text(
     real_acct: Optional[Dict[str, Any]],
     real_stats: Optional[Dict[str, Any]],
     live_executor: Optional[Any] = None,
+    all_sessions: Optional[list] = None,
 ) -> str:
     """Roadmap-to-5M card: real progress, top-up needed vs the breaker, and the
     safety-net checklist — all from real numbers (or 'unavailable')."""
@@ -2582,7 +2634,8 @@ def _build_plan_text(
     gross_per_1m = maker * 1e6 * 1.05
 
     is_real = mode_label != "PAPER"
-    real_vol = float(real_stats.get("volume", 0.0)) if (is_real and real_stats) else session.total_volume_usd
+    sim_vol = sum(s_.total_volume_usd for s_ in (all_sessions or [session]))
+    real_vol = float(real_stats.get("volume", 0.0)) if (is_real and real_stats) else sim_vol
     wallet = real_acct.get("equity") if (is_real and real_acct) else session.equity
     pct = real_vol / target * 100 if target else 0
     remaining = max(target - real_vol, 0.0)
@@ -2763,6 +2816,8 @@ async def _command_loop(
     log_dir: Optional[pathlib.Path] = None,
     live_executor: Optional[Any] = None,
     pos_mode: str = "net",
+    symbols: Optional[list] = None,
+    sessions: Optional[list] = None,
 ) -> None:
     if not notifier.enabled:
         # CRITICAL: returning here used to end this task, which unblocked
@@ -2812,6 +2867,7 @@ async def _command_loop(
         session=session, client=client, symbol=symbol, tf=tf, cfg=cfg,
         mode_label=mode_label, bot_label=bot_label, start_time=start_time,
         log_dir=log_dir, live_executor=live_executor, pos_mode=pos_mode,
+        symbols=symbols, sessions=sessions,
     )
 
     async def _reply(text: Optional[str], buttons: Optional[list], reply_to: Optional[int]) -> None:
@@ -3068,6 +3124,7 @@ async def _live_ops_loop(
     mode_label: str,
     bot_label: str,
     stop_evt: asyncio.Event,
+    symbols: Optional[list] = None,
 ) -> None:
     """LIVE/DEMO operations watchdog — every number from the REAL exchange.
 
@@ -3166,7 +3223,13 @@ async def _live_ops_loop(
             if wallet is not None:
                 last_wallet = float(wallet)
                 _save_ops()
-            fees24 = await _fees_last_24h(client, symbol)
+            fees24: Optional[float] = 0.0
+            for _sym in (symbols or [symbol]):
+                _f = await _fees_last_24h(client, _sym)
+                if _f is None:
+                    fees24 = None
+                    break
+                fees24 += _f
             rebate24 = fees24 * rebate_pct if fees24 is not None else None
             low_balance = bool(
                 wallet is not None and anchor is not None
@@ -3230,6 +3293,55 @@ async def _live_ops_loop(
             pass
 
 
+async def _target_watcher(
+    notifier: Optional[TelegramNotifier],
+    client: Any,
+    symbols: list,
+    cfg: Dict[str, Any],
+    mode_label: str,
+    bot_label: str,
+    stop_evt: asyncio.Event,
+) -> None:
+    """Stop the campaign when the COMBINED real exchange volume crosses the
+    target (+buffer). With multiple instruments no single session's counter is
+    authoritative — only the summed OKX order history is."""
+    if mode_label == "PAPER":
+        await stop_evt.wait()
+        return
+    tgt = float((cfg.get("target", {}) or {}).get("volume_usd", 0) or 0)
+    buf = float((cfg.get("target", {}) or {}).get("volume_buffer_pct", 0.02))
+    if tgt <= 0:
+        await stop_evt.wait()
+        return
+    _esc = TelegramNotifier.escape
+    while not stop_evt.is_set():
+        try:
+            st = await _fetch_okx_trade_stats_multi(client, symbols)
+            vol = float(st.get("volume", 0.0)) if st else None
+            if vol is not None and vol >= tgt * (1.0 + buf):
+                LOGGER.warning("TARGET REACHED: combined real volume $%.0f >= $%.0f — stopping", vol, tgt)
+                if notifier and notifier.enabled:
+                    try:
+                        await notifier.send_and_get_id(
+                            f"🏁 *TARGET REACHED · {_esc(mode_label)}*\n{_SEP}\n"
+                            f"Combined real volume `${vol:,.0f}` ≥ `${tgt:,.0f}` "
+                            f"\\(\\+{buf*100:.0f}% buffer\\)\n"
+                            f"Campaign complete — stopping the bot\\. Claim the reward\\!\n"
+                            f"{_SEP}\n\\[{_esc(bot_label)}\\]"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                stop_evt.set()
+                return
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("target watcher error: %s", exc)
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=600.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _daily_report_loop(
     notifier: Optional[TelegramNotifier],
     session: "VolumeFarmerSession",
@@ -3239,6 +3351,8 @@ async def _daily_report_loop(
     stop_evt: asyncio.Event,
     client: Any = None,
     symbol_for_report: str = "BTC_USDT",
+    symbols: Optional[list] = None,
+    sessions: Optional[list] = None,
 ) -> None:
     """Send the daily digest at ``notifications.telegram.daily_report_hour`` UTC.
 
@@ -3267,8 +3381,12 @@ async def _daily_report_loop(
                     # stats + real 24h fees. The sim digest under a LIVE header
                     # read as the real account's daily P&L — exactly the
                     # fake-fact class this bot must never emit.
-                    acct = await _fetch_real_account(client, symbol_for_report)
-                    stats = await _fetch_okx_trade_stats(client, symbol_for_report)
+                    _multi = bool(symbols and len(symbols) > 1)
+                    acct = await _fetch_real_account(
+                        client, None if _multi else symbol_for_report)
+                    stats = (await _fetch_okx_trade_stats_multi(client, symbols)
+                             if _multi else
+                             await _fetch_okx_trade_stats(client, symbol_for_report))
                     w = acct.get("equity")
                     lines.append(f"Wallet  `${w:,.4f}`" if w is not None
                                  else "Wallet  `unavailable`")
@@ -3282,7 +3400,13 @@ async def _daily_report_loop(
                         ]
                     else:
                         lines.append("Trade stats  `unavailable` \\(OKX history error\\)")
-                    fees24 = await _fees_last_24h(client, symbol_for_report)
+                    fees24: Optional[float] = 0.0
+                    for _sym in (symbols or [symbol_for_report]):
+                        _f = await _fees_last_24h(client, _sym)
+                        if _f is None:
+                            fees24 = None   # partial data must not look total
+                            break
+                        fees24 += _f
                     if fees24 is not None:
                         reb = fees24 * float((cfg.get("fees", {}) or {}).get("rebate_pct", 0.40))
                         lines.append(f"Fees 24h  `${fees24:,.4f}`  ·  rebate est `${reb:,.2f}`")
@@ -3296,7 +3420,7 @@ async def _daily_report_loop(
                         f"Fees    `${s_sum['fees_gross']:.4f}` gross  ·  `${s_sum['fees_net']:.4f}` net",
                         f"Rebate  accrued `${s_sum['rebate_accrued']:.4f}`  ·  available `${s_sum['rebate_available']:.4f}`",
                     ]
-                lines.extend(_journey_lines(session, cfg))
+                lines.extend(_journey_lines(sessions or session, cfg))
                 lines += [_SEP, f"\\[{_esc(bot_label)}\\]"]
                 await notifier.send_raw("\n".join(lines))
             except Exception as exc:  # noqa: BLE001
@@ -3692,6 +3816,90 @@ async def main_async(args: argparse.Namespace) -> int:
             closed_bars = history[history["closed"]].copy()
             orphan_result = session.reconcile_orphan_position(closed_bars)
 
+        # ---- SECONDARY INSTRUMENTS (e.g. DOGE alongside BTC) ----
+        # Each gets its own session/executor/handler/poll loop; ONE position
+        # at a time account-wide is enforced by the executors' shared peer
+        # registry (primary checked first via the poll stagger).
+        import copy as _copy
+        from dataclasses import replace as _dc_replace
+        sec_stacks: list = []
+        all_sessions = [session]
+        all_symbols = [symbol]
+        for sec in (cfg.get("exchange", {}).get("secondary_symbols") or []):
+            sym2 = str(sec.get("symbol", "")).strip()
+            if not sym2 or sym2 == symbol:
+                continue
+            ov = sec.get("overrides", {}) or {}
+            cfg2 = _copy.deepcopy(cfg)
+            if "tp_mult" in ov:
+                cfg2["farmer"].setdefault("atr", {})["tp_mult"] = float(ov["tp_mult"])
+            if "max_bar_range_bps" in ov:
+                cfg2["farmer"].setdefault("entry", {})["max_bar_range_bps"] = float(ov["max_bar_range_bps"])
+            if "min_vol_ratio" in ov:
+                cfg2["farmer"].setdefault("entry", {})["min_vol_ratio"] = float(ov["min_vol_ratio"])
+            # The PRIMARY owns campaign pacing and the target halt; secondaries
+            # trade at base size and never halt the process on their sim book.
+            cfg2.setdefault("farmer", {}).setdefault("pace", {})["enabled"] = False
+            cfg2.setdefault("risk", {})["stop_on_volume_target"] = False
+            sess2 = VolumeFarmerSession(config=cfg2)
+            state2 = PROJECT_ROOT / f"data/volume_farmer_okx_{args.label or 'paper'}_{sym2.lower()}_state.json"
+            if state2.exists():
+                try:
+                    sess2.load_state(state2)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.error("state load failed for %s (fresh): %s", sym2, exc)
+            ex2 = None
+            if live_executor is not None:
+                ex2 = _dc_replace(
+                    live_executor, symbol=sym2,
+                    on_entry_filled=None, on_entry_abandoned=None,
+                    on_close_confirmed=None, on_close_unverified=None,
+                    on_real_fill=None, on_breaker=None,
+                )
+                await ex2.initialize(leverage_cap=_exchange_lev)
+                ex2.on_entry_filled = _make_entry_filled_callback(
+                    notifier, sym2, mode_label=_exec_mode, bot_label=_exec_lbl,
+                    tf=tf, client=client,
+                )
+                ex2.on_close_confirmed = _make_real_fill_callback(
+                    notifier, sym2, mode_label=_exec_mode, bot_label=_exec_lbl,
+                    client=client, session=sess2, cfg=cfg2,
+                )
+                ex2.on_close_unverified = _make_close_unverified_callback(
+                    notifier, sym2, mode_label=_exec_mode, bot_label=_exec_lbl,
+                    client=client,
+                )
+                ex2.on_breaker = live_executor.on_breaker
+                ex2.on_entry_abandoned = live_executor.on_entry_abandoned
+            try:
+                hist2 = await _seed_history(client, sym2, tf, SEED_CANDLES)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("seed failed for %s — skipping the instrument: %s", sym2, exc)
+                continue
+            if sess2.position is not None:
+                sess2.reconcile_orphan_position(hist2[hist2["closed"]].copy())
+            intrabar2: Dict[str, Any] = {}
+            handler2 = _make_event_handler(log_dir, sym2, sess2, ex2,
+                                           notifier=notifier, mode_label=mode_label,
+                                           client=client, tf=tf,
+                                           bot_label=args.label or "okx-paper",
+                                           intrabar=intrabar2, state_path=state2,
+                                           cfg=cfg2)
+            sess2.event_callback = handler2
+            sec_stacks.append(dict(symbol=sym2, session=sess2, executor=ex2,
+                                   handler=handler2, intrabar=intrabar2,
+                                   state_path=state2, history=hist2))
+            all_sessions.append(sess2)
+            all_symbols.append(sym2)
+            LOGGER.info("secondary instrument armed: %s (tp_mult=%s max_range=%s)",
+                        sym2, cfg2["farmer"]["atr"]["tp_mult"],
+                        cfg2["farmer"]["entry"].get("max_bar_range_bps"))
+        # Shared single-position gate: every executor sees every other.
+        if live_executor is not None:
+            peers = [live_executor] + [st["executor"] for st in sec_stacks if st["executor"] is not None]
+            for e in peers:
+                e.peer_executors = peers
+
         # STARTUP message.
         if notifier.enabled:
             _esc = TelegramNotifier.escape
@@ -3828,6 +4036,16 @@ async def main_async(args: argparse.Namespace) -> int:
             notifier=notifier, mode_label=mode_label,
             bot_label=args.label or "okx-paper", cfg=cfg, intrabar=_intrabar,
         ))
+        sec_poll_tasks = [
+            asyncio.create_task(_poll_loop(
+                client, st["session"], st["symbol"], tf, args.poll_seconds,
+                st["history"], end_at, log_dir, st["handler"],
+                notifier=notifier, mode_label=mode_label,
+                bot_label=args.label or "okx-paper", cfg=cfg,
+                intrabar=st["intrabar"], initial_delay=3.0 * (i + 1),
+            ))
+            for i, st in enumerate(sec_stacks)
+        ]
         cmd_task = asyncio.create_task(_command_loop(
             notifier, session, client, symbol, tf, cfg,
             mode_label, bot_label=args.label or "okx-paper",
@@ -3835,18 +4053,25 @@ async def main_async(args: argparse.Namespace) -> int:
             state_path=state_path,
             log_dir=log_dir, live_executor=live_executor,
             pos_mode=args.pos_mode,
+            symbols=all_symbols, sessions=all_sessions,
         ))
         daily_task = asyncio.create_task(_daily_report_loop(
             notifier, session, cfg, mode_label,
             args.label or "okx-paper", stop_evt,
             client=client, symbol_for_report=symbol,
+            symbols=all_symbols, sessions=all_sessions,
         ))
         ops_task = asyncio.create_task(_live_ops_loop(
             notifier, client, symbol, cfg, mode_label,
+            args.label or "okx-paper", stop_evt, symbols=all_symbols,
+        ))
+        target_task = asyncio.create_task(_target_watcher(
+            notifier, client, all_symbols, cfg, mode_label,
             args.label or "okx-paper", stop_evt,
         ))
         stop_waiter = asyncio.create_task(stop_evt.wait())
-        all_tasks = (poll_task, cmd_task, daily_task, ops_task, stop_waiter)
+        all_tasks = (poll_task, *sec_poll_tasks, cmd_task, daily_task,
+                     ops_task, target_task, stop_waiter)
         crash_exc: Optional[BaseException] = None
         try:
             done, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)

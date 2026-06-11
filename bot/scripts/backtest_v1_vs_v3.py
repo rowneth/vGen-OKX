@@ -87,6 +87,7 @@ async def fetch_bars(days: int, symbol: str = "BTC_USDT") -> pd.DataFrame:
                         "ts": int(r[0]),
                         "open": float(r[1]), "high": float(r[2]),
                         "low": float(r[3]), "close": float(r[4]),
+                        "qvol": float(r[7]),   # quote-ccy (USDT) volume of the bar
                     })
             after = int(raw[-1][0])      # oldest ts of this page → go older
             if len(rows) % 2000 < 100:
@@ -127,6 +128,7 @@ def simulate(df: pd.DataFrame, *, name: str,
              lev: float = 0.0,           # >0 enables intrabar LIQUIDATION modeling
              mmr_buffer: float = 0.005,  # maintenance margin + fee buffer
              liq_penalty_bps: float = 2.0,
+             min_vol_ratio: float = 0.0,    # entry gate: bar qvol >= ratio*median(50)
              max_range_bps: float = 40.0,   # entry gate: skip violent bars
              tp_cap_bps: float = 18.0,      # TP reachability cap
              scratch_slip_bps: float = SCRATCH_SLIP_BPS,
@@ -137,6 +139,11 @@ def simulate(df: pd.DataFrame, *, name: str,
     ts = df["ts"].values
     atr = wilder_atr(df)
     n = len(df)
+    if min_vol_ratio > 0 and "qvol" in df.columns:
+        qv = df["qvol"].rolling(50, min_periods=10).median().values
+        vol_ok = df["qvol"].values >= min_vol_ratio * np.where(np.isnan(qv), np.inf, qv)
+    else:
+        vol_ok = np.ones(n, dtype=bool)
 
     pos = None          # dict(side, entry, tp, sl, bars_held, open_fee_type)
     last_side = "short"  # so an alternating book starts long
@@ -146,6 +153,8 @@ def simulate(df: pd.DataFrame, *, name: str,
     def decide_entry(i: int) -> dict | None:
         nonlocal last_side
         if o[i] <= 0:
+            return None
+        if not vol_ok[i]:
             return None
         rng_bps = abs(c[i] - o[i]) / o[i] * 1e4
         if rng_bps < min_range_bps or rng_bps > max_range_bps:

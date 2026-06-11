@@ -42,8 +42,17 @@ app:
 # IMPORTANT — DEMO FIRST. Run with --demo until a full day looks clean.
 
 exchange:
-  symbol: BTC_USDT
+  symbol: BTC_USDT                 # PRIMARY — checked first every bar
   timeframe: 5m
+  # Secondary instruments fill the primary's quiet gaps. ONE position at a
+  # time account-wide (executors share a global gate; primary has a 3s poll
+  # head-start on shared bar boundaries). Joint backtest 2026-06-11 (60d):
+  # BTC+DOGE @ gate 0.7 → $846k/day at $182.8/1M vs BTC-only $898k at $186.7.
+  secondary_symbols:
+    - symbol: DOGE_USDT
+      overrides:
+        tp_mult: 0.5               # DOGE ATR runs ~23bps; 0.5x lands mid-band
+        max_bar_range_bps: 80.0    # DOGE bars are bigger; 40 would gate most
 
 fees:
   # CORRECTED 2026-06-11 from the live startup fee-tier check: OKX charges this
@@ -144,6 +153,10 @@ farmer:
     mode: micro_momentum
     min_bar_range_bps: 1.0         # dead bars = cheap maker scratches; farm them
     max_bar_range_bps: 40.0        # keep: adverse selection in violent bars
+    # Relative volume gate: skip bars trading under 0.7x the 50-bar median
+    # volume. Backtested: thin bars have the worst maker fills/spreads; with
+    # DOGE as secondary the skipped BTC bars are reused, net +$16 campaign.
+    min_vol_ratio: 0.7
     skip_hours: []                 # volume target beats the ~0.7bps/t saving
 
   # Re-enter on the same bar a position closed (cycle floor 1 bar, not 2).
@@ -196,7 +209,10 @@ risk:
   # ONLY these reasons advance the streak (session AND executor breaker).
   # Time-stop scratches are designed fee-cost exits, not adverse moves.
   consecutive_losses_count_reasons: ["sl", "sl_ambiguous"]
-  stop_on_volume_target: true
+  # Multi-symbol: no single session's SIM counter is authoritative — the
+  # runner's target watcher stops the campaign on COMBINED REAL exchange
+  # volume (sum of all instruments) instead.
+  stop_on_volume_target: false
 
 target:
   volume_usd: 5000000.0
