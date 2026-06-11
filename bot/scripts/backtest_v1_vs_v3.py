@@ -51,16 +51,24 @@ VOL_TARGET = 5_000_000.0
 REWARD = 1_500.0
 CAMPAIGN_DAYS = 30.0
 
-CACHE = pathlib.Path(__file__).resolve().parents[1] / "data" / "btc_5m_backtest_cache.csv"
+_CACHE_DIR = pathlib.Path(__file__).resolve().parents[1] / "data"
+CACHE = _CACHE_DIR / "btc_5m_backtest_cache.csv"   # legacy BTC cache name
 
 
-async def fetch_bars(days: int) -> pd.DataFrame:
+def _cache_for(symbol: str) -> pathlib.Path:
+    if symbol.upper().startswith("BTC"):
+        return CACHE
+    return _CACHE_DIR / f"{symbol.lower()}_5m_backtest_cache.csv"
+
+
+async def fetch_bars(days: int, symbol: str = "BTC_USDT") -> pd.DataFrame:
     """Download `days` of closed 5m candles, oldest→newest, with CSV cache."""
     need = days * 288
-    if CACHE.exists():
-        df = pd.read_csv(CACHE)
+    cache = _cache_for(symbol)
+    if cache.exists():
+        df = pd.read_csv(cache)
         if len(df) >= need:
-            print(f"cache hit: {len(df)} bars from {CACHE.name}")
+            print(f"cache hit: {len(df)} bars from {cache.name}")
             return df.tail(need).reset_index(drop=True)
     rows: list = []
     async with OKXClient() as client:
@@ -68,7 +76,7 @@ async def fetch_bars(days: int) -> pd.DataFrame:
         after = None
         while len(rows) < need + 200:
             raw = await client.get_candles(
-                "BTC_USDT", "5m", limit=100, history=True,
+                symbol, "5m", limit=100, history=True,
                 after=after,
             )
             if not raw:
@@ -85,9 +93,9 @@ async def fetch_bars(days: int) -> pd.DataFrame:
                 print(f"  fetched {len(rows)} bars…")
             await asyncio.sleep(0.12)    # stay under 10 req/2s public limit
     df = pd.DataFrame(rows).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(CACHE, index=False)
-    print(f"downloaded {len(df)} bars → cached")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(cache, index=False)
+    print(f"downloaded {len(df)} bars for {symbol} → cached")
     return df.tail(need).reset_index(drop=True)
 
 
@@ -118,7 +126,12 @@ def simulate(df: pd.DataFrame, *, name: str,
              be_exit_bps: float = 0.0,   # the collapsed target (maker close)
              lev: float = 0.0,           # >0 enables intrabar LIQUIDATION modeling
              mmr_buffer: float = 0.005,  # maintenance margin + fee buffer
-             liq_penalty_bps: float = 2.0) -> dict:
+             liq_penalty_bps: float = 2.0,
+             max_range_bps: float = 40.0,   # entry gate: skip violent bars
+             tp_cap_bps: float = 18.0,      # TP reachability cap
+             scratch_slip_bps: float = SCRATCH_SLIP_BPS,
+             sl_slip_bps: float = SL_SLIP_BPS,
+             entry_slip_bps: float = TAKER_ENTRY_SLIP_BPS) -> dict:
     o = df["open"].values; h = df["high"].values
     l = df["low"].values; c = df["close"].values
     ts = df["ts"].values
@@ -135,7 +148,7 @@ def simulate(df: pd.DataFrame, *, name: str,
         if o[i] <= 0:
             return None
         rng_bps = abs(c[i] - o[i]) / o[i] * 1e4
-        if rng_bps < min_range_bps or rng_bps > 40.0:
+        if rng_bps < min_range_bps or rng_bps > max_range_bps:
             return None
         if atr_min_usd > 0 and (np.isnan(atr[i]) or atr[i] < atr_min_usd):
             return None
@@ -146,7 +159,7 @@ def simulate(df: pd.DataFrame, *, name: str,
             tp_bps = 12.0
         else:  # v3: ATR-relative, fee floor = 2*round_trip+2, cap 18
             rt_bps = MAKER_NET * 2 * 1e4
-            tp_bps = min(max(max(6.0, tp_atr_mult * atr_bps), 2*rt_bps + 2.0), 18.0)
+            tp_bps = min(max(max(6.0, tp_atr_mult * atr_bps), 2*rt_bps + 2.0), tp_cap_bps)
         if alternate:
             side = "short" if last_side == "long" else "long"
         else:
@@ -186,7 +199,7 @@ def simulate(df: pd.DataFrame, *, name: str,
                 else (h[i] >= pending["entry"])
             pending["open_fee_type"] = "maker" if touched else "taker"
             if not touched:  # taker fallback slips slightly against us
-                adj = pending["entry"] * (TAKER_ENTRY_SLIP_BPS / 1e4)
+                adj = pending["entry"] * (entry_slip_bps / 1e4)
                 pending["entry"] += adj if pending["side"] == "long" else -adj
             pending["bars_held"] = 0
             pos = pending
@@ -231,7 +244,7 @@ def simulate(df: pd.DataFrame, *, name: str,
                     # penalty, taker-fee'd — strictly worse than any stop.
                     slip = adverse_px * (liq_penalty_bps / 1e4)
                 else:
-                    slip = adverse_px * (SL_SLIP_BPS / 1e4)
+                    slip = adverse_px * (sl_slip_bps / 1e4)
                 px = adverse_px - slip if long else adverse_px + slip
                 close_trade(pos, px, adverse_reason, "taker")
                 pos = None; closed_this_bar = True
@@ -240,7 +253,7 @@ def simulate(df: pd.DataFrame, *, name: str,
                 pos = None; closed_this_bar = True
             elif (be_seek_bars > 0 and pos["bars_held"] >= 1 + be_seek_bars) or \
                  (be_seek_bars == 0 and time_stop_bars > 0 and pos["bars_held"] >= time_stop_bars):
-                slip = c[i] * (SCRATCH_SLIP_BPS / 1e4)
+                slip = c[i] * (scratch_slip_bps / 1e4)
                 px = c[i] - slip if long else c[i] + slip
                 close_trade(pos, px, "time_stop", "maker")
                 pos = None; closed_this_bar = True
