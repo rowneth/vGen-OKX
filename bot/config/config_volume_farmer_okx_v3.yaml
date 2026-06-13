@@ -66,11 +66,16 @@ fees:
   # if the 20%-off is also cashed back (40% total), bump this to 0.40 so the
   # cost display and the recycle-ask amounts are exact. Net at 20%: ~$160/1M;
   # at 40%: ~$126/1M.
-  maker: 0.0002                    # 0.020% — what OKX actually charges (verified)
-  taker: 0.0005                    # 0.050% — what OKX actually charges (verified)
-  rebate_pct: 0.40                 # user-confirmed 2026-06-11: 40% of fees come back
-                                   # (20%-off deal pays as cashback + 20% rebate)
-  rebate_all_legs: true            # rebate applies to maker AND taker legs
+  maker: 0.0002                    # 0.020% — full rate CHARGED at execution (verified
+  taker: 0.0005                    # 0.050%   from real fills: $0.269194 / $1345.97 = 2.0bps)
+  # rebate_pct = TOTAL fraction of paid fees returned to you (any source).
+  # User-stated 2026-06-13: rebate is 20% (the "20% off on fees" is a SEPARATE
+  # credit — if it ALSO returns as cash, true recovery is 40% and this should
+  # be 0.40). 0.20 is the CONSERVATIVE setting: under-stating recovery only
+  # makes the TP floor safer (8.4bps) and the cost display honest, whereas
+  # over-stating it would book tiny-loss TPs as wins. Net cost ~$160/1M @20%.
+  rebate_pct: 0.20
+  rebate_all_legs: true            # the 20% applies to maker AND taker legs
 
 farmer:
   capital_usd: 500.0               # sim equity (paper bookkeeping view)
