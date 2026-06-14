@@ -271,6 +271,14 @@ class LiveVolumeExecutorOKX:
     # BTC/DOGE loss streak never tripped the cooldown.
     breaker_delegate: Optional["LiveVolumeExecutorOKX"] = None
 
+    # MILESTONE 0 — process-wide kill switch (file-backed). When engaged, every
+    # live entry is blocked here, the single sync chokepoint. Shared across all
+    # symbol executors so one /kill halts the whole account. None = no switch.
+    kill_switch: Optional[Any] = None
+    # Wall-clock of the last CONFIRMED entry fill — read by the dead-man monitor
+    # (no confirmed trade in N hours on --live => something is wedged => halt).
+    _last_fill_wall: float = field(default=0.0, init=False)
+
     # ------------------------------------------------------------------
     # REAL-WALLET circuit breaker. Unlike the session's paper-equity guards,
     # these gate live entries on the ACTUAL OKX balance and real per-trade P&L:
@@ -574,6 +582,12 @@ class LiveVolumeExecutorOKX:
         Sync (called from the sync entry hook). Reads only local breaker state;
         the state itself is refreshed from the live wallet on each close.
         """
+        # Kill switch is process-wide and checked on EVERY executor (not via the
+        # delegate) so an engaged halt blocks entries regardless of which symbol
+        # asks. Cheapest possible guard — a file existence check, entries are
+        # minutes apart.
+        if self.kill_switch is not None and self.kill_switch.is_engaged():
+            return f"killed:{self.kill_switch.reason() or 'manual'}"
         if self.breaker_delegate is not None and self.breaker_delegate is not self:
             return self.breaker_delegate._entry_blocked_reason()  # noqa: SLF001
         if self._hard_halted:
@@ -1116,6 +1130,7 @@ class LiveVolumeExecutorOKX:
         # exists). The fill — not the placement attempt — consumes the
         # max_live_trades budget, so a string of no-fills can't exhaust it.
         self._trade_count += 1
+        self._last_fill_wall = time.time()   # dead-man monitor heartbeat
         # Rest the maker TP IMMEDIATELY (before the watch) so it's in the book
         # the instant price can reach it — fills as maker instead of the
         # attached trigger-TP's taker-on-gap. No-op when resting_tp is off.
@@ -1187,6 +1202,7 @@ class LiveVolumeExecutorOKX:
                 od = (r.get("data") or [{}])[0]
                 if self._adopt_order_fill(trade, od, note="unswept-recovery"):
                     self._trade_count += 1
+                    self._last_fill_wall = time.time()
                     await self._place_resting_tp(trade)
                     self._spawn(self._fire_entry_filled(trade), name="entry_card")
                     await self._watch_open_position(trade)
@@ -1216,6 +1232,7 @@ class LiveVolumeExecutorOKX:
                 od = (r.get("data") or [{}])[0]
                 if self._adopt_order_fill(trade, od, note="unswept-recovery-slow"):
                     self._trade_count += 1
+                    self._last_fill_wall = time.time()
                     await self._place_resting_tp(trade)
                     self._spawn(self._fire_entry_filled(trade), name="entry_card")
                     await self._watch_open_position(trade)

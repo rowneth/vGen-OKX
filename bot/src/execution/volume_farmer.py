@@ -251,6 +251,17 @@ class VolumeFarmerSession:
 		self._pace_min_frac = float(pace_cfg.get("min_margin_fraction", self._margin_frac * 0.5))
 		self._pace_max_frac = float(pace_cfg.get("max_margin_fraction", self._margin_frac * 2.0))
 		self._pace_warmup_trips = int(pace_cfg.get("warmup_trips", 10))
+		# MILESTONE 0 — bound the pace catch-up factor, ramped by campaign age so a
+		# near-zero achieved-rate on a cold start can't panic-size on day 1. The
+		# divide (required/achieved) can spike huge in the first hours; these
+		# ceilings cap it low early, opening up to the steady ceiling after day 2.
+		self._pace_factor_ceiling = float(pace_cfg.get("factor_ceiling", 3.0))
+		self._pace_factor_ceiling_day1 = float(pace_cfg.get("factor_ceiling_day1", 1.5))
+		self._pace_factor_ceiling_day2 = float(pace_cfg.get("factor_ceiling_day2", 2.0))
+		# MILESTONE 0 — hard ceiling on the ATR-derived SL (bps). 9xATR is a
+		# disaster floor by design; this only catches an absurd value (bad ATR /
+		# data glitch) becoming a >cap% stop. Default 1000bps (10%).
+		self._sl_bps_cap = float((f.get("atr", {}) or {}).get("sl_bps_cap", 1000.0))
 		self._last_pace: Dict[str, Any] = {}
 		# Auto rebate-top-up reminder: pings configured members on Telegram
 		# when the wallet looks shaky and there's enough available rebate to
@@ -333,6 +344,9 @@ class VolumeFarmerSession:
 		else:
 			self._pending_tp_bps = self._apply_tp_floor_cap(self._tp_bps)
 			self._pending_sl_bps = self._sl_bps
+		# MILESTONE 0 — clamp the SL to its hard ceiling (defense in depth: a bad
+		# ATR can't size a runaway stop). Applies to both ATR and fixed branches.
+		self._pending_sl_bps = min(self._pending_sl_bps, self._sl_bps_cap)
 		# Firm effective-TP override — pin TP after the ATR bracket + floor/cap
 		# so nothing downstream can drift it. SL stays ATR-relative.
 		if self._force_tp_bps > 0:
@@ -649,7 +663,16 @@ class VolumeFarmerSession:
 			return self._pace_min_frac
 		if self.round_trips < self._pace_warmup_trips or elapsed_days < 0.5 or achieved_per_day <= 0:
 			return base
-		factor = max(0.5, min(required_per_day / achieved_per_day, 3.0))
+		# Age-ramped ceiling: cold-start hours have a tiny achieved_per_day, so
+		# required/achieved can explode — cap it low on day 1-2, open to the
+		# steady ceiling after. (min_margin/max_margin still bound the result.)
+		if elapsed_days < 1.0:
+			ceiling = self._pace_factor_ceiling_day1
+		elif elapsed_days < 2.0:
+			ceiling = self._pace_factor_ceiling_day2
+		else:
+			ceiling = self._pace_factor_ceiling
+		factor = max(0.5, min(required_per_day / achieved_per_day, ceiling))
 		frac = max(self._pace_min_frac, min(base * factor, self._pace_max_frac))
 		self._last_pace["margin_fraction"] = round(frac, 5)
 		return frac

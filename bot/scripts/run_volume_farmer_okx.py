@@ -50,6 +50,13 @@ from execution.live_volume_executor_okx import (  # noqa: E402
     _round_to_tick,
 )
 from execution.maker_exit import MakerExitConfig  # noqa: E402
+from execution.safety import (  # noqa: E402
+    KillSwitch,
+    atr_bps_median,
+    check_liquidation_safety,
+    deadman_idle_exceeded,
+    validate_config,
+)
 from execution.volume_farmer import FarmerEvent, VolumeFarmerSession  # noqa: E402
 from monitoring.telegram_notifier import TelegramNotifier  # noqa: E402
 
@@ -2882,6 +2889,7 @@ async def _command_loop(
     symbols: Optional[list] = None,
     sessions: Optional[list] = None,
     executors: Optional[Dict[str, Any]] = None,
+    kill_switch: Optional[Any] = None,
 ) -> None:
     if not notifier.enabled:
         # CRITICAL: returning here used to end this task, which unblocked
@@ -2994,6 +3002,48 @@ async def _command_loop(
         _tasks.add(t)
         t.add_done_callback(_tasks.discard)
 
+    # MILESTONE 0 — kill switch over Telegram. /kill is two-tap (command then a
+    # CONFIRM button); /resume needs the typed token (two messages + token) so a
+    # stray tap can't un-halt a real-money bot.
+    _RESUME_TOKEN = "RESUME"
+
+    async def _send_kill_prompt(reply_to: Optional[int]) -> None:
+        await notifier.send_with_buttons(
+            f"⚠️ *Confirm KILL · {_esc(mode_label)}*\n{_SEP}\n"
+            f"{_esc('This halts ALL new entries immediately and persists across restarts. Open positions keep their stops. Tap to confirm.')}\n"
+            f"{_SEP}\n\\[{_esc(bot_label)}\\]",
+            [[{"text": "🛑 CONFIRM KILL", "callback_data": "kill_confirm"}]],
+            reply_to_message_id=reply_to,
+        )
+
+    async def _do_kill_confirm(reply_to: Optional[int]) -> None:
+        if kill_switch is None:
+            await _reply(f"⚠️ {_esc('kill switch unavailable')}", None, reply_to)
+            return
+        kill_switch.engage("manual /kill")
+        await notifier.send_raw(
+            f"🛑 *KILLED — entries halted · {_esc(mode_label)}*\n{_SEP}\n"
+            f"{_esc('New entries are blocked. Send /resume ' + _RESUME_TOKEN + ' to clear.')}\n"
+            f"{_SEP}\n\\[{_esc(bot_label)}\\]")
+
+    async def _do_resume(raw_text: str, reply_to: Optional[int]) -> None:
+        if kill_switch is None:
+            await _reply(f"⚠️ {_esc('kill switch unavailable')}", None, reply_to)
+            return
+        parts = raw_text.split()
+        token = parts[1] if len(parts) > 1 else ""
+        if token != _RESUME_TOKEN:
+            await _reply(
+                f"⚠️ *Resume needs the token*\n{_SEP}\n"
+                f"{_esc('Send  /resume ' + _RESUME_TOKEN + '  to clear the kill switch.')}\n"
+                f"{_SEP}\n\\[{_esc(bot_label)}\\]", None, reply_to)
+            return
+        cleared = kill_switch.clear()
+        await _reply(
+            (f"✅ *Resumed — entries enabled*\n" if cleared
+             else f"ℹ️ *Already clear*\n") +
+            f"{_SEP}\n\\[{_esc(bot_label)}\\]", None, reply_to)
+
     while not stop_evt.is_set():
         try:
             updates = await notifier.get_updates(offset=offset, timeout=20)
@@ -3022,6 +3072,10 @@ async def _command_loop(
                     continue
                 data = cq.get("data", "") or ""
                 await notifier.answer_callback(cq_id)
+                tapped = (cq.get("message") or {}).get("message_id") or menu_msg_id
+                if data == "kill_confirm":
+                    _spawn(_do_kill_confirm(tapped))
+                    continue
                 action = data[4:] if data.startswith("cmd_") else data
                 # Thread the reply under the message whose button was tapped
                 # (e.g. an EXIT-FAILED card), not the day-old Controls menu.
@@ -3035,7 +3089,11 @@ async def _command_loop(
                     continue
                 cmd = raw_text.split()[0].lstrip("/").split("@")[0].lower()
                 reply_to = msg.get("message_id")
-                if cmd == "rebate":
+                if cmd == "kill":
+                    _spawn(_send_kill_prompt(reply_to))
+                elif cmd == "resume":
+                    _spawn(_do_resume(raw_text, reply_to))
+                elif cmd == "rebate":
                     _spawn(_dispatch("rebate", raw_text, reply_to))
                 elif cmd == "close":
                     parts = raw_text.split()
@@ -3496,6 +3554,63 @@ async def _daily_report_loop(
             pass
 
 
+async def _deadman_loop(
+    notifier: Optional[TelegramNotifier],
+    executors: list,
+    kill_switch: Any,
+    bot_label: str,
+    stop_evt: asyncio.Event,
+    *,
+    idle_hours: float,
+    start_wall: float,
+) -> None:
+    """Dead-man monitor (LIVE only): at this trade frequency (~one entry every
+    few minutes) a multi-hour gap with ZERO confirmed fills means something is
+    wedged (dead feed, stuck gate, revoked key). Engage the kill switch and
+    alert; the operator investigates and /resumes. ``idle_hours <= 0`` disables.
+    """
+    if idle_hours <= 0 or kill_switch is None or not executors:
+        return
+    idle_s = idle_hours * 3600.0
+    primary = executors[0]
+    # Baseline is refreshed whenever entries are LEGITIMATELY blocked (a daily
+    # halt runs to UTC midnight, a loss-streak cooldown to its timeout) so those
+    # expected-idle windows never trip the dead-man. Re-arms after /resume via
+    # the is_engaged() skip — no sticky 'fired' flag.
+    last_blocked_seen = start_wall
+    while not stop_evt.is_set():
+        try:
+            await asyncio.wait_for(stop_evt.wait(), timeout=300.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+        if kill_switch.is_engaged():
+            continue
+        now = time.time()
+        try:
+            blocked = primary._entry_blocked_reason()  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            blocked = None
+        if blocked is not None:
+            last_blocked_seen = now      # gate intentionally shut — not a wedge
+            continue
+        last_fill = max((float(getattr(ex, "_last_fill_wall", 0.0) or 0.0)
+                         for ex in executors), default=0.0)
+        if deadman_idle_exceeded(now, last_fill, last_blocked_seen, start_wall, idle_s):
+            kill_switch.engage(f"deadman: no confirmed trade in {idle_hours:g}h (gate open)")
+            LOGGER.error("DEAD-MAN: gate open but no confirmed fill in %.1fh — kill switch engaged",
+                         idle_hours)
+            if notifier is not None and notifier.enabled:
+                try:
+                    _esc = TelegramNotifier.escape
+                    await notifier.send_raw(
+                        f"🛑 *DEAD\\-MAN TRIGGERED — entries halted*\n{_SEP}\n"
+                        f"{_esc(f'Gate open but no confirmed trade in {idle_hours:g}h — likely a wedged feed/gate/auth. Investigate, then send /resume RESUME.')}\n"
+                        f"{_SEP}\n\\[{_esc(bot_label)}\\]")
+                except Exception:  # noqa: BLE001
+                    pass
+
+
 async def main_async(args: argparse.Namespace) -> int:
     cfg_path = pathlib.Path(args.config)
     if not cfg_path.is_absolute():
@@ -3542,6 +3657,28 @@ async def main_async(args: argparse.Namespace) -> int:
         notifier._enabled = False  # noqa: SLF001
     if notifier.enabled:
         await notifier.start()
+
+    # MILESTONE 0 — config schema validation. Block startup on any violation so a
+    # typo or out-of-bounds safety param can never reach a real order. MUST pass
+    # for the shipped config; only genuinely-unsafe edits are rejected.
+    _cfg_errors = validate_config(cfg)
+    if _cfg_errors:
+        for _e in _cfg_errors:
+            LOGGER.error("CONFIG INVALID: %s", _e)
+        if notifier.enabled:
+            try:
+                _esc0 = TelegramNotifier.escape
+                _body = "\n".join(f"• {_esc0(e)}" for e in _cfg_errors[:12])
+                await notifier.send_raw(
+                    f"🛑 *CONFIG INVALID — refusing to start*\n{_SEP}\n{_body}\n"
+                    f"{_SEP}\n\\[{_esc0(args.label or 'okx')}\\]")
+            except Exception:  # noqa: BLE001
+                pass
+        return 2
+
+    # MILESTONE 0 — process-wide kill switch. The flag persists across restarts:
+    # a /kill (or a startup-detected flag) blocks every live entry until /resume.
+    kill_switch = KillSwitch(log_dir / f"halt_{args.label or 'okx'}.flag")
 
     _intrabar: Dict[str, Any] = {}  # shared state: poll loop ↔ event handler
 
@@ -3681,6 +3818,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 bar_seconds=int(ts_cfg.get("bar_seconds", tf_seconds)),
                 maker_exit_enabled=bool(mx_cfg.get("enabled", False)),
                 resting_tp_enabled=bool(rtp_cfg.get("enabled", False)),
+                kill_switch=kill_switch,
                 maker_exit_cfg=MakerExitConfig(
                     repeg_ms=int(mx_cfg.get("repeg_ms", 750)),
                     max_repegs=int(mx_cfg.get("max_repegs", 8)),
@@ -4111,6 +4249,58 @@ async def main_async(args: argparse.Namespace) -> int:
                     f"\\[{_esc_resume(_bot_lbl)}\\]"
                 )
 
+        # MILESTONE 0 — startup liquidation-safety check (per symbol, on the
+        # seeded candles). Blocks startup if the configured stop sits too close
+        # to the liq line at TYPICAL volatility (a genuine over-leverage misconfig);
+        # the disaster-floor tail is reported as a warning, not a block.
+        _atr_period = int((cfg.get("farmer", {}).get("atr", {}) or {}).get("period", 14))
+        _sl_mult = float((cfg.get("farmer", {}).get("atr", {}) or {}).get("sl_mult", 9.0))
+        _max_lev = float((cfg.get("farmer", {}).get("sizing", {}) or {}).get("max_leverage", 15))
+        _hist_by_symbol = [(symbol, history)] + [
+            (st["symbol"], st["history"]) for st in sec_stacks
+            if st.get("history") is not None
+        ]
+        _liq_errs: list = []
+        _liq_warns: list = []
+        for _sym, _hist in _hist_by_symbol:
+            _med = atr_bps_median(_hist, _atr_period)
+            _e, _w = check_liquidation_safety(
+                _sym, _med, max_leverage=_max_lev, sl_mult=_sl_mult, safety_factor=2.0)
+            _liq_errs.extend(_e)
+            _liq_warns.extend(_w)
+        for _w in _liq_warns:
+            LOGGER.warning("LIQ-SAFETY: %s", _w)
+        if _liq_errs:
+            for _e in _liq_errs:
+                LOGGER.error("LIQ-SAFETY VIOLATION: %s", _e)
+            if notifier.enabled:
+                try:
+                    _esc1 = TelegramNotifier.escape
+                    _body = "\n".join(f"• {_esc1(e)}" for e in _liq_errs[:8])
+                    await notifier.send_raw(
+                        f"🛑 *LIQUIDATION-SAFETY — refusing to start*\n{_SEP}\n{_body}\n"
+                        f"{_SEP}\n\\[{_esc1(args.label or 'okx')}\\]")
+                except Exception:  # noqa: BLE001
+                    pass
+            return 2
+
+        # MILESTONE 0 — if a kill switch is engaged (a prior /kill, or a crash
+        # while halted), refuse to trade: entries are already blocked at the gate;
+        # alert the operator that /resume is required.
+        if kill_switch.is_engaged():
+            LOGGER.warning("KILL SWITCH ENGAGED at startup (%s) — entries blocked until /resume",
+                           kill_switch.reason())
+            if notifier.enabled:
+                try:
+                    _esc2 = TelegramNotifier.escape
+                    await notifier.send_raw(
+                        f"🛑 *KILL SWITCH ENGAGED — entries blocked*\n{_SEP}\n"
+                        f"Reason  `{_esc2(kill_switch.reason() or 'manual')}`\n"
+                        f"{_esc2('Send /resume to clear and allow entries.')}\n"
+                        f"{_SEP}\n\\[{_esc2(args.label or 'okx')}\\]")
+                except Exception:  # noqa: BLE001
+                    pass
+
         # Startup sweep of dangling resting LIMIT orders (live only). A crash
         # after a resting maker-TP (or a maker-exit limit) was placed, where the
         # position then closed while the bot was down, leaves that reduce-only
@@ -4160,6 +4350,7 @@ async def main_async(args: argparse.Namespace) -> int:
             symbols=all_symbols, sessions=all_sessions,
             executors={symbol: live_executor,
                        **{st["symbol"]: st["executor"] for st in sec_stacks}},
+            kill_switch=kill_switch,
         ))
         daily_task = asyncio.create_task(_daily_report_loop(
             notifier, session, cfg, mode_label,
@@ -4175,9 +4366,18 @@ async def main_async(args: argparse.Namespace) -> int:
             notifier, client, all_symbols, cfg, mode_label,
             args.label or "okx-paper", stop_evt,
         ))
+        # MILESTONE 0 — dead-man monitor (LIVE only). Halts entries if no
+        # confirmed trade lands within deadman_hours (default 3h).
+        _deadman_hours = float((cfg.get("farmer", {}).get("safety", {}) or {}).get("deadman_hours", 3.0))
+        _exec_list = [live_executor] + [st["executor"] for st in sec_stacks if st.get("executor")]
+        deadman_task = asyncio.create_task(_deadman_loop(
+            notifier, _exec_list if args.live else [], kill_switch,
+            args.label or "okx-paper", stop_evt,
+            idle_hours=_deadman_hours, start_wall=start_time.timestamp(),
+        ))
         stop_waiter = asyncio.create_task(stop_evt.wait())
         all_tasks = (poll_task, *sec_poll_tasks, cmd_task, daily_task,
-                     ops_task, target_task, stop_waiter)
+                     ops_task, target_task, deadman_task, stop_waiter)
         crash_exc: Optional[BaseException] = None
         try:
             done, _ = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)

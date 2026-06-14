@@ -115,6 +115,19 @@ farmer:
     max_margin_fraction: 0.20      # $4,500/leg catch-up ceiling (lev stays 15x:
                                    # notional never moves the liquidation line)
     warmup_trips: 10
+    # MILESTONE 0 — age-ramped ceiling on the catch-up factor. Cold-start hours
+    # have a tiny achieved-rate, so required/achieved can spike; cap it low on
+    # day 1-2, then open to the steady ceiling. (min/max_margin still bound it.)
+    factor_ceiling_day1: 1.5
+    factor_ceiling_day2: 2.0
+    factor_ceiling: 3.0
+
+  # MILESTONE 0 — safety rails.
+  safety:
+    # Dead-man: LIVE only. If no confirmed trade lands in this many hours, the
+    # bot engages the kill switch (entries halt, /resume to clear). At ~250
+    # trades/day a multi-hour gap means something is wedged. 0 disables.
+    deadman_hours: 3.0
 
   # Fallback fixed TP/SL (used when atr.relative = false)
   tp_bps: 8.0
@@ -213,6 +226,9 @@ farmer:
     tp_fee_cover_mult: 2.0         # floor = 2.0*2.4 + 2.0 = 6.8bps
     tp_profit_buffer_bps: 2.0
     tp_bps_max: 18.0               # reachability collapses past ~18bps @ 1 bar
+    sl_bps_cap: 1000.0             # MILESTONE 0 hard ceiling (10%) — 9xATR is a
+                                   # disaster floor; this only catches an absurd
+                                   # value from a bad ATR / data glitch
 
   trend_break:
     enabled: false
