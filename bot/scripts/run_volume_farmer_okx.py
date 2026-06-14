@@ -3639,6 +3639,7 @@ async def main_async(args: argparse.Namespace) -> int:
             ts_cfg = farmer_cfg.get("time_stop", {}) or {}
             mx_cfg = farmer_cfg.get("maker_exit", {}) or {}
             er_cfg = farmer_cfg.get("entry_repeg", {}) or {}
+            rtp_cfg = farmer_cfg.get("resting_tp", {}) or {}
             risk_cfg = cfg.get("risk", {}) or {}
             tf_seconds = _parse_timeframe_seconds(tf)
             # DEMO realism overlay — constructed ONLY in simulated mode so it can
@@ -3679,6 +3680,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 )),
                 bar_seconds=int(ts_cfg.get("bar_seconds", tf_seconds)),
                 maker_exit_enabled=bool(mx_cfg.get("enabled", False)),
+                resting_tp_enabled=bool(rtp_cfg.get("enabled", False)),
                 maker_exit_cfg=MakerExitConfig(
                     repeg_ms=int(mx_cfg.get("repeg_ms", 750)),
                     max_repegs=int(mx_cfg.get("max_repegs", 8)),
@@ -4108,6 +4110,28 @@ async def main_async(args: argparse.Namespace) -> int:
                     f"{_SEP}\n"
                     f"\\[{_esc_resume(_bot_lbl)}\\]"
                 )
+
+        # Startup sweep of dangling resting LIMIT orders (live only). A crash
+        # after a resting maker-TP (or a maker-exit limit) was placed, where the
+        # position then closed while the bot was down, leaves that reduce-only
+        # order orphaned on the book — its in-process watcher died with the
+        # process. reduce_only means it can never open a naked position, but it
+        # could still partial-reduce a FUTURE same-side entry, so clear it for a
+        # clean slate. SL-SAFE: get_pending_orders returns regular orders only;
+        # the protective SL is an attached ALGO (get_pending_algos), never touched.
+        if live_executor is not None:
+            for _sweep_sym in all_symbols:
+                try:
+                    _pend = await client.get_pending_orders(_sweep_sym)
+                    for _o in (_pend.get("data") or []):
+                        _oid = _o.get("ordId")
+                        if not _oid:
+                            continue
+                        await client.cancel_order(_sweep_sym, ord_id=_oid)
+                        LOGGER.warning("startup sweep: cancelled dangling order %s on %s",
+                                       _oid, _sweep_sym)
+                except Exception as _exc:  # noqa: BLE001
+                    LOGGER.debug("startup sweep for %s failed (continuing): %s", _sweep_sym, _exc)
 
         start_time = datetime.now(tz=timezone.utc)
         poll_task = asyncio.create_task(_poll_loop(

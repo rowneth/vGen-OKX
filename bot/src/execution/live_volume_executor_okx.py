@@ -201,6 +201,14 @@ class LiveVolumeExecutorOKX:
     # time-stop path uses it instead of a market close.
     maker_exit_enabled: bool = False
     maker_exit_cfg: MakerExitConfig = field(default_factory=MakerExitConfig)
+    # Feature 3 — RESTING maker TP. The attached trigger-TP fires a limit only
+    # when price touches the trigger; on a gap that limit is already marketable
+    # and fills TAKER (live: ~47% of TP wins leaked taker). When enabled, the
+    # entry attaches ONLY the market SL, and a reduce-only POST_ONLY limit is
+    # rested at tp_px the moment the entry fills — it sits in the book and fills
+    # as MAKER by construction (post_only is rejected if it would cross).
+    # Backtested 2026-06-14: TP-taker 47%->0%, fill-rate -2-3%, ~$7-18/1M saved.
+    resting_tp_enabled: bool = False
     # Entry re-peg loop (B). When enabled, replaces the single-shot post_only
     # entry with a re-peg loop that follows the touch. Solves the post_only
     # timeout-cancel problem in trending markets where the bar-close reference
@@ -961,6 +969,68 @@ class LiveVolumeExecutorOKX:
         )
         return trade, ok_side, pos_side, sz_payload
 
+    def _attach_tp_args(self, tp_px_r: float) -> Dict[str, Any]:
+        """TP attachment for the entry order. With resting_tp on, the TP is a
+        SEPARATE resting post_only order placed after fill (always maker), so
+        the entry attaches ONLY the SL — no trigger-TP (those fill taker on a
+        gap). With it off, the legacy attached trigger-limit TP."""
+        if self.resting_tp_enabled:
+            return {"tp_trigger_px": None, "tp_ord_px": None}
+        return {"tp_trigger_px": str(tp_px_r), "tp_ord_px": str(tp_px_r)}
+
+    async def _place_resting_tp(self, trade: LiveTradeOKX) -> None:
+        """Rest a reduce-only post_only limit at tp_px so a winning close fills
+        MAKER. Stores the ordId for cancellation on any non-TP exit. If the
+        price has ALREADY gapped past the TP (post_only would cross), capture
+        the profit immediately at market rather than give it back."""
+        if not self.resting_tp_enabled or self.dry_run or trade.tp_px <= 0:
+            return
+        side = "sell" if trade.side == "long" else "buy"
+        pos_side = trade.side if self.pos_mode == "hedge" else None
+        cl = "vftp" + uuid.uuid4().hex[:12]
+        sz = _fmt_size(trade.sz_contracts, self._lot_sz)
+        px = str(_round_to_tick(trade.tp_px, self._tick_sz))
+        try:
+            resp = await self.client.place_order(
+                symbol=self.symbol, side=side, pos_side=pos_side,
+                td_mode=self.mgn_mode, ord_type="post_only", sz=sz, px=px,
+                client_oid=cl, reduce_only=True,
+            )
+            data = (resp.get("data") or [{}])[0]
+            sc = str(data.get("sCode", "0"))
+            if sc == "0":
+                trade.extras["resting_tp_ord_id"] = data.get("ordId")
+                LOGGER.info("resting TP placed: %s %s @ %s ordId=%s",
+                            side, sz, px, data.get("ordId"))
+            elif sc == "51280":
+                # would cross → price already past TP → we're in profit; take it.
+                LOGGER.info("resting TP would cross (price past TP) — market-taking profit (cid=%s)",
+                            trade.cl_ord_id)
+                try:
+                    await self.client.close_position_market(
+                        self.symbol, mgn_mode=self.mgn_mode, pos_side=pos_side, auto_cxl=True)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("resting TP profit-take market close failed: %s", exc)
+            else:
+                LOGGER.warning("resting TP rejected sCode=%s sMsg=%r (the time-stop will exit)",
+                               sc, data.get("sMsg"))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("resting TP placement failed (time-stop will exit): %s", exc)
+
+    async def _cancel_resting_tp(self, trade: LiveTradeOKX) -> None:
+        """Cancel the resting TP if still open. Idempotent — a no-op (or a
+        harmless 'already filled/canceled' error) once it has filled. MUST run
+        on every non-TP exit so a stale reduce-only order can't fill against a
+        later position."""
+        oid = trade.extras.pop("resting_tp_ord_id", None)
+        if not oid:
+            return
+        try:
+            await self.client.cancel_order(self.symbol, ord_id=oid)
+            LOGGER.debug("resting TP cancelled ordId=%s", oid)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("resting TP cancel (likely already filled/gone): %s", exc)
+
     async def _submit_and_watch(
         self, trade: LiveTradeOKX, payload: Dict[str, Any],
         ok_side: str, pos_side: Optional[str], sz_payload: str,
@@ -1012,7 +1082,7 @@ class LiveVolumeExecutorOKX:
                     td_mode=self.mgn_mode, ord_type="post_only",
                     sz=sz_payload, px=str(entry_px),
                     client_oid=trade.cl_ord_id,
-                    tp_trigger_px=str(tp_px_r), tp_ord_px=str(tp_px_r),
+                    **self._attach_tp_args(tp_px_r),
                     sl_trigger_px=str(sl_px_r), sl_ord_px="-1",
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1046,6 +1116,10 @@ class LiveVolumeExecutorOKX:
         # exists). The fill — not the placement attempt — consumes the
         # max_live_trades budget, so a string of no-fills can't exhaust it.
         self._trade_count += 1
+        # Rest the maker TP IMMEDIATELY (before the watch) so it's in the book
+        # the instant price can reach it — fills as maker instead of the
+        # attached trigger-TP's taker-on-gap. No-op when resting_tp is off.
+        await self._place_resting_tp(trade)
         # Fire the entry card CONCURRENTLY — the card does a chart render +
         # account fetch + photo upload (up to callback_timeout_s); awaiting it
         # here used to delay the first position poll, so a fast TP inside that
@@ -1113,6 +1187,7 @@ class LiveVolumeExecutorOKX:
                 od = (r.get("data") or [{}])[0]
                 if self._adopt_order_fill(trade, od, note="unswept-recovery"):
                     self._trade_count += 1
+                    await self._place_resting_tp(trade)
                     self._spawn(self._fire_entry_filled(trade), name="entry_card")
                     await self._watch_open_position(trade)
                     return
@@ -1141,6 +1216,7 @@ class LiveVolumeExecutorOKX:
                 od = (r.get("data") or [{}])[0]
                 if self._adopt_order_fill(trade, od, note="unswept-recovery-slow"):
                     self._trade_count += 1
+                    await self._place_resting_tp(trade)
                     self._spawn(self._fire_entry_filled(trade), name="entry_card")
                     await self._watch_open_position(trade)
                     return
@@ -1353,7 +1429,7 @@ class LiveVolumeExecutorOKX:
                         td_mode=self.mgn_mode, ord_type="post_only",
                         sz=sz_payload, px=str(entry_px),
                         client_oid=cl_ord,
-                        tp_trigger_px=str(tp_px_r), tp_ord_px=str(tp_px_r),
+                        **self._attach_tp_args(tp_px_r),
                         sl_trigger_px=str(sl_px_r), sl_ord_px="-1",
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -1452,7 +1528,7 @@ class LiveVolumeExecutorOKX:
                 side=ok_side, pos_side=pos_side_for_market,
                 td_mode=self.mgn_mode, ord_type="market",
                 sz=sz_payload, client_oid=cl_ord,
-                tp_trigger_px=str(tp_px_r), tp_ord_px=str(tp_px_r),
+                **self._attach_tp_args(tp_px_r),
                 sl_trigger_px=str(sl_px_r), sl_ord_px="-1",
             )
         except Exception as exc:  # noqa: BLE001
@@ -1583,6 +1659,10 @@ class LiveVolumeExecutorOKX:
         if trade.extras.get("close_finalized"):
             return
         trade.extras["close_finalized"] = True
+
+        # Cancel any resting maker TP so it can't linger on the book and fill
+        # against a later position (idempotent: a no-op once it has filled).
+        await self._cancel_resting_tp(trade)
 
         flat = await self._confirm_flat()
         have_price = bool(trade.closed and trade.close_px > 0)
@@ -1756,6 +1836,7 @@ class LiveVolumeExecutorOKX:
             async with self._close_lock:
                 if trade.close_reason == "manual" or trade.closed:
                     return
+                await self._cancel_resting_tp(trade)
                 await cancel_attached_algos(self.client, self.symbol)
                 await self._maker_close(trade, reason="time_stop", abs_qty=trade.sz_contracts)
             return
@@ -1792,6 +1873,7 @@ class LiveVolumeExecutorOKX:
                     return
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("time_stop: re-check positions failed: %s", exc)
+            await self._cancel_resting_tp(trade)
             await cancel_attached_algos(self.client, self.symbol)
             await self._maker_close(trade, reason="time_stop", abs_qty=abs(qty))
 

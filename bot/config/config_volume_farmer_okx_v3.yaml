@@ -148,6 +148,15 @@ farmer:
     ladder_max_frac: 1.0
     ladder_start_frac: 0.5
 
+  # RESTING maker TP. The attached trigger-TP fired a limit only on touch; on
+  # a gap that limit was already marketable and filled TAKER — live data showed
+  # ~47% of TP WINS leaking taker. With this on, the entry attaches only the
+  # market SL and a reduce-only POST_ONLY limit is rested at tp_px the instant
+  # the entry fills, so wins fill MAKER by construction. Backtested 2026-06-14:
+  # TP-taker 47%->0%, fill-rate only -2-3%, ~$7-18/1M saved; net@5M +$36-89.
+  resting_tp:
+    enabled: true
+
   # Entry re-peg chase. taker_fallback stays ON: a missed entry forfeits
   # 2x notional of counted volume; the taker leg still nets positive against
   # the bounty (≈$300/1M) and rebates 40% too. max_chase_bps bounds the
